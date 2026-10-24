@@ -351,6 +351,7 @@ pub unsafe extern "C" fn kemu_rs_translate(
     stubs_base: u64,
     info: *const KemuStubs,
     res: *mut KemuTrans,
+    reloc: bool,
 ) -> c_int {
     // SAFETY: `Scratch` is repr(C) and made only of integers, so any
     // initialized bytes are a valid value; the rest is guaranteed by the
@@ -363,7 +364,7 @@ pub unsafe extern "C" fn kemu_rs_translate(
             &mut *res,
         )
     };
-    let cfg = t1::Cfg { stubs: info.addrs(stubs_base), code_uaddr };
+    let cfg = t1::Cfg { stubs: info.addrs(stubs_base), code_uaddr, reloc };
     match t1::translate(&mut KEnv, pc, out, &cfg, s) {
         Ok(r) => {
             res.size = r.size as u64;
@@ -379,6 +380,65 @@ pub unsafe extern "C" fn kemu_rs_translate(
             -EFAULT
         }
     }
+}
+
+/// Size of the shared-cache relocation blob for the last translation, or
+/// -1 if it can't be cached.
+///
+/// # Safety
+/// `scratch` must be the scratch area passed to `kemu_rs_translate`.
+#[no_mangle]
+pub unsafe extern "C" fn kemu_rs_xc_blob_size(scratch: *const u8) -> core::ffi::c_long {
+    // SAFETY: see kemu_rs_translate.
+    let s = unsafe { &*(scratch as *const t1::Scratch) };
+    s.xcache_blob_size().map(|n| n as core::ffi::c_long).unwrap_or(-1)
+}
+
+/// Write the relocation blob of the last translation (at guest `pc`,
+/// `blk_off` from the code base); returns its size or -1.
+///
+/// # Safety
+/// `scratch` as above; `out` must be `len` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kemu_rs_xc_blob(
+    scratch: *const u8,
+    pc: u64,
+    blk_off: u64,
+    out: *mut u8,
+    len: usize,
+) -> core::ffi::c_long {
+    // SAFETY: guaranteed by the caller.
+    let (s, out) = unsafe { (&*(scratch as *const t1::Scratch), core::slice::from_raw_parts_mut(out, len)) };
+    s.xcache_blob(pc, blk_off, out).map(|n| n as core::ffi::c_long).unwrap_or(-1)
+}
+
+/// Does a cached block (blob) still match the guest code at `pc`?
+///
+/// # Safety
+/// `blob` must be `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kemu_rs_xc_validate(blob: *const u8, len: usize, pc: u64) -> bool {
+    // SAFETY: guaranteed by the caller.
+    let b = unsafe { core::slice::from_raw_parts(blob, len) };
+    kemu_core::jit::xcache::validate(&mut KEnv, b, pc)
+}
+
+/// Relocate a copied block for guest `pc`, `blk_off` from the code base.
+///
+/// # Safety
+/// `blob` must be `blen` readable bytes and `code` `clen` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kemu_rs_xc_apply(
+    blob: *const u8,
+    blen: usize,
+    code: *mut u8,
+    clen: usize,
+    pc: u64,
+    blk_off: u64,
+) -> bool {
+    // SAFETY: guaranteed by the caller.
+    let (b, c) = unsafe { (core::slice::from_raw_parts(blob, blen), core::slice::from_raw_parts_mut(code, clen)) };
+    kemu_core::jit::xcache::apply(b, c, pc, blk_off)
 }
 
 /// Mirror of `struct kemu_host_regs`.

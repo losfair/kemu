@@ -219,3 +219,56 @@ fn id_space_mrs_is_raz() {
     assert_eq!(cpu.x[0], 0);
     assert_eq!((cpu.x[1] >> 32) & 0xff, 0x11); // FRINTTS=1, SB=1
 }
+
+/// Shared translation cache: a relocatable block validates and relocates
+/// against the same code mapped elsewhere, and any change to a word it
+/// depends on (including look-ahead into exit targets) is detected.
+#[test]
+fn xcache_validate_and_relocate() {
+    use crate::jit::{stubs, t1, xcache};
+    let code: [u32; 8] = [
+        0x90000000, // adrp x0, 0
+        0xf9400001, // ldr  x1, [x0]
+        0xeb02003f, // cmp  x1, x2
+        0x54000041, // b.ne +8
+        0x94000004, // bl   +16
+        0xf1000421, // subs x1, x1, #1
+        0xd65f03c0, // ret
+        0xd503201f, // nop
+    ];
+    let mk = |base: u64, patch: Option<(usize, u32)>| {
+        let mut mem = std::vec![0u8; 0x2000];
+        for (i, w) in code.iter().enumerate() {
+            let w = match patch { Some((j, v)) if j == i => v, _ => *w };
+            mem[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        TestEnv { mem, base }
+    };
+    let mut page = std::vec![0u8; 4096];
+    let so = stubs::gen_stubs(&mut page, stubs::ExitMode::Syscall, 0x7000_1000_0000, 0xfff8).expect("stubs");
+    let cfg = t1::Cfg { stubs: so.addrs(0x7000_0000_0000), code_uaddr: 0x7000_0000_0000 + (1 << 20), reloc: true };
+    let mut s = std::boxed::Box::new(t1::Scratch::new());
+    let mut out = std::vec![0u8; 8192];
+    let mut env = mk(0x40_0000, None);
+    let r = t1::translate(&mut env, 0x40_0000, &mut out, &cfg, &mut s).expect("translate");
+    let mut blob = std::vec![0u8; 4096];
+    let blen = s.xcache_blob(0x40_0000, 1 << 20, &mut blob).expect("cacheable");
+    let blob = &blob[..blen];
+
+    // Same code 1 GiB higher: valid, and relocation equals a fresh translation.
+    let base2 = 0x4040_0000;
+    let mut env2 = mk(base2, None);
+    assert!(xcache::validate(&mut env2, blob, base2));
+    let mut copy = out[..r.size].to_vec();
+    assert!(xcache::apply(blob, &mut copy, base2, 3 << 20));
+    let cfg2 = t1::Cfg { code_uaddr: 0x7000_0000_0000 + (3 << 20), ..cfg };
+    let mut out2 = std::vec![0u8; 8192];
+    let r2 = t1::translate(&mut env2, base2, &mut out2, &cfg2, &mut s).expect("translate 2");
+    assert_eq!(copy, out2[..r2.size].to_vec());
+
+    // Changed instruction inside the block, or at an exit target the
+    // flags look-ahead read: rejected. Unaligned delta: rejected.
+    assert!(!xcache::validate(&mut mk(base2, Some((1, 0xf9400401))), blob, base2));
+    assert!(!xcache::validate(&mut mk(base2, Some((5, 0x8b020021))), blob, base2));
+    assert!(!xcache::validate(&mut mk(base2 + 4, None), blob, base2 + 4));
+}

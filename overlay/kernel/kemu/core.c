@@ -154,6 +154,17 @@ static void kemu_mm_free(struct kemu_mm *km)
 	unsigned long idx;
 	int i;
 
+	if (kemu_debug >= 1 && km->lookups) {
+		unsigned long xe, xb;
+
+		kemu_xc_stats(&xe, &xb);
+		pr_info("kemu: %s[%d] mm stats: %lu translations (%lu from xcache), %lu lookups (%llu us), %lu chains, %lu helpers, %lu flushes, %lu interp insns; xcache %lu entries %lu KiB, %ld hits %ld misses %ld stale\n",
+			current->comm, task_pid_nr(current), km->translations, km->xc_hits,
+			km->lookups, km->translate_ns / 1000, km->chains, km->helpers,
+			km->flushes, km->interp_insns, xe, xb >> 10,
+			atomic_long_read(&kemu_xc_hits), atomic_long_read(&kemu_xc_misses),
+			atomic_long_read(&kemu_xc_stale));
+	}
 	xa_for_each(&km->slots, idx, s) {
 		for (i = 0; i < KEMU_SLOT_USED_PAGES; i++)
 			if (s->pages[i])
@@ -684,6 +695,8 @@ static int __init kemu_init(void)
 	static const u32 tramp[] = { 0xd2801168, 0xd4000001 };
 
 	kemu_thread_cache = KMEM_CACHE(kemu_thread, SLAB_PANIC | SLAB_ACCOUNT);
+	if (kemu_xc_init())
+		pr_warn("kemu: no shared translation cache shrinker\n");
 	pr_info("kemu: AArch64 user-mode emulation, %s\n",
 		kemu_jit_enabled ? "JIT" : "interpreter only");
 	kemu_tramp_pages[0] = alloc_page(GFP_KERNEL | __GFP_ZERO);

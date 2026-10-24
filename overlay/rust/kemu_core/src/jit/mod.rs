@@ -7,3 +7,4 @@ pub mod regmap;
 pub mod stubs;
 pub mod t1;
 pub mod x86;
+pub mod xcache;

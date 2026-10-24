@@ -224,6 +224,34 @@ pub fn read_exit(m: &[u8], i: usize) -> Option<Exit> {
     Some(Exit { site: get32(m, off)?, kind: get32(m, off + 4)?, target: get64(m, off + 8)? })
 }
 
+/// Shift every guest PC stored in a block's header and exit table by
+/// `delta` (see xcache).
+pub fn relocate_block(blk: &mut [u8], delta: u64) -> bool {
+    let hdr = match Header::read(blk) {
+        Some(h) => h,
+        None => return false,
+    };
+    if !put64(blk, 24, hdr.guest_pc.wrapping_add(delta)) {
+        return false;
+    }
+    let m0 = hdr.meta_off as usize;
+    let (np, ne) = match blk.get(m0..m0 + hdr.meta_len as usize).and_then(meta_counts) {
+        Some(x) => x,
+        None => return false,
+    };
+    for i in 0..ne {
+        let off = m0 + META_HDR_SIZE + np * POINT_SIZE + i * EXIT_SIZE;
+        let (kind, target) = match (get32(blk, off + 4), get64(blk, off + 8)) {
+            (Some(k), Some(t)) => (k, t),
+            _ => return false,
+        };
+        if kind == EXIT_DIRECT && !put64(blk, off + 8, target.wrapping_add(delta)) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Is `site` (block-relative offset of a rel32 field) a patchable exit?
 pub fn find_exit_site(m: &[u8], site: u32) -> Option<Exit> {
     let (_, ne) = meta_counts(m)?;

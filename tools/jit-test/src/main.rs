@@ -208,7 +208,7 @@ fn lookup_or_translate(pc: u64) -> Result<u64, Fault> {
     }
     let base = REGION + hh.code_used as u64;
     let out = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, CODE_SIZE - hh.code_used) };
-    let cfg = Cfg { stubs: hh.stubs.addrs(REGION), code_uaddr: base };
+    let cfg = Cfg { stubs: hh.stubs.addrs(REGION), code_uaddr: base, reloc: std::env::var("RELOC").is_ok() };
     match t1::translate(&mut UEnv, pc, out, &cfg, &mut hh.scratch) {
         Ok(r) => {
             hh.blocks.push((base, r.size));

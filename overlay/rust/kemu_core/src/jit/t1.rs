@@ -12,6 +12,7 @@
 //!   the state-page image; every change of location is recorded.
 //! * At block exits, flags are in the image and pinned registers live.
 
+use super::xcache;
 use super::meta::{self, kind, Exit, Header, Point, FLAGS_HOST, FLAGS_HOST_INV, FLAGS_MEM};
 use super::regmap::*;
 use super::stubs::StubAddrs;
@@ -50,6 +51,12 @@ pub struct Scratch {
     /// Direct exit targets at which the guest flags are dead.
     dead: [u64; MAX_DEAD],
     ndead: u32,
+    /// Relocatable mode: relocations, dependencies, and whether both fit.
+    relocs: [u32; xcache::MAX_RELOCS],
+    nrelocs: u32,
+    deps: [xcache::Dep; xcache::MAX_DEPS],
+    ndeps: u32,
+    xc_overflow: u32,
 }
 
 const MAX_DEAD: usize = 32;
@@ -63,8 +70,73 @@ impl Scratch {
             exits: [Exit { site: 0, kind: 0, target: 0 }; MAX_EXITS],
             dead: [0; MAX_DEAD],
             ndead: 0,
+            relocs: [0; xcache::MAX_RELOCS],
+            nrelocs: 0,
+            deps: [xcache::Dep { pc: 0, word: 0, ok: 0 }; xcache::MAX_DEPS],
+            ndeps: 0,
+            xc_overflow: 0,
         }
     }
+}
+
+impl Scratch {
+    /// After a relocatable translation: the relocation blob for the shared
+    /// cache, or None if the block can't be cached (records overflowed).
+    /// `blk_off` is the block's offset from the code base.
+    pub fn xcache_blob(&self, pc: u64, blk_off: u64, out: &mut [u8]) -> Option<usize> {
+        if self.xc_overflow != 0 {
+            return None;
+        }
+        let r = self.relocs.get(..self.nrelocs as usize)?;
+        let d = self.deps.get(..self.ndeps as usize)?;
+        xcache::write_blob(out, pc, blk_off, r, d)
+    }
+
+    /// Size `xcache_blob` needs, if cacheable.
+    pub fn xcache_blob_size(&self) -> Option<usize> {
+        if self.xc_overflow != 0 {
+            return None;
+        }
+        Some(xcache::blob_size(self.nrelocs as usize, self.ndeps as usize))
+    }
+
+    fn record_fetch(&mut self, pc: u64, r: &Result<u32, Fault>) {
+        let d = match r {
+            Ok(w) => xcache::Dep { pc, word: *w, ok: 1 },
+            Err(_) => xcache::Dep { pc, word: 0, ok: 0 },
+        };
+        let n = self.ndeps as usize;
+        if self.deps.iter().take(n).any(|x| x.pc == pc) {
+            return;
+        }
+        match self.deps.get_mut(n) {
+            Some(x) => {
+                *x = d;
+                self.ndeps += 1;
+            }
+            None => self.xc_overflow = 1,
+        }
+    }
+
+    fn record_reloc(&mut self, r: u32) {
+        match self.relocs.get_mut(self.nrelocs as usize) {
+            Some(x) => {
+                *x = r;
+                self.nrelocs += 1;
+            }
+            None => self.xc_overflow = 1,
+        }
+    }
+}
+
+/// Instruction fetch for the translator, recording dependencies in
+/// relocatable mode.
+fn fetch<E: Env>(env: &mut E, s: &mut Scratch, rec: bool, pc: u64) -> Result<u32, Fault> {
+    let r = env.fetch(pc);
+    if rec {
+        s.record_fetch(pc, &r);
+    }
+    r
 }
 
 impl Default for Scratch {
@@ -79,6 +151,10 @@ pub struct Cfg {
     pub stubs: StubAddrs,
     /// User address corresponding to `out[0]`.
     pub code_uaddr: u64,
+    /// Relocatable mode for the shared translation cache (see xcache):
+    /// guest-PC immediates are full imm64s, and relocations and guest-code
+    /// dependencies are recorded in the scratch area.
+    pub reloc: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -350,6 +426,24 @@ impl<'s, 'b> Gen<'s, 'b> {
         self.point(kind::REMAP, 0, 0);
     }
 
+    /// Load a guest-PC-derived value (relocated in relocatable mode).
+    fn gpc_imm(&mut self, dst: Reg, v: u64) {
+        if self.cfg.reloc {
+            self.gpc_ri64(dst, v);
+        } else {
+            self.mov_imm(dst, v);
+        }
+    }
+
+    /// `movabs` of a guest-PC-derived value, recording a relocation.
+    fn gpc_ri64(&mut self, dst: Reg, v: u64) {
+        self.a.mov_ri64(dst, v);
+        if self.cfg.reloc {
+            let at = self.a.pos.wrapping_sub(8);
+            self.s.record_reloc(xcache::RELOC_IMM64 | at as u32);
+        }
+    }
+
     /// `mov` an immediate without touching flags.
     fn mov_imm(&mut self, dst: Reg, imm: u64) {
         if imm <= u32::MAX as u64 {
@@ -422,6 +516,9 @@ impl<'s, 'b> Gen<'s, 'b> {
             self.overflow = true;
         }
         self.a.patch_u32(at, rel as i32 as u32);
+        if self.cfg.reloc {
+            self.s.record_reloc(xcache::RELOC_REL32 | at as u32);
+        }
     }
 
     fn jmp_abs(&mut self, uaddr: u64) {
@@ -552,7 +649,7 @@ impl<'s, 'b> Gen<'s, 'b> {
     /// the CPU's return stack. `target` None = indirect (in %rax).
     fn call_to(&mut self, target: Option<u64>, next: u64, main_off: usize) {
         self.remap_epilogue();
-        self.mov_imm(RSI, next);
+        self.gpc_imm(RSI, next);
         match target {
             Some(t) if t == self.pc0 => {
                 self.a.call(Some(main_off));
@@ -578,7 +675,7 @@ impl<'s, 'b> Gen<'s, 'b> {
         }
         // Landing pad: a guest RET arrives here with the target in %rax.
         self.point(kind::EXIT_RAX, 0, 0);
-        self.a.mov_ri64(RDX, next);
+        self.gpc_ri64(RDX, next);
         self.a.alu_rr(Alu::Cmp, Sz::Q, RAX, RDX);
         let j = self.a.jcc(Cc::Ne, None);
         self.rel_abs(j, self.cfg.stubs.dispatch_rax);
@@ -592,7 +689,7 @@ impl<'s, 'b> Gen<'s, 'b> {
         let was = self.remapped;
         self.remap_epilogue();
         let pc = self.pc();
-        self.mov_imm(RAX, pc);
+        self.gpc_imm(RAX, pc);
         self.a.store(Sz::Q, Mem::gs(OFF_PC), RAX);
         self.call_abs(self.cfg.stubs.helper);
         self.fl = Flags { host: false, inv: false, mem: true };
@@ -1887,13 +1984,12 @@ fn gpr_fields(i: &Insn, out: &mut [u32; 6]) -> usize {
 /// are frequently used unpinned registers, victims pinned registers the
 /// block never touches. Returns 0 for blocks that use anything we cannot
 /// account for (helpers, syscalls, unknown register uses).
-fn choose_remap(words: &[u32], out: &mut [(u32, u32); MAX_REMAP]) -> usize {
+fn choose_remap(insns: &[Insn], out: &mut [(u32, u32); MAX_REMAP]) -> usize {
     let mut count = [0u32; 33];
     let mut used_pinned = [false; 33];
     let mut f = [0u32; 6];
     let mut self_loop = false;
-    for (k, w) in words.iter().enumerate() {
-        let i = decode::decode(*w);
+    for (k, &i) in insns.iter().enumerate() {
         if !is_native(&i) || matches!(i, Insn::Svc { .. } | Insn::Mrs { .. } | Insn::MsrReg { .. }) {
             return 0;
         }
@@ -1960,9 +2056,9 @@ fn choose_remap(words: &[u32], out: &mut [(u32, u32); MAX_REMAP]) -> usize {
 /// Are the guest flags dead on entry to `pc`, i.e. written before being
 /// read on every path? Looks at a few straight-line instructions, follows
 /// B and both arms of CBZ/TBZ up to `depth`; anything else is "live".
-fn flags_dead_at<E: Env>(env: &mut E, mut pc: u64, depth: u32) -> bool {
+fn flags_dead_at<E: Env>(env: &mut E, s: &mut Scratch, rec: bool, mut pc: u64, depth: u32) -> bool {
     for _ in 0..12 {
-        let insn = match env.fetch(pc) {
+        let insn = match fetch(env, s, rec, pc) {
             Ok(w) => decode::decode(w),
             Err(_) => return false,
         };
@@ -1973,8 +2069,8 @@ fn flags_dead_at<E: Env>(env: &mut E, mut pc: u64, depth: u32) -> bool {
             }
             Insn::Cbz { imm, .. } | Insn::Tbz { imm, .. } => {
                 return depth > 0
-                    && flags_dead_at(env, pc.wrapping_add(imm as u64), depth - 1)
-                    && flags_dead_at(env, pc.wrapping_add(4), depth - 1);
+                    && flags_dead_at(env, s, rec, pc.wrapping_add(imm as u64), depth - 1)
+                    && flags_dead_at(env, s, rec, pc.wrapping_add(4), depth - 1);
             }
             _ => {}
         }
@@ -2081,14 +2177,18 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
 }
 
 fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut Scratch, limit: usize) -> Result<TOk, TErr> {
-    // 1. Fetch and decode.
+    s.nrelocs = 0;
+    s.ndeps = 0;
+    s.xc_overflow = 0;
+    // 1. Fetch and decode (once; reused by every later pass).
+    let mut insns = [Insn::Undefined; MAX_INSNS];
     let mut n = 0usize;
     let mut p = pc;
     while n < limit.min(MAX_INSNS) {
         if n > 0 && p & 0xfff == 0 {
             break;
         }
-        let w = match env.fetch(p) {
+        let w = match fetch(env, s, cfg.reloc, p) {
             Ok(w) => w,
             Err(f) => {
                 if n == 0 {
@@ -2101,6 +2201,9 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
         if let Some(ws) = s.words.get_mut(n) {
             *ws = w;
         }
+        if let Some(d) = insns.get_mut(n) {
+            *d = insn;
+        }
         n += 1;
         p = p.wrapping_add(4);
         if ends_block(&insn) {
@@ -2111,8 +2214,9 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
     // 2. Flag liveness (live after each instruction). Direct exits look
     // ahead into their targets: flags written before any read are dead.
     s.ndead = 0;
+    let rec = cfg.reloc;
     let note_target = |s: &mut Scratch, env: &mut E, t: u64| -> bool {
-        let dead = flags_dead_at(env, t, 2);
+        let dead = flags_dead_at(env, s, rec, t, 2);
         if dead {
             if let Some(d) = s.dead.get_mut(s.ndead as usize) {
                 *d = t;
@@ -2124,7 +2228,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
         dead
     };
     let last_pc = pc.wrapping_add((n.saturating_sub(1) as u64) * 4);
-    let last = decode::decode(s.words.get(n.wrapping_sub(1)).copied().unwrap_or(0));
+    let last = insns.get(n.wrapping_sub(1)).copied().unwrap_or(Insn::Undefined);
     let mut live = match last {
         Insn::B { imm } => !note_target(s, env, last_pc.wrapping_add(imm as u64)),
         Insn::Bl { imm } => !note_target(s, env, last_pc.wrapping_add(imm as u64)),
@@ -2137,7 +2241,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
         if let Some(l) = s.live_after.get_mut(i) {
             *l = live as u8;
         }
-        let insn = decode::decode(s.words.get(i).copied().unwrap_or(0));
+        let insn = insns.get(i).copied().unwrap_or(Insn::Undefined);
         let ipc = pc.wrapping_add((i as u64) * 4);
         live = match insn {
             Insn::Cbz { imm, .. } | Insn::Tbz { imm, .. } => {
@@ -2173,7 +2277,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
         live_in0,
     };
     if jit_off() & 32 == 0 {
-        g.nremap = choose_remap(&g.s.words[..n.min(MAX_INSNS)], &mut g.remap);
+        g.nremap = choose_remap(&insns[..n.min(MAX_INSNS)], &mut g.remap);
     }
     // Header placeholder.
     for _ in 0..meta::HEADER_SIZE {
@@ -2182,7 +2286,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
     // Inline-cache entry: %rax holds the branch target; mismatches go to
     // the lookup table.
     g.point(kind::EXIT_RAX, 0, 0);
-    g.a.mov_ri64(RDX, pc);
+    g.gpc_ri64(RDX, pc);
     g.a.alu_rr(Alu::Cmp, Sz::Q, RAX, RDX);
     let jd = g.a.jcc(Cc::Ne, None);
     g.rel_abs(jd, cfg.stubs.dispatch_rax);
@@ -2192,7 +2296,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
     }
     // Checking entry (lookup table): mismatches go to the translator.
     let check_off = g.a.pos;
-    g.a.mov_ri64(RDX, pc);
+    g.gpc_ri64(RDX, pc);
     g.a.alu_rr(Alu::Cmp, Sz::Q, RAX, RDX);
     let jm = g.a.jcc(Cc::Ne, None);
     g.rel_abs(jm, cfg.stubs.miss);
@@ -2209,7 +2313,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
         g.idx = idx;
         g.live_after = g.s.live_after.get(idx).copied().unwrap_or(1) != 0;
         let w = g.s.words.get(idx).copied().unwrap_or(0);
-        let insn = decode::decode(w);
+        let insn = insns.get(idx).copied().unwrap_or(Insn::Undefined);
         g.mul_sz = Sz::from_sf(w >> 31 != 0);
         g.insn_point();
         let ipc = g.pc();
@@ -2263,9 +2367,9 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
                     ipc.wrapping_add(imm as u64)
                 };
                 match g.gp(rd, false) {
-                    Gp::R(r) => g.mov_imm(r, v),
+                    Gp::R(r) => g.gpc_imm(r, v),
                     Gp::M(o) => {
-                        g.mov_imm(RAX, v);
+                        g.gpc_imm(RAX, v);
                         g.a.store(Sz::Q, Mem::gs(o), RAX);
                     }
                     Gp::Zero => {}
@@ -2360,7 +2464,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
             }
             Insn::LdStLiteral { fp, size, sign_ext, rt, imm } => {
                 let addr = ipc.wrapping_add(imm as u64);
-                g.mov_imm(RDX, addr);
+                g.gpc_imm(RDX, addr);
                 let m = Mem::b(RDX);
                 if fp {
                     if size <= 4 {
@@ -2500,7 +2604,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
                 g.flags_to_mem();
                 g.fl.host = false;
                 g.remap_epilogue();
-                g.mov_imm(RAX, next);
+                g.gpc_imm(RAX, next);
                 g.a.store(Sz::Q, Mem::gs(OFF_PC), RAX);
                 g.call_abs(cfg.stubs.svc);
                 g.fl = Flags { host: false, inv: false, mem: true };
@@ -2542,7 +2646,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
             g.point(kind::EXIT_RAX, 0, 0);
         } else {
             g.point(kind::EXIT, k as u8, 0);
-            g.a.mov_ri64(RAX, e.target);
+            g.gpc_ri64(RAX, e.target);
         }
         g.a.lea(Sz::Q, RDX, Mem::rip(e.site as i32));
         g.jmp_abs(cfg.stubs.chain);
@@ -2591,6 +2695,10 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
     };
     if !hdr.write(out) {
         return Err(TErr::NoSpace);
+    }
+    // Deterministic padding (the shared cache compares and copies blocks).
+    if let Some(pad) = out.get_mut(meta_off + mlen..hdr.size()) {
+        pad.fill(0);
     }
     Ok(TOk { size: hdr.size(), main_off: main_off as u32, check_off: check_off as u32, ninsns: n as u32 })
 }

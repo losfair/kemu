@@ -119,6 +119,9 @@ struct kemu_mm {
 	unsigned long chains;
 	unsigned long helpers;
 	unsigned long flushes;
+	unsigned long lookups;		/* TRANSLATE/CHAIN ops */
+	unsigned long xc_hits;		/* translations taken from the xcache */
+	u64 translate_ns;		/* time spent in those ops */
 };
 
 /* kemu_thread.flags */
@@ -262,7 +265,30 @@ int kemu_rs_gen_stubs(u8 *out, size_t len, u64 table_base, u32 mask8,
 size_t kemu_rs_scratch_size(void);
 int kemu_rs_translate(void *scratch, u64 pc, u8 *out, size_t len, u64 code_uaddr,
 		      u64 stubs_base, const struct kemu_stubs *info,
-		      struct kemu_trans *res);
+		      struct kemu_trans *res, bool reloc);
+long kemu_rs_xc_blob_size(void *scratch);
+long kemu_rs_xc_blob(void *scratch, u64 pc, u64 blk_off, u8 *out, size_t len);
+bool kemu_rs_xc_validate(const u8 *blob, size_t len, u64 pc);
+bool kemu_rs_xc_apply(const u8 *blob, size_t blen, u8 *code, size_t clen, u64 pc,
+		      u64 blk_off);
+
+/* Shared translation cache (xcache.c). */
+struct kemu_xc_key {
+	u64 sb;
+	u64 ino;
+	u32 gen;
+	u32 pad;
+	u64 off;
+};
+bool kemu_xc_key(u64 pc, struct kemu_xc_key *k);
+size_t kemu_xc_lookup(const struct kemu_xc_key *k, u64 pc, u8 *out, size_t avail,
+		      unsigned long blk_off, struct kemu_trans *res);
+void kemu_xc_insert(const struct kemu_xc_key *k, void *scratch, u64 pc,
+		    const u8 *code, const struct kemu_trans *res,
+		    unsigned long blk_off);
+void kemu_xc_stats(unsigned long *entries, unsigned long *bytes);
+int kemu_xc_init(void);
+extern atomic_long_t kemu_xc_hits, kemu_xc_misses, kemu_xc_stale;
 bool kemu_rs_recover(const u8 *blk, size_t len, u32 host_off,
 		     const struct kemu_host_regs *h, struct kemu_cpu *cpu);
 void kemu_rs_pinned_from_host(const struct kemu_host_regs *h, struct kemu_cpu *cpu);

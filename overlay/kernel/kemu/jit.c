@@ -243,7 +243,9 @@ static int kemu_translate(struct kemu_mm *km, u64 pc, unsigned long *main,
 			  struct kemu_trans *res)
 {
 	void *v = xa_load(&km->blocks, pc >> 2);
+	struct kemu_xc_key key;
 	unsigned long off, uaddr;
+	bool cacheable;
 	int c, err, tries = 0;
 	u64 gpc;
 	u32 moff;
@@ -264,6 +266,7 @@ static int kemu_translate(struct kemu_mm *km, u64 pc, unsigned long *main,
 		return 0;
 	}
 
+	cacheable = kemu_xc_key(pc, &key);
 	for (;;) {
 		if (km->cur_chunk < 0) {
 			err = kemu_chunk_new(km);
@@ -275,15 +278,24 @@ static int kemu_translate(struct kemu_mm *km, u64 pc, unsigned long *main,
 		c = km->cur_chunk;
 		out = km->chunks[c] + km->chunk_used[c];
 		uaddr = km->code_base + c * KEMU_CHUNK_SIZE + km->chunk_used[c];
+		if (cacheable && kemu_xc_lookup(&key, pc, out,
+						KEMU_CHUNK_SIZE - km->chunk_used[c],
+						uaddr - km->code_base, res)) {
+			km->xc_hits++;
+			break;
+		}
 		err = kemu_rs_translate(km->scratch, pc, out,
 					KEMU_CHUNK_SIZE - km->chunk_used[c], uaddr,
-					km->code_base, &km->stubs, res);
+					km->code_base, &km->stubs, res, cacheable);
 		if (err == -ENOSPC && km->chunk_used[c] > 0 && tries++ < 4) {
 			km->cur_chunk = -1;
 			continue;
 		}
 		if (err)
 			return err;
+		if (cacheable)
+			kemu_xc_insert(&key, km->scratch, pc, out, res,
+				       uaddr - km->code_base);
 		break;
 	}
 	off = c * KEMU_CHUNK_SIZE + km->chunk_used[c];
@@ -461,6 +473,7 @@ static unsigned long kemu_op_translate(struct kemu_thread *kt, struct kemu_mm *k
 {
 	struct kemu_trans res = {};
 	u64 pc = kt->cpu->pc;
+	u64 t0 = ktime_get_ns();
 	unsigned long main;
 	int err;
 
@@ -468,6 +481,8 @@ static unsigned long kemu_op_translate(struct kemu_thread *kt, struct kemu_mm *k
 	err = kemu_translate(km, pc, &main, &res);
 	if (!err && chain)
 		kemu_chain(km, kt->cpu->exit_info, pc, main, res.ic_entry);
+	km->lookups++;
+	km->translate_ns += ktime_get_ns() - t0;
 	mutex_unlock(&km->lock);
 
 	switch (err) {
