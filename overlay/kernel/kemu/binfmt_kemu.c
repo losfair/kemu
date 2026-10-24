@@ -17,8 +17,15 @@ static inline bool kemu_elf_check_arch(const struct elf64_hdr *x)
 	       x->e_ident[EI_DATA] == ELFDATA2LSB;
 }
 
-/* Core dumps of kemu tasks are not supported yet. */
-#undef CONFIG_ELF_CORE
+#include <linux/elfcore.h>
+
+/* arm64 NT_PRSTATUS layout: user_pt_regs is 34 u64 (x0-x30, sp, pc, pstate). */
+struct kemu_elf_prstatus {
+	struct elf_prstatus_common common;
+	u64 pr_reg[34];
+	int pr_fpvalid;
+};
+#define elf_prstatus	kemu_elf_prstatus
 
 #undef	ELF_ARCH
 #define	ELF_ARCH		EM_AARCH64

@@ -18,6 +18,29 @@ index 6571d432c..a562bae4f 100644
  	struct cpuinfo_x86 *c = v;
  	unsigned int cpu;
  	int i;
+diff --git a/fs/coredump.c b/fs/coredump.c
+index 5c1c381ee..e56a18d82 100644
+--- a/fs/coredump.c
++++ b/fs/coredump.c
+@@ -4,6 +4,7 @@
+ #include <linux/fdtable.h>
+ #include <linux/freezer.h>
+ #include <linux/mm.h>
++#include <linux/kemu.h>
+ #include <linux/stat.h>
+ #include <linux/fcntl.h>
+ #include <linux/swap.h>
+@@ -1593,6 +1594,10 @@ static bool always_dump_vma(struct vm_area_struct *vma)
+ static unsigned long vma_dump_size(struct vm_area_struct *vma,
+ 				   unsigned long mm_flags)
+ {
++	/* kemu's private translation region is not part of the process image. */
++	if (kemu_vma_hidden(vma))
++		return 0;
++
+ #define FILTER(type)	(mm_flags & (1UL << MMF_DUMP_##type))
+ 
+ 	/* always dump the vdso and vsyscall sections */
 diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
 index fc35a0543..a39ebde9e 100644
 --- a/fs/proc/task_mmu.c
