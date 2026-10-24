@@ -14,6 +14,8 @@
 #include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/resume_user_mode.h>
+#include <asm/trap_pf.h>
+#include <asm/trapnr.h>
 
 #include "kemu_internal.h"
 
@@ -80,6 +82,17 @@ static int kemu_setup_rt_frame(struct ksignal *ksig, sigset_t *set)
 	next_frame = round_down(sp - sizeof(rec), 16);
 	frame = round_down(next_frame, 16) - KEMU_SIGFRAME_SIZE;
 
+	if ((sig == SIGSEGV || sig == SIGBUS) && !kt->fault_esr &&
+	    current->thread.trap_nr == X86_TRAP_PF) {
+		/* A fault in translated code: describe it as an arm64 abort. */
+		unsigned long ec = current->thread.error_code;
+
+		kt->fault_addr = current->thread.cr2;
+		kt->fault_esr = ESR_IL | ((u64)((ec & X86_PF_INSTR) ? ESR_EC_IABT_LOW :
+						ESR_EC_DABT_LOW) << ESR_EC_SHIFT) |
+				((ec & X86_PF_WRITE) ? ESR_WNR : 0) |
+				((ec & X86_PF_PROT) ? ESR_FSC_PERM_L3 : ESR_FSC_TRANS_L3);
+	}
 	if ((sig == SIGSEGV || sig == SIGBUS) && kt->fault_esr) {
 		fault_addr = kt->fault_addr;
 		esr = kt->fault_esr;
@@ -122,15 +135,6 @@ static int kemu_setup_rt_frame(struct ksignal *ksig, sigset_t *set)
 	return 0;
 }
 
-/*
- * Make the state page authoritative for the interrupted guest context.
- * The interpreter always keeps it so; translated code will need metadata.
- */
-static void kemu_materialize(struct pt_regs *regs)
-{
-	kemu_redirect(current->kemu);
-}
-
 void kemu_do_signal(struct pt_regs *regs)
 {
 	struct kemu_thread *kt = current->kemu;
@@ -141,6 +145,11 @@ void kemu_do_signal(struct pt_regs *regs)
 	struct ksignal ksig;
 
 	kemu_materialize(regs);
+	if (kemu_debug)
+		pr_info("kemu: %s[%d] signal pending %lx at pc %llx (host ip %lx trap %ld cr2 %lx err %lx) x0=%llx sp=%llx lr=%llx\n",
+			current->comm, task_pid_nr(current), current->pending.signal.sig[0],
+			cpu->pc, regs->ip, current->thread.trap_nr, current->thread.cr2,
+			current->thread.error_code, cpu->x[0], cpu->sp, cpu->x[30]);
 
 	if (syscall) {
 		retval = (long)cpu->x[0];
@@ -158,6 +167,10 @@ void kemu_do_signal(struct pt_regs *regs)
 	}
 
 	if (get_signal(&ksig)) {
+		if (kemu_debug)
+			pr_info("kemu: %s[%d] sig %d code %d addr %px at pc %llx (host ip %lx) x0=%llx sp=%llx lr=%llx\n",
+				current->comm, task_pid_nr(current), ksig.sig, ksig.info.si_code,
+				ksig.info.si_addr, cpu->pc, regs->ip, cpu->x[0], cpu->sp, cpu->x[30]);
 		if (syscall && cpu->pc == restart &&
 		    (retval == -ERESTARTNOHAND ||
 		     retval == -ERESTART_RESTARTBLOCK ||

@@ -63,8 +63,11 @@ void kemu_svc(struct pt_regs *regs)
 {
 	struct kemu_thread *kt = current->kemu;
 	struct kemu_cpu *cpu = kt->cpu;
+	u64 next_pc;
 	long nr;
 
+	kemu_enter_op(kt);
+	next_pc = cpu->pc;
 	kemu_load_syscall_view(regs, cpu);
 	kt->orig_x0 = regs->di;
 	kt->flags |= KEMU_TF_IN_SVC;
@@ -75,29 +78,33 @@ void kemu_svc(struct pt_regs *regs)
 		regs->ax = kemu_dispatch(regs, nr);
 
 	/* exec may have replaced (or dropped) the kemu state. */
-	kt = current->kemu;
-	if (kt && (kt->flags & KEMU_TF_IN_SVC))
+	if (current->kemu != kt)
+		return;
+	if (kt->flags & KEMU_TF_IN_SVC)
 		WRITE_ONCE(kt->cpu->x[0], regs->ax);
+	/* The guest PC changed (e.g. rt_sigreturn): resume at dispatch. */
+	if (READ_ONCE(cpu->pc) != next_pc)
+		kemu_redirect(kt);
 }
 
 /*
  * Run the reference interpreter from the current guest state, then return
  * to a user stub: dispatch (keep going) or svc (perform a guest syscall).
  */
-static unsigned long kemu_interp(struct kemu_thread *kt, struct kemu_mm *km)
+unsigned long kemu_interp(struct kemu_thread *kt, struct kemu_mm *km, u32 budget)
 {
 	struct kemu_rs_exit ex;
 	u64 pc;
 
 	kt->shadow = *kt->cpu;
-	kemu_rs_interp(&kt->shadow, KEMU_INTERP_BUDGET, &ex);
+	kemu_rs_interp(&kt->shadow, budget, &ex);
 	*kt->cpu = kt->shadow;
 	km->interp_insns += ex.retired;
 	pc = READ_ONCE(kt->cpu->pc);
 
 	switch (ex.kind) {
 	case KEMU_EXIT_SVC:
-		return kemu_stub_addr(km, kemu_stub_svc);
+		return kemu_stub(km, km->stubs.interp_svc);
 	case KEMU_EXIT_BRK:
 		force_sig_fault(SIGTRAP, TRAP_BRKPT, (void __user *)pc);
 		break;
@@ -108,11 +115,17 @@ static unsigned long kemu_interp(struct kemu_thread *kt, struct kemu_mm *km)
 		kemu_force_fault(ex.addr, ex.access, ex.aux);
 		break;
 	case KEMU_EXIT_ICINV:
+		if (kemu_jit_enabled) {
+			mutex_lock(&km->lock);
+			kemu_jit_flush(km);
+			mutex_unlock(&km->lock);
+		}
+		break;
 	case KEMU_EXIT_BUDGET:
 	default:
 		break;
 	}
-	return kemu_stub_addr(km, kemu_stub_dispatch);
+	return kemu_stub(km, km->stubs.dispatch);
 }
 
 /* Non-svc kemu operations. regs->ax is the value returned to the stub. */
@@ -121,16 +134,21 @@ void kemu_op(struct pt_regs *regs, unsigned long op)
 	struct kemu_thread *kt = current->kemu;
 	struct kemu_mm *km = current->mm->kemu;
 
+	kemu_enter_op(kt);
+	if (kemu_jit_enabled) {
+		regs->ax = kemu_jit_op(regs, op);
+		return;
+	}
 	switch (op) {
 	case KEMU_OP_TRANSLATE:
 	case KEMU_OP_HELPER:
 	case KEMU_OP_CHAIN:
-		regs->ax = kemu_interp(kt, km);
+		regs->ax = kemu_interp(kt, km, KEMU_INTERP_BUDGET);
 		break;
 	default:
 		/* Not something translated code ever does. */
 		force_sig(SIGSYS);
-		regs->ax = kemu_stub_addr(km, kemu_stub_dispatch);
+		regs->ax = kemu_stub(km, km->stubs.dispatch);
 		kemu_redirect(kt);
 		break;
 	}

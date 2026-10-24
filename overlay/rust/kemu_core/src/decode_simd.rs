@@ -18,6 +18,9 @@ fn decode_simd_fp(x: u32) -> Insn {
     if bits(x, 28, 24) == 0b11110 {
         return decode_fp(x);
     }
+    if bits(x, 28, 24) == 0b11111 {
+        return decode_fp_3src(x);
+    }
     // Advanced SIMD: everything else in this group.
     let _ = (op0, op1);
     decode_asimd(x)
@@ -27,18 +30,26 @@ fn decode_simd_fp(x: u32) -> Insn {
 
 fn decode_fp(x: u32) -> Insn {
     // Common fields
-    let m = bit(x, 31);
-    let s = bit(x, 29);
-    if m || s {
-        return Insn::Undefined; // M and S must be 0 for the advertised set
+    // Note: bit31 is M for the FP-FP data-processing forms but `sf` for the
+    // FP<->integer conversions, so it is validated per-subclass, not here.
+    if bit(x, 29) {
+        return Insn::Undefined; // S must be 0
     }
     let ptype = bits(x, 23, 22) as u8;
     let op21 = bits(x, 21, 21);
     // Distinguish sub-classes by bits 15:10 region.
     // 1. Conversion between FP and integer: bit21==1 && bits 15:10 pattern.
     if op21 == 1 {
-        // Either data-processing (1/2/3 source), compare, immediate, or
-        // conditional. Determined by bits 11:10.
+        // FP<->integer conversion has bits 15:10 == 000000.
+        if bits(x, 15, 10) == 0 {
+            let sf = bit(x, 31);
+            let rmode = bits(x, 20, 19);
+            let opcode = bits(x, 18, 16);
+            let rd = bits(x, 4, 0);
+            let rn = bits(x, 9, 5);
+            return decode_fp_int_conv(x, sf, ptype, rmode, opcode, rd, rn);
+        }
+        // Otherwise data-processing (1/2 source), compare, or conditional.
         let b1110 = bits(x, 11, 10);
         match b1110 {
             0b00 => {
@@ -193,7 +204,7 @@ fn decode_fp_csel(x: u32) -> Insn {
 fn decode_fp_fixed_or_imm(x: u32) -> Insn {
     let sf = bit(x, 31);
     let ftype = bits(x, 23, 22) as u8;
-    let b1110 = bits(x, 15, 10);
+    let _b1110 = bits(x, 15, 10);
     // FP immediate: bits 12:10 == 100, bits 9:5 == imm5(zero), imm8 in 20:13.
     if bits(x, 12, 10) == 0b100 {
         let imm8 = bits(x, 20, 13) as u8;
@@ -210,11 +221,7 @@ fn decode_fp_fixed_or_imm(x: u32) -> Insn {
     let scale = bits(x, 15, 10);
     let rn = bits(x, 9, 5);
     let rd = bits(x, 4, 0);
-    // bit 21 is 0 here. Integer conversions have bits 15:10 == 000000.
-    if scale == 0b000000 {
-        return decode_fp_int_conv(x, sf, ftype, rmode, opcode, rd, rn);
-    }
-    // Fixed-point conversions: fbits = 64 - scale.
+    // bit21==0: this is always a fixed-point conversion. fbits = 64 - scale.
     let fbits = 64 - scale;
     let unsigned = bit(x, 16);
     let to_fp = bits(x, 18, 17) == 0b00; // opcode 010/011 = *CVTF, 000/001 = FCVTZ*

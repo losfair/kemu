@@ -5,8 +5,9 @@ fn decode_ldst(x: u32) -> Insn {
     let op0 = bits(x, 31, 28);
     let op1 = bit(x, 26); // SIMD&FP select for some forms
     let _ = op1;
-    // Advanced SIMD load/store multiple & single structures.
-    if bits(x, 31, 30) == 0b00 && bit(x, 29) == false && bits(x, 28, 24) == 0b01100 {
+    // Advanced SIMD load/store multiple & single structures:
+    // bit31=0, bits 29:25 == 0b00110 (bit24 selects single vs multiple).
+    if !bit(x, 31) && bits(x, 29, 25) == 0b00110 {
         return decode_simd_ldst(x);
     }
     // Compare-and-swap / exclusives / LSE atomics / general load-store.
@@ -68,10 +69,11 @@ fn ldst_kind(size: u32, opc: u32, fp: bool) -> Option<(bool, u8, bool)> {
             }
         }
         0b11 => {
-            if size == 0b11 {
-                Insn_none()
+            // LDRS* to 32-bit exists only for byte/halfword; size>=2 unallocated.
+            if size >= 0b10 {
+                insn_none()
             } else {
-                Some((true, 32, false)) // LDRS* to 32-bit
+                Some((true, 32, false))
             }
         }
         _ => None,
@@ -79,7 +81,7 @@ fn ldst_kind(size: u32, opc: u32, fp: bool) -> Option<(bool, u8, bool)> {
 }
 
 #[inline]
-fn Insn_none() -> Option<(bool, u8, bool)> {
+fn insn_none() -> Option<(bool, u8, bool)> {
     None
 }
 

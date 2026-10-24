@@ -1,0 +1,12 @@
+[package]
+name = "jit-test"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0"
+description = "Userspace differential tester for the kemu JIT (JIT vs interpreter)"
+
+[dependencies]
+kemu_core = { path = "../../overlay/rust/kemu_core", features = ["std"] }
+
+[profile.release]
+debug = true

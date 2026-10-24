@@ -8,6 +8,7 @@
 //! division, and must not panic on any guest input.
 #![no_std]
 #![forbid(unsafe_code)]
+#![allow(dead_code)]
 
 #[cfg(feature = "std")]
 extern crate std;
@@ -15,6 +16,8 @@ extern crate std;
 pub mod state;
 pub mod env;
 pub mod decode;
+pub mod sysregs;
 pub mod softfloat;
 pub mod interp;
 pub mod sigframe;
+pub mod jit;

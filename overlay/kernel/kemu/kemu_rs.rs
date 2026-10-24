@@ -6,6 +6,10 @@
 //! kemu C code. All guest-controlled data is parsed by `kemu_core`; the
 //! `unsafe` here is limited to the FFI boundary.
 
+// kemu_core is also a standalone (cargo) crate with its own conventions;
+// relax the kernel's documentation lints for it.
+#![allow(missing_docs)]
+
 use core::ffi::c_int;
 
 // The crate root of kemu_core, mounted as a module. Its crate-level
@@ -242,4 +246,238 @@ pub unsafe extern "C" fn kemu_rs_restore_ucontext(
         }
         Err(_) => -EACCES,
     }
+}
+
+// ---- JIT ----
+
+use jit::{meta, regmap, stubs, t1};
+
+const ENOSPC: c_int = 28;
+
+/// Mirror of `struct kemu_stubs` (offsets within the stub page).
+#[repr(C)]
+pub struct KemuStubs {
+    pub dispatch: u32,
+    pub dispatch_rax: u32,
+    pub miss: u32,
+    pub chain: u32,
+    pub helper: u32,
+    pub svc: u32,
+    pub interp_svc: u32,
+    pub end: u32,
+    pub nranges: u32,
+    pub ranges: [[u32; 3]; 16],
+}
+
+impl KemuStubs {
+    fn addrs(&self, base: u64) -> stubs::StubAddrs {
+        stubs::StubAddrs {
+            dispatch_rax: base + self.dispatch_rax as u64,
+            miss: base + self.miss as u64,
+            chain: base + self.chain as u64,
+            helper: base + self.helper as u64,
+            svc: base + self.svc as u64,
+        }
+    }
+}
+
+/// Generate the stub page.
+///
+/// # Safety
+/// `out` must point to `len` writable bytes and `info` to a `KemuStubs`.
+#[no_mangle]
+pub unsafe extern "C" fn kemu_rs_gen_stubs(
+    out: *mut u8,
+    len: usize,
+    table_base: u64,
+    mask8: u32,
+    info: *mut KemuStubs,
+) -> c_int {
+    // SAFETY: guaranteed by the caller.
+    let (out, info) = unsafe { (core::slice::from_raw_parts_mut(out, len), &mut *info) };
+    let o = match stubs::gen_stubs(out, stubs::ExitMode::Syscall, table_base, mask8) {
+        Some(o) => o,
+        None => return -ENOSPC,
+    };
+    info.dispatch = o.dispatch;
+    info.dispatch_rax = o.dispatch_rax;
+    info.miss = o.miss;
+    info.chain = o.chain;
+    info.helper = o.helper;
+    info.svc = o.svc;
+    info.interp_svc = o.interp_svc;
+    info.end = o.end;
+    info.nranges = o.nranges as u32;
+    for (d, s) in info.ranges.iter_mut().zip(o.ranges.iter()) {
+        *d = [s.0, s.1, s.2 as u32];
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn kemu_rs_scratch_size() -> usize {
+    core::mem::size_of::<t1::Scratch>()
+}
+
+/// Mirror of `struct kemu_trans`.
+#[repr(C)]
+pub struct KemuTrans {
+    pub size: u64,
+    pub check_off: u32,
+    pub main_off: u32,
+    pub ninsns: u32,
+    pub fault_access: u32,
+    pub fault_addr: u64,
+}
+
+/// Translate the guest block at `pc` into `out` (user address `code_uaddr`).
+///
+/// # Safety
+/// `scratch` must point to `kemu_rs_scratch_size()` zero-initialized (or
+/// previously used) bytes, suitably aligned; `out` to `len` writable bytes;
+/// `info` and `res` to valid structures.
+#[no_mangle]
+pub unsafe extern "C" fn kemu_rs_translate(
+    scratch: *mut u8,
+    pc: u64,
+    out: *mut u8,
+    len: usize,
+    code_uaddr: u64,
+    stubs_base: u64,
+    info: *const KemuStubs,
+    res: *mut KemuTrans,
+) -> c_int {
+    // SAFETY: `Scratch` is repr(C) and made only of integers, so any
+    // initialized bytes are a valid value; the rest is guaranteed by the
+    // caller.
+    let (s, out, info, res) = unsafe {
+        (
+            &mut *(scratch as *mut t1::Scratch),
+            core::slice::from_raw_parts_mut(out, len),
+            &*info,
+            &mut *res,
+        )
+    };
+    let cfg = t1::Cfg { stubs: info.addrs(stubs_base), code_uaddr };
+    match t1::translate(&mut KEnv, pc, out, &cfg, s) {
+        Ok(r) => {
+            res.size = r.size as u64;
+            res.check_off = r.check_off;
+            res.main_off = r.main_off;
+            res.ninsns = r.ninsns;
+            0
+        }
+        Err(t1::TErr::NoSpace) => -ENOSPC,
+        Err(t1::TErr::Fault(f)) => {
+            res.fault_addr = f.addr;
+            res.fault_access = access_code(f.access);
+            -EFAULT
+        }
+    }
+}
+
+/// Mirror of `struct kemu_host_regs`.
+#[repr(C)]
+pub struct KemuHostRegs {
+    pub gpr: [u64; 16],
+    pub rflags: u64,
+}
+
+fn host_regs(h: &KemuHostRegs) -> meta::HostRegs {
+    meta::HostRegs { gpr: h.gpr, rflags: h.rflags }
+}
+
+/// Rebuild the guest state for a host PC inside a translated block.
+///
+/// # Safety
+/// `blk` must point to `len` readable bytes; `h` and `cpu` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn kemu_rs_recover(
+    blk: *const u8,
+    len: usize,
+    host_off: u32,
+    h: *const KemuHostRegs,
+    cpu: *mut CpuState,
+) -> bool {
+    // SAFETY: guaranteed by the caller.
+    let (blk, h, cpu) = unsafe { (core::slice::from_raw_parts(blk, len), &*h, &mut *cpu) };
+    meta::recover(blk, host_off, &host_regs(h), cpu)
+}
+
+/// Copy pinned guest registers from host registers.
+///
+/// # Safety
+/// `h` and `cpu` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn kemu_rs_pinned_from_host(h: *const KemuHostRegs, cpu: *mut CpuState) {
+    // SAFETY: guaranteed by the caller.
+    let (h, cpu) = unsafe { (&*h, &mut *cpu) };
+    meta::pinned_from_host(cpu, &host_regs(h));
+}
+
+/// Validate a block header; returns its size (0 if invalid).
+///
+/// # Safety
+/// `blk` must point to `len` readable bytes; out-params must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn kemu_rs_block_info(
+    blk: *const u8,
+    len: usize,
+    guest_pc: *mut u64,
+    main_off: *mut u32,
+) -> usize {
+    // SAFETY: guaranteed by the caller.
+    let blk = unsafe { core::slice::from_raw_parts(blk, len) };
+    match meta::Header::read(blk) {
+        Some(h) if h.size() <= len => {
+            // SAFETY: guaranteed by the caller.
+            unsafe {
+                guest_pc.write(h.guest_pc);
+                main_off.write(h.main_off);
+            }
+            h.size()
+        }
+        _ => 0,
+    }
+}
+
+/// Is `site_off` a patchable exit of the block? Returns its target.
+///
+/// # Safety
+/// `blk` must point to `len` readable bytes; `target` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn kemu_rs_find_exit(
+    blk: *const u8,
+    len: usize,
+    site_off: u32,
+    target: *mut u64,
+) -> bool {
+    // SAFETY: guaranteed by the caller.
+    let blk = unsafe { core::slice::from_raw_parts(blk, len) };
+    let h = match meta::Header::read(blk) {
+        Some(h) => h,
+        None => return false,
+    };
+    let m = match blk.get(h.meta_off as usize..(h.meta_off + h.meta_len) as usize) {
+        Some(m) => m,
+        None => return false,
+    };
+    match meta::find_exit_site(m, site_off) {
+        Some(e) => {
+            // SAFETY: guaranteed by the caller.
+            unsafe { target.write(e.target) };
+            true
+        }
+        None => false,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn kemu_rs_nzcv_from_image(img: u64) -> u64 {
+    regmap::nzcv_from_image(img)
+}
+
+#[no_mangle]
+pub extern "C" fn kemu_rs_image_from_nzcv(nzcv: u64) -> u64 {
+    regmap::image_from_nzcv(nzcv)
 }

@@ -43,16 +43,18 @@ static vm_fault_t kemu_code_fault(const struct vm_special_mapping *sm,
 {
 	struct kemu_mm *km = vma->vm_mm->kemu;
 	unsigned long off = vmf->pgoff << PAGE_SHIFT;
-	unsigned long c = off >> KEMU_CHUNK_SHIFT;
+	unsigned long c = off >> KEMU_CHUNK_SHIFT, in = off & (KEMU_CHUNK_SIZE - 1);
+	vm_fault_t ret = VM_FAULT_SIGBUS;
 	void *chunk;
 
 	if (!km || c >= KEMU_MAX_CHUNKS)
 		return VM_FAULT_SIGBUS;
-	chunk = READ_ONCE(km->chunks[c]);
-	if (!chunk)
-		return VM_FAULT_SIGBUS;
-	return kemu_insert(vma, vmf,
-			   vmalloc_to_pfn(chunk + (off & (KEMU_CHUNK_SIZE - 1))));
+	down_read(&km->chunk_sem);
+	chunk = km->chunks[c];
+	if (chunk && (c != 0 || in < KEMU_STUBS_SIZE))
+		ret = kemu_insert(vma, vmf, vmalloc_to_pfn(chunk + in));
+	up_read(&km->chunk_sem);
+	return ret;
 }
 
 static vm_fault_t kemu_table_fault(const struct vm_special_mapping *sm,
@@ -136,8 +138,13 @@ static struct kemu_mm *kemu_mm_alloc(void)
 	if (!km)
 		return NULL;
 	mutex_init(&km->lock);
+	init_rwsem(&km->chunk_sem);
 	xa_init(&km->slots);
+	xa_init(&km->blocks);
 	ida_init(&km->slot_ida);
+	spin_lock_init(&km->threads_lock);
+	INIT_LIST_HEAD(&km->threads);
+	km->cur_chunk = -1;
 	return km;
 }
 
@@ -155,15 +162,10 @@ static void kemu_mm_free(struct kemu_mm *km)
 	}
 	xa_destroy(&km->slots);
 	ida_destroy(&km->slot_ida);
-	for (i = 0; i < KEMU_MAX_CHUNKS; i++)
-		vfree(km->chunks[i]);
+	kemu_jit_free(km);
+	vfree(km->chunks[0]);
 	vfree(km->table);
 	kfree(km);
-}
-
-static void *kemu_chunk_alloc(void)
-{
-	return __vmalloc(KEMU_CHUNK_SIZE, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
 }
 
 static struct kemu_slot *kemu_slot_alloc_pages(void)
@@ -229,25 +231,36 @@ static struct kemu_cpu *kemu_slot_cpu(struct kemu_mm *km, int slot)
 
 /* ---- kemu_thread ---- */
 
-static struct kemu_thread *kemu_thread_new(struct kemu_mm *km, int slot)
+static struct kemu_thread *kemu_thread_new(struct kemu_mm *km, int slot,
+					   struct task_struct *task)
 {
 	struct kemu_thread *kt;
 
 	kt = kmem_cache_zalloc(kemu_thread_cache, GFP_KERNEL_ACCOUNT);
 	if (!kt)
 		return NULL;
+	kt->task = task;
+	kt->epoch_seen = km->epoch;
+	spin_lock(&km->threads_lock);
+	list_add(&kt->node, &km->threads);
+	spin_unlock(&km->threads_lock);
 	kt->slot = slot;
 	kt->cpu = kemu_slot_cpu(km, slot);
 	kt->cpu_uaddr = kemu_slot_base(km, slot) + KEMU_SLOT_STATE_PG * PAGE_SIZE;
-	kt->rstack_top = kemu_slot_base(km, slot) + KEMU_SLOT_RSTACK_TOP_PG * PAGE_SIZE;
+	/* Leave headroom: barriers touch [rsp] even when the stack is empty. */
+	kt->rstack_top = kemu_slot_base(km, slot) + KEMU_SLOT_RSTACK_TOP_PG * PAGE_SIZE - 64;
 	kt->cpu->host_rsp_top = kt->rstack_top;
 	return kt;
 }
 
 static void kemu_thread_free(struct kemu_mm *km, struct kemu_thread *kt)
 {
-	if (km)
+	if (km) {
+		spin_lock(&km->threads_lock);
+		list_del(&kt->node);
+		spin_unlock(&km->threads_lock);
 		ida_free(&km->slot_ida, kt->slot);
+	}
 	kmem_cache_free(kemu_thread_cache, kt);
 }
 
@@ -273,14 +286,12 @@ int kemu_setup_mm(struct linux_binprm *bprm)
 	km = kemu_mm_alloc();
 	if (!km)
 		return -ENOMEM;
-	km->chunks[0] = kemu_chunk_alloc();
+	km->chunks[0] = vzalloc(KEMU_STUBS_SIZE);
 	km->table = vzalloc(KEMU_TABLE_SIZE);
 	if (!km->chunks[0] || !km->table) {
 		kemu_mm_free(km);
 		return -ENOMEM;
 	}
-	memcpy(km->chunks[0], kemu_stubs_start, kemu_stubs_end - kemu_stubs_start);
-	km->code_used = KEMU_STUBS_SIZE;
 
 	if (mmap_write_lock_killable(mm)) {
 		kemu_mm_free(km);
@@ -295,6 +306,9 @@ int kemu_setup_mm(struct linux_binprm *bprm)
 	km->code_base = addr;
 	km->table_base = addr + KEMU_CODE_SIZE;
 	km->slots_base = km->table_base + KEMU_TABLE_SIZE;
+	ret = kemu_jit_init(km);
+	if (ret)
+		goto fail;
 
 	vma = _install_special_mapping(mm, km->code_base, KEMU_CODE_SIZE,
 				       VM_READ | VM_EXEC | VM_MAYREAD | VM_MAYEXEC |
@@ -359,7 +373,7 @@ void kemu_start_thread(struct pt_regs *regs, unsigned long pc, unsigned long sp)
 	slot = kemu_slot_get(km);
 	if (slot < 0)
 		goto fail;
-	kt = kemu_thread_new(km, slot);
+	kt = kemu_thread_new(km, slot, current);
 	if (!kt) {
 		ida_free(&km->slot_ida, slot);
 		goto fail;
@@ -375,7 +389,7 @@ void kemu_start_thread(struct pt_regs *regs, unsigned long pc, unsigned long sp)
 	static_branch_enable(&kemu_active_key);
 	current->kemu = kt;
 
-	start_thread(regs, kemu_stub_addr(km, kemu_stub_dispatch), kt->rstack_top);
+	start_thread(regs, kemu_stub(km, km->stubs.dispatch), kt->rstack_top);
 	do_arch_prctl_64(current, ARCH_SET_GS, kt->cpu_uaddr);
 	return;
 fail:
@@ -442,21 +456,16 @@ int kemu_dup_mm(struct mm_struct *oldmm, struct mm_struct *mm)
 	km->code_base = okm->code_base;
 	km->table_base = okm->table_base;
 	km->slots_base = okm->slots_base;
-	km->code_used = okm->code_used;
 	km->vdso_base = okm->vdso_base;
 	err = -ENOMEM;
-	for (i = 0; i < KEMU_MAX_CHUNKS; i++) {
-		if (!okm->chunks[i])
-			continue;
-		km->chunks[i] = kemu_chunk_alloc();
-		if (!km->chunks[i])
-			goto out_unlock;
-		memcpy(km->chunks[i], okm->chunks[i], KEMU_CHUNK_SIZE);
-	}
+	km->chunks[0] = vzalloc(KEMU_STUBS_SIZE);
 	km->table = vmalloc(KEMU_TABLE_SIZE);
-	if (!km->table)
+	if (!km->chunks[0] || !km->table)
 		goto out_unlock;
-	memcpy(km->table, okm->table, KEMU_TABLE_SIZE);
+	memcpy(km->chunks[0], okm->chunks[0], KEMU_STUBS_SIZE);
+	err = kemu_jit_dup(okm, km);
+	if (err)
+		goto out_unlock;
 	mutex_unlock(&okm->lock);
 
 	/* Copy the current thread's slot to the same index. */
@@ -527,7 +536,7 @@ int kemu_copy_thread(struct task_struct *p, const struct kernel_clone_args *args
 	} else {
 		slot = pkt->slot;
 	}
-	kt = kemu_thread_new(km, slot);
+	kt = kemu_thread_new(km, slot, p);
 	if (!kt) {
 		if (args->flags & CLONE_VM)
 			ida_free(&km->slot_ida, slot);
@@ -550,7 +559,8 @@ int kemu_copy_thread(struct task_struct *p, const struct kernel_clone_args *args
 	p->thread.gsbase = kt->cpu_uaddr;
 	p->thread.gsindex = 0;
 	childregs->sp = kt->rstack_top;
-	childregs->ip = kemu_stub_addr(km, kemu_stub_dispatch);
+	childregs->ip = kemu_stub(km, km->stubs.dispatch);
+	kt->cpu->flags_x86 = kemu_rs_image_from_nzcv(kt->cpu->nzcv);
 	childregs->cx = childregs->ip;
 	childregs->r11 = childregs->flags;
 	p->kemu = kt;
@@ -591,11 +601,12 @@ void kemu_exit_to_user(struct pt_regs *regs)
 	if (!kt)
 		return;
 	kt->flags &= ~KEMU_TF_IN_SVC;
+	kemu_jit_exit_to_user(kt, regs);
 	if (!(kt->flags & KEMU_TF_REDIRECT))
 		return;
 	km = current->mm->kemu;
 	kt->flags &= ~KEMU_TF_REDIRECT;
-	regs->ip = kemu_stub_addr(km, kemu_stub_dispatch);
+	regs->ip = kemu_stub(km, km->stubs.dispatch);
 	regs->sp = kt->rstack_top;
 	regs->cx = regs->ip;
 	regs->r11 = regs->flags;
@@ -616,6 +627,8 @@ static int __init kemu_init(void)
 	static const u32 tramp[] = { 0xd2801168, 0xd4000001 };
 
 	kemu_thread_cache = KMEM_CACHE(kemu_thread, SLAB_PANIC | SLAB_ACCOUNT);
+	pr_info("kemu: AArch64 user-mode emulation, %s\n",
+		kemu_jit_enabled ? "JIT" : "interpreter only");
 	kemu_tramp_pages[0] = alloc_page(GFP_KERNEL | __GFP_ZERO);
 	BUG_ON(!kemu_tramp_pages[0]);
 	memcpy(page_address(kemu_tramp_pages[0]), tramp, sizeof(tramp));

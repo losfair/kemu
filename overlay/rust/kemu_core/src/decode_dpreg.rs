@@ -232,7 +232,7 @@ fn decode_dp2(x: u32) -> Insn {
 }
 
 fn decode_dp3(x: u32) -> Insn {
-    let sf = bit(x, 31);
+    let _sf = bit(x, 31);
     let op54 = bits(x, 30, 29);
     let op31 = bits(x, 23, 21);
     let rm = bits(x, 20, 16);

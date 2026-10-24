@@ -1,0 +1,590 @@
+// SPDX-License-Identifier: GPL-2.0
+//! Differential tester for the kemu T1 JIT.
+//!
+//! Runs translated x86 code natively in this process (user mode, exactly
+//! as in a kemu task, with %gs pointing at a guest state page) and compares
+//! the result against the reference interpreter for random instruction
+//! sequences. Stubs reach the harness with `call` instead of `syscall`.
+
+use kemu_core::decode::{decode, Insn};
+use kemu_core::env::{Access, Env, Fault};
+use kemu_core::interp::{self, Exit};
+use kemu_core::jit::regmap::{image_from_nzcv, nzcv_from_image};
+use kemu_core::jit::stubs::{self, ExitMode, StubOffsets, OP_CHAIN, OP_HELPER, OP_SVC, OP_TRANSLATE};
+use kemu_core::jit::t1::{self, Cfg, Scratch};
+use kemu_core::state::CpuState;
+use std::collections::HashMap;
+use std::arch::global_asm;
+
+const REGION: u64 = 0x6e00_0000_0000;
+const CODE_SIZE: usize = 64 << 20;
+const TABLE_BITS: u32 = 14;
+const TABLE_ENTRIES: usize = 1 << TABLE_BITS;
+const TABLE: u64 = REGION + CODE_SIZE as u64;
+const STATE: u64 = TABLE + (TABLE_ENTRIES as u64) * 8;
+const RSTACK_SIZE: usize = 1 << 20;
+const RSTACK_TOP: u64 = STATE + 4096 + RSTACK_SIZE as u64;
+const GUEST: u64 = 0x5000_0000_0000;
+const GUEST_SIZE: usize = 1 << 20;
+const DATA: u64 = 0x5100_0000_0000;
+const DATA_SIZE: usize = 1 << 16;
+
+extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn arch_prctl(code: i32, addr: u64) -> i32;
+    fn jt_enter(rstack_top: u64, entry: u64);
+    fn jt_harness_entry();
+}
+
+global_asm!(
+    ".globl jt_enter",
+    "jt_enter:",
+    "push rbx", "push rbp", "push r12", "push r13", "push r14", "push r15",
+    "mov [rip + jt_host_rsp], rsp",
+    "mov rsp, rdi",
+    "jmp rsi",
+    ".globl jt_harness_entry",
+    "jt_harness_entry:",
+    "mov edi, eax",
+    "mov rbp, rsp",
+    "and rsp, -16",
+    "call jt_handle_op",
+    "test rdx, rdx",
+    "jnz 2f",
+    "mov rsp, rbp",
+    "ret",
+    "2:",
+    "mov rsp, [rip + jt_host_rsp]",
+    "pop r15", "pop r14", "pop r13", "pop r12", "pop rbp", "pop rbx",
+    "ret",
+    ".data",
+    ".globl jt_host_rsp",
+    "jt_host_rsp: .quad 0",
+    ".text",
+);
+
+fn map_fixed(addr: u64, len: usize, prot: i32) {
+    // PROT: 1 R, 2 W, 4 X; MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE
+    let p = unsafe { mmap(addr as *mut u8, len, prot, 0x02 | 0x20 | 0x100000, -1, 0) };
+    assert_eq!(p as u64, addr, "mmap at {addr:#x} failed");
+}
+
+/// Guest memory: the guest code and data windows of this process.
+struct UEnv;
+
+fn in_range(a: u64, n: u64) -> bool {
+    (a >= GUEST && a + n <= GUEST + GUEST_SIZE as u64) || (a >= DATA && a + n <= DATA + DATA_SIZE as u64)
+}
+
+impl UEnv {
+    fn chk(&self, a: u64, n: u64, acc: Access) -> Result<(), Fault> {
+        if in_range(a, n) {
+            Ok(())
+        } else {
+            Err(Fault { addr: a, access: acc, align: false })
+        }
+    }
+}
+
+impl Env for UEnv {
+    fn fetch(&mut self, pc: u64) -> Result<u32, Fault> {
+        if !(pc >= GUEST && pc + 4 <= GUEST + GUEST_SIZE as u64) {
+            return Err(Fault { addr: pc, access: Access::Exec, align: false });
+        }
+        Ok(unsafe { (pc as *const u32).read_unaligned() })
+    }
+    fn read_u8(&mut self, a: u64) -> Result<u8, Fault> {
+        self.chk(a, 1, Access::Read)?;
+        Ok(unsafe { (a as *const u8).read() })
+    }
+    fn read_u16(&mut self, a: u64) -> Result<u16, Fault> {
+        self.chk(a, 2, Access::Read)?;
+        Ok(unsafe { (a as *const u16).read_unaligned() })
+    }
+    fn read_u32(&mut self, a: u64) -> Result<u32, Fault> {
+        self.chk(a, 4, Access::Read)?;
+        Ok(unsafe { (a as *const u32).read_unaligned() })
+    }
+    fn read_u64(&mut self, a: u64) -> Result<u64, Fault> {
+        self.chk(a, 8, Access::Read)?;
+        Ok(unsafe { (a as *const u64).read_unaligned() })
+    }
+    fn write_u8(&mut self, a: u64, v: u8) -> Result<(), Fault> {
+        self.chk(a, 1, Access::Write)?;
+        unsafe { (a as *mut u8).write(v) };
+        Ok(())
+    }
+    fn write_u16(&mut self, a: u64, v: u16) -> Result<(), Fault> {
+        self.chk(a, 2, Access::Write)?;
+        unsafe { (a as *mut u16).write_unaligned(v) };
+        Ok(())
+    }
+    fn write_u32(&mut self, a: u64, v: u32) -> Result<(), Fault> {
+        self.chk(a, 4, Access::Write)?;
+        unsafe { (a as *mut u32).write_unaligned(v) };
+        Ok(())
+    }
+    fn write_u64(&mut self, a: u64, v: u64) -> Result<(), Fault> {
+        self.chk(a, 8, Access::Write)?;
+        unsafe { (a as *mut u64).write_unaligned(v) };
+        Ok(())
+    }
+    fn cmpxchg(&mut self, a: u64, size: u32, e: [u64; 2], n: [u64; 2]) -> Result<[u64; 2], Fault> {
+        if a % size as u64 != 0 {
+            return Err(Fault { addr: a, access: Access::Write, align: true });
+        }
+        self.chk(a, size as u64, Access::Write)?;
+        use std::sync::atomic::*;
+        let old = unsafe {
+            match size {
+                1 => match (*(a as *const AtomicU8)).compare_exchange(e[0] as u8, n[0] as u8, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(v) | Err(v) => v as u64,
+                },
+                2 => match (*(a as *const AtomicU16)).compare_exchange(e[0] as u16, n[0] as u16, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(v) | Err(v) => v as u64,
+                },
+                4 => match (*(a as *const AtomicU32)).compare_exchange(e[0] as u32, n[0] as u32, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(v) | Err(v) => v as u64,
+                },
+                8 => match (*(a as *const AtomicU64)).compare_exchange(e[0], n[0], Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(v) | Err(v) => v,
+                },
+                _ => {
+                    let p = a as *mut u64;
+                    let (lo, hi) = (p.read(), p.add(1).read());
+                    if lo == e[0] && hi == e[1] {
+                        p.write(n[0]);
+                        p.add(1).write(n[1]);
+                    }
+                    return Ok([lo, hi]);
+                }
+            }
+        };
+        Ok([old, 0])
+    }
+    fn cntvct(&mut self) -> u64 {
+        0
+    }
+    fn cntfrq(&mut self) -> u64 {
+        1_000_000_000
+    }
+    fn random(&mut self) -> Option<u64> {
+        Some(4)
+    }
+}
+
+struct Harness {
+    stubs: StubOffsets,
+    code_used: usize,
+    map: HashMap<u64, (u64, u64)>,
+    scratch: Box<Scratch>,
+    stop: Option<Exit>,
+    translations: usize,
+    helpers: usize,
+}
+
+static mut H: Option<Harness> = None;
+
+fn state() -> &'static mut CpuState {
+    unsafe { &mut *(STATE as *mut CpuState) }
+}
+
+fn table() -> &'static mut [u64] {
+    unsafe { std::slice::from_raw_parts_mut(TABLE as *mut u64, TABLE_ENTRIES) }
+}
+
+#[allow(static_mut_refs)]
+fn h() -> &'static mut Harness {
+    unsafe { H.as_mut().unwrap() }
+}
+
+fn lookup_or_translate(pc: u64) -> Result<u64, Fault> {
+    let hh = h();
+    if let Some(&(check, main)) = hh.map.get(&pc) {
+        table()[((pc >> 2) as usize) & (TABLE_ENTRIES - 1)] = check;
+        return Ok(main);
+    }
+    let base = REGION + hh.code_used as u64;
+    let out = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, CODE_SIZE - hh.code_used) };
+    let cfg = Cfg { stubs: hh.stubs.addrs(REGION), code_uaddr: base };
+    match t1::translate(&mut UEnv, pc, out, &cfg, &mut hh.scratch) {
+        Ok(r) => {
+            hh.code_used += r.size;
+            hh.translations += 1;
+            let check = base + r.check_off as u64;
+            let main = base + r.main_off as u64;
+            hh.map.insert(pc, (check, main));
+            table()[((pc >> 2) as usize) & (TABLE_ENTRIES - 1)] = check;
+            Ok(main)
+        }
+        Err(t1::TErr::Fault(f)) => Err(f),
+        Err(e) => panic!("translate failed: {e:?}"),
+    }
+}
+
+#[repr(C)]
+pub struct Ret {
+    val: u64,
+    stop: u64,
+}
+
+#[no_mangle]
+pub extern "C" fn jt_handle_op(op: u32) -> Ret {
+    let st = state();
+    match op {
+        OP_TRANSLATE | OP_CHAIN => match lookup_or_translate(st.pc) {
+            Ok(main) => {
+                if op == OP_CHAIN {
+                    let site = st.exit_info;
+                    let rel = main.wrapping_sub(site + 4) as i64 as i32;
+                    unsafe { (site as *mut i32).write_unaligned(rel) };
+                }
+                Ret { val: main, stop: 0 }
+            }
+            Err(f) => {
+                h().stop = Some(Exit::Fault(f));
+                Ret { val: 0, stop: 1 }
+            }
+        },
+        OP_HELPER => {
+            h().helpers += 1;
+            st.nzcv = nzcv_from_image(st.flags_x86);
+            let pc = st.pc;
+            let (ex, _) = interp::run(st, &mut UEnv, 1);
+            st.flags_x86 = image_from_nzcv(st.nzcv);
+            match ex {
+                Exit::Budget | Exit::IcInvalidate(_) if st.pc == pc + 4 => Ret { val: 0, stop: 0 },
+                e => {
+                    h().stop = Some(e);
+                    Ret { val: 0, stop: 1 }
+                }
+            }
+        }
+        OP_SVC => {
+            h().stop = Some(Exit::Svc);
+            Ret { val: 0, stop: 1 }
+        }
+        _ => panic!("bad op {op:#x}"),
+    }
+}
+
+fn reset_cache() {
+    let hh = h();
+    hh.map.clear();
+    hh.code_used = 4096;
+    let miss = REGION + hh.stubs.miss as u64;
+    for e in table().iter_mut() {
+        *e = miss;
+    }
+}
+
+/// Run guest code at GUEST from `init` under the JIT until it stops.
+fn run_jit(init: &CpuState) -> (CpuState, Option<Exit>) {
+    let st = state();
+    *st = *init;
+    st.pc = GUEST;
+    st.flags_x86 = image_from_nzcv(init.nzcv);
+    st.host_rsp_top = RSTACK_TOP;
+    h().stop = None;
+    unsafe { jt_enter(RSTACK_TOP, REGION + h().stubs.dispatch as u64) };
+    let mut out = *st;
+    // After a helper stop, nzcv is authoritative; otherwise the image is.
+    if !matches!(h().stop, Some(Exit::Brk(_)) | Some(Exit::Undefined(_)) | Some(Exit::Fault(_))) {
+        out.nzcv = nzcv_from_image(out.flags_x86);
+    }
+    (out, h().stop)
+}
+
+fn run_interp(init: &CpuState) -> (CpuState, Exit) {
+    let mut st = *init;
+    st.pc = GUEST;
+    loop {
+        let (ex, _) = interp::run(&mut st, &mut UEnv, 100_000);
+        match ex {
+            Exit::Budget => panic!("interp ran away"),
+            e => return (st, e),
+        }
+    }
+}
+
+// ---- random generation ----
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+    fn val(&mut self) -> u64 {
+        match self.below(8) {
+            0 => 0,
+            1 => u64::MAX,
+            2 => 0x8000_0000_0000_0000,
+            3 => 0x7fff_ffff_ffff_ffff,
+            4 => self.below(256),
+            5 => 0xffff_ffff,
+            6 => 0x8000_0000 + self.below(3),
+            _ => self.next(),
+        }
+    }
+}
+
+fn is_alu(i: &Insn) -> bool {
+    matches!(
+        i,
+        Insn::AddSubImm { .. }
+            | Insn::LogicImm { .. }
+            | Insn::MovN { .. }
+            | Insn::MovZ { .. }
+            | Insn::MovK { .. }
+            | Insn::Bitfield { .. }
+            | Insn::Extr { .. }
+            | Insn::AddSubShift { .. }
+            | Insn::AddSubExt { .. }
+            | Insn::LogicShift { .. }
+            | Insn::AddSubCarry { .. }
+            | Insn::CondCmp { .. }
+            | Insn::CondSel { .. }
+            | Insn::Dp1 { .. }
+            | Insn::Dp2 { .. }
+            | Insn::Mul { .. }
+            | Insn::Adr { .. }
+            | Insn::Adrp { .. }
+    )
+}
+
+fn gen_alu(r: &mut Rng) -> u32 {
+    loop {
+        let op0 = [0b1000u32, 0b1001, 0b0101, 0b1101][r.below(4) as usize];
+        let w = (r.next() as u32 & !(0xf << 25)) | (op0 << 25);
+        if is_alu(&decode(w)) {
+            return w;
+        }
+    }
+}
+
+/// Memory op with base in {x20, x22, sp}; offsets keep accesses in DATA.
+fn gen_mem(r: &mut Rng) -> u32 {
+    loop {
+        let op0 = [0b0100u32, 0b0110, 0b1100, 0b1110][r.below(4) as usize];
+        let mut w = (r.next() as u32 & !(0xf << 25)) | (op0 << 25);
+        let base = [20u32, 22, 31][r.below(3) as usize];
+        w = (w & !(31 << 5)) | (base << 5);
+        let i = decode(w);
+        let off_ok = match i {
+            Insn::LdSt { offset, .. } | Insn::LdStPair { offset, .. } => offset.abs() < 0x7000,
+            _ => true,
+        };
+        if !off_ok {
+            continue;
+        }
+        let ok = match i {
+            Insn::LdSt { fp: false, rt, rn, index, .. } => {
+                !(matches!(index, kemu_core::decode::Index::Pre | kemu_core::decode::Index::Post) && rt == rn)
+            }
+            Insn::LdStPair { fp: false, rt, rt2, rn, index, load, .. } => {
+                rt != rn && rt2 != rn && !(load && rt == rt2) && {
+                    let _ = index;
+                    true
+                }
+            }
+            Insn::LdStReg { fp: false, .. } => {
+                // index register forced to x23 (small value)
+                w = (w & !(31 << 16)) | (23 << 16);
+                true
+            }
+            Insn::LdSt { fp: true, .. } | Insn::LdStPair { fp: true, .. } => true,
+            Insn::Atomic { rs, rt, rn, .. } => rs != rn && rt != rn,
+            Insn::Cas { pair: false, rs, rt, rn, .. } => rs != rn && rt != rn,
+            _ => false,
+        };
+        if ok {
+            // Re-decode in case we patched rm.
+            let i2 = decode(w);
+            if matches!(i2, Insn::Undefined) {
+                continue;
+            }
+            // Writes to the base registers would break later accesses.
+            let writes_base = match i2 {
+                Insn::LdSt { load: true, rt, fp: false, .. } => rt == 20 || rt == 22 || rt == 23,
+                Insn::LdStReg { load: true, rt, fp: false, .. } => rt == 20 || rt == 22 || rt == 23,
+                Insn::LdStPair { load: true, rt, rt2, fp: false, .. } => [rt, rt2].iter().any(|x| *x == 20 || *x == 22 || *x == 23),
+                Insn::Atomic { rt, .. } => rt == 20 || rt == 22 || rt == 23,
+                Insn::Cas { rs, .. } => rs == 20 || rs == 22 || rs == 23,
+                _ => false,
+            };
+            if !writes_base {
+                return w;
+            }
+        }
+    }
+}
+
+static mut MAXLEN: u64 = 24;
+
+fn gen_case(r: &mut Rng, mode: u32) -> Vec<u32> {
+    let n = 1 + r.below(unsafe { MAXLEN }) as usize;
+    let mut v = Vec::new();
+    for k in 0..n {
+        let w = match mode {
+            0 => gen_alu(r),
+            1 => gen_mem(r),
+            _ => {
+                // mixed with forward branches
+                match r.below(6) {
+                    0 if k + 2 < n => {
+                        // b.cond / cbz / tbz forward by 1..=(n-k-1)
+                        let off = 1 + r.below((n - k - 1) as u64) as i32;
+                        match r.below(3) {
+                            0 => 0x5400_0000 | (((off as u32) & 0x7ffff) << 5) | r.below(15) as u32,
+                            1 => 0x3400_0000 | (r.below(2) as u32) << 31 | (r.below(2) as u32) << 24 | (((off as u32) & 0x7ffff) << 5) | r.below(31) as u32,
+                            _ => 0x3600_0000 | (r.below(2) as u32) << 31 | (r.below(2) as u32) << 24 | (r.below(32) as u32) << 19 | (((off as u32) & 0x3fff) << 5) | r.below(31) as u32,
+                        }
+                    }
+                    1 => gen_mem(r),
+                    _ => gen_alu(r),
+                }
+            }
+        };
+        v.push(w);
+    }
+    v.push(0xd420_0000); // brk #0
+    v
+}
+
+fn init_state(r: &mut Rng) -> CpuState {
+    let mut s = CpuState::new();
+    for i in 0..31 {
+        s.x[i] = r.val();
+    }
+    s.x[20] = DATA + 0x8000;
+    s.x[22] = DATA + 0x8000 + 8 * r.below(16);
+    s.x[23] = 8 * r.below(8);
+    s.sp = DATA + 0x8000;
+    s.nzcv = (r.below(16)) << 28;
+    for i in 0..32 {
+        s.v[i] = [r.val(), r.val()];
+    }
+    s
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let iters: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(100_000);
+    let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0x1234_5678_9abc_def1);
+    let only_mode: Option<u32> = args.get(3).and_then(|s| s.parse().ok());
+    let maxlen: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(24);
+    unsafe { MAXLEN = maxlen };
+
+    map_fixed(REGION, CODE_SIZE, 7);
+    map_fixed(TABLE, TABLE_ENTRIES * 8, 3);
+    map_fixed(STATE, 4096 + RSTACK_SIZE, 3);
+    map_fixed(GUEST, GUEST_SIZE, 3);
+    map_fixed(DATA, DATA_SIZE, 3);
+    unsafe {
+        assert_eq!(arch_prctl(0x1001 /* ARCH_SET_GS */, STATE), 0);
+    }
+    let stub_buf = unsafe { std::slice::from_raw_parts_mut(REGION as *mut u8, 4096) };
+    let so = stubs::gen_stubs(stub_buf, ExitMode::Call(jt_harness_entry as u64), TABLE, ((TABLE_ENTRIES - 1) << 3) as u32).unwrap();
+    unsafe {
+        H = Some(Harness {
+            stubs: so,
+            code_used: 4096,
+            map: HashMap::new(),
+            scratch: Box::new(Scratch::new()),
+            stop: None,
+            translations: 0,
+            helpers: 0,
+        });
+    }
+
+    let mut rng = Rng(seed);
+    let mut data_init = vec![0u8; DATA_SIZE];
+    let mut fails = 0;
+    let mut shown = 0;
+    let mut classes: HashMap<String, usize> = HashMap::new();
+    for it in 0..iters {
+        let mode = only_mode.unwrap_or((it % 3) as u32);
+        let code = gen_case(&mut rng, mode);
+        let init = init_state(&mut rng);
+        for b in data_init.iter_mut() {
+            *b = rng.next() as u8;
+        }
+        let data = unsafe { std::slice::from_raw_parts_mut(DATA as *mut u8, DATA_SIZE) };
+        let gcode = unsafe { std::slice::from_raw_parts_mut(GUEST as *mut u32, code.len()) };
+        gcode.copy_from_slice(&code);
+
+        data.copy_from_slice(&data_init);
+        let (ref_st, ref_ex) = run_interp(&init);
+        let ref_data = data.to_vec();
+
+        data.copy_from_slice(&data_init);
+        reset_cache();
+        let (jit_st, jit_ex) = run_jit(&init);
+
+        let mut bad = Vec::new();
+        for i in 0..31 {
+            if ref_st.x[i] != jit_st.x[i] {
+                bad.push(format!("x{i}: ref {:#x} jit {:#x}", ref_st.x[i], jit_st.x[i]));
+            }
+        }
+        if ref_st.sp != jit_st.sp {
+            bad.push(format!("sp: ref {:#x} jit {:#x}", ref_st.sp, jit_st.sp));
+        }
+        if ref_st.pc != jit_st.pc {
+            bad.push(format!("pc: ref {:#x} jit {:#x}", ref_st.pc, jit_st.pc));
+        }
+        if ref_st.nzcv != jit_st.nzcv {
+            bad.push(format!("nzcv: ref {:#x} jit {:#x}", ref_st.nzcv, jit_st.nzcv));
+        }
+        for i in 0..32 {
+            if ref_st.v[i] != jit_st.v[i] {
+                bad.push(format!("v{i}: ref {:x?} jit {:x?}", ref_st.v[i], jit_st.v[i]));
+            }
+        }
+        if ref_data != data {
+            let k = (0..DATA_SIZE).find(|&k| ref_data[k] != data[k]).unwrap();
+            bad.push(format!("mem differs at +{k:#x}"));
+        }
+        if format!("{:?}", Some(ref_ex)) != format!("{:?}", jit_ex) {
+            bad.push(format!("exit: ref {ref_ex:?} jit {jit_ex:?}"));
+        }
+        if !bad.is_empty() {
+            for w in &code {
+                let name = format!("{:?}", decode(*w));
+                let key = name.split(|c: char| c == ' ' || c == '{').next().unwrap_or("").to_string();
+                *classes.entry(key).or_insert(0usize) += 1;
+            }
+            fails += 1;
+            let show = std::env::var("SHOW").ok();
+            let matches = match &show {
+                Some(c) => code.iter().any(|w| format!("{:?}", decode(*w)).starts_with(c.as_str())),
+                None => true,
+            };
+            if matches && { shown += 1; shown } <= 10 {
+                println!("FAIL case {it} (mode {mode}):");
+                for w in &code {
+                    println!("  {:08x}  {:?}", w, decode(*w));
+                }
+                println!("  init nzcv {:#x}", init.nzcv);
+                for b in &bad {
+                    println!("  {b}");
+                }
+            }
+        }
+    }
+    let mut cv: Vec<_> = classes.into_iter().collect();
+    cv.sort_by(|a, b| b.1.cmp(&a.1));
+    println!("classes in failing cases: {:?}", cv);
+    let hh = h();
+    println!(
+        "{iters} cases, {fails} failures; {} translations, {} helper calls",
+        hh.translations, hh.helpers
+    );
+    std::process::exit(if fails == 0 { 0 } else { 1 });
+}

@@ -1,0 +1,11 @@
+[package]
+name = "difftest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kemu_core = { path = "../../overlay/rust/kemu_core", features = ["std"] }
+
+[[bin]]
+name = "difftest"
+path = "src/main.rs"
