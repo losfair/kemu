@@ -238,8 +238,83 @@ pub struct Ret {
     stop: u64,
 }
 
+static IN_RUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static IN_OP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static INTERRUPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Asynchronous interruption: recover the guest state exactly as the kernel
+/// does (kemu_materialize) and resume through the dispatcher.
+extern "C" fn on_alarm(_sig: i32, _info: *mut libc::siginfo_t, ucv: *mut libc::c_void) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if !IN_RUN.load(SeqCst) || IN_OP.load(SeqCst) {
+        return;
+    }
+    let uc = unsafe { &mut *(ucv as *mut libc::ucontext_t) };
+    let g = &mut uc.uc_mcontext.gregs;
+    let rip = g[libc::REG_RIP as usize] as u64;
+    let hregs = meta::HostRegs {
+        gpr: [
+            g[libc::REG_RAX as usize] as u64, g[libc::REG_RCX as usize] as u64,
+            g[libc::REG_RDX as usize] as u64, g[libc::REG_RBX as usize] as u64,
+            g[libc::REG_RSP as usize] as u64, g[libc::REG_RBP as usize] as u64,
+            g[libc::REG_RSI as usize] as u64, g[libc::REG_RDI as usize] as u64,
+            g[libc::REG_R8 as usize] as u64, g[libc::REG_R9 as usize] as u64,
+            g[libc::REG_R10 as usize] as u64, g[libc::REG_R11 as usize] as u64,
+            g[libc::REG_R12 as usize] as u64, g[libc::REG_R13 as usize] as u64,
+            g[libc::REG_R14 as usize] as u64, g[libc::REG_R15 as usize] as u64,
+        ],
+        rflags: g[libc::REG_EFL as usize] as u64,
+    };
+    let st = state();
+    let hh = h();
+    if rip >= REGION && rip < REGION + 4096 {
+        let info = hh.stubs.info((rip - REGION) as u32);
+        if info != stubs::STUB_PAGE_STATE {
+            if info == stubs::STUB_PINNED_LIVE_PC_RAX {
+                st.pc = hregs.gpr[0];
+            }
+            meta::pinned_from_host(st, &hregs);
+        }
+        st.nzcv = nzcv_from_image(st.flags_x86);
+    } else if let Some(&(b, sz)) = hh.blocks.iter().find(|(b, sz)| rip >= *b && rip < *b + *sz as u64) {
+        let blk = unsafe { std::slice::from_raw_parts(b as *const u8, sz) };
+        if !meta::recover(blk, (rip - b) as u32, &hregs, st) {
+            let msg = b"recover failed\n";
+            unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
+            unsafe { libc::abort() };
+        }
+    } else {
+        return;
+    }
+    st.flags_x86 = image_from_nzcv(st.nzcv);
+    INTERRUPTS.fetch_add(1, SeqCst);
+    g[libc::REG_RIP as usize] = (REGION + hh.stubs.dispatch as u64) as i64;
+    g[libc::REG_RSP as usize] = (RSTACK_TOP - 64) as i64;
+}
+
+fn install_alarm(us: i64) {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_alarm as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+        libc::sigaction(libc::SIGALRM, &sa, std::ptr::null_mut());
+        let it = libc::itimerval {
+            it_interval: libc::timeval { tv_sec: 0, tv_usec: us },
+            it_value: libc::timeval { tv_sec: 0, tv_usec: us },
+        };
+        libc::setitimer(libc::ITIMER_REAL, &it, std::ptr::null_mut());
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn jt_handle_op(op: u32) -> Ret {
+    IN_OP.store(true, std::sync::atomic::Ordering::SeqCst);
+    let r = jt_handle_op_inner(op);
+    IN_OP.store(false, std::sync::atomic::Ordering::SeqCst);
+    r
+}
+
+fn jt_handle_op_inner(op: u32) -> Ret {
     let st = state();
     match op {
         OP_TRANSLATE | OP_CHAIN => match lookup_or_translate(st.pc) {
@@ -317,7 +392,9 @@ fn run_jit(init: &CpuState) -> (CpuState, Option<Exit>) {
         unsafe { ((RSTACK_TOP - 64 + i * 8) as *mut u64).write(REGION + h().stubs.dispatch_rax as u64) };
     }
     h().stop = None;
+    IN_RUN.store(true, std::sync::atomic::Ordering::SeqCst);
     unsafe { jt_enter(RSTACK_TOP - 64, REGION + h().stubs.dispatch as u64) };
+    IN_RUN.store(false, std::sync::atomic::Ordering::SeqCst);
     let mut out = *st;
     out.fpsr = fpsr_merge(out.fpsr, out.scratch[7] as u32);
     // After a helper stop, nzcv is authoritative; otherwise the image is.
@@ -331,7 +408,7 @@ fn run_interp(init: &CpuState) -> (CpuState, Exit) {
     let mut st = *init;
     st.pc = GUEST;
     loop {
-        let (ex, _) = interp::run(&mut st, &mut UEnv, 100_000);
+        let (ex, _) = interp::run(&mut st, &mut UEnv, 10_000_000);
         match ex {
             Exit::Budget => panic!("interp ran away"),
             e => return (st, e),
@@ -516,9 +593,41 @@ fn gen_calls(r: &mut Rng) -> Vec<u32> {
     v
 }
 
+/// A counted loop around random ALU/memory ops (x24 = counter).
+fn gen_loop(r: &mut Rng) -> Vec<u32> {
+    let mut v = vec![0xd280_fa18u32]; // mov x24, #2000
+    let body = 1 + r.below(12) as usize;
+    for _ in 0..body {
+        let w = loop {
+            let w = if r.below(3) == 0 { gen_mem(r) } else { gen_alu(r) };
+            let i = decode(w);
+            let rd = w & 31;
+            let bad_rd = [20, 22, 23, 24, 31].contains(&rd);
+            let writes_rt = matches!(i, Insn::LdSt { load: true, .. } | Insn::LdStPair { load: true, .. } | Insn::LdStReg { load: true, .. } | Insn::Atomic { .. } | Insn::Cas { .. });
+            let touches24 = [w & 31, (w >> 10) & 31, (w >> 16) & 31].contains(&24);
+            if !bad_rd && !(writes_rt && rd == 24) && !touches24 {
+                // memory ops with writeback walk the base; keep them in bounds
+                let wb = matches!(i, Insn::LdSt { index: kemu_core::decode::Index::Pre | kemu_core::decode::Index::Post, .. } | Insn::LdStPair { index: kemu_core::decode::Index::Pre | kemu_core::decode::Index::Post, .. });
+                if !wb {
+                    break w;
+                }
+            }
+        };
+        v.push(w);
+    }
+    v.push(0xf100_0718); // subs x24, x24, #1
+    let off = -(body as i32 + 1);
+    v.push(0x5400_0001 | (((off as u32) & 0x7ffff) << 5)); // b.ne loop
+    v.push(0xd420_0000);
+    v
+}
+
 fn gen_case(r: &mut Rng, mode: u32) -> Vec<u32> {
     if mode == 4 {
         return gen_calls(r);
+    }
+    if mode == 5 {
+        return gen_loop(r);
     }
     let n = 1 + r.below(unsafe { MAXLEN }) as usize;
     let mut v = Vec::new();
@@ -656,6 +765,9 @@ fn main() {
         });
     }
 
+    if let Some(us) = std::env::var("INTR").ok().and_then(|v| v.parse().ok()) {
+        install_alarm(us);
+    }
     let mut rng = Rng(seed);
     let mut data_init = vec![0u8; DATA_SIZE];
     let mut fails = 0;
@@ -754,6 +866,7 @@ fn main() {
     cv.sort_by(|a, b| b.1.cmp(&a.1));
     println!("classes in failing cases: {:?}", cv);
     println!("fpsr differences (not counted as failures): {fpsr_diffs}");
+    println!("async interruptions recovered: {}", INTERRUPTS.load(std::sync::atomic::Ordering::SeqCst));
     let hh = h();
     println!(
         "{iters} cases, {fails} failures; {} translations, {} helper calls",

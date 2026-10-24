@@ -49,6 +49,10 @@ pub mod kind {
     pub const EXIT_RAX: u8 = 5;
     /// Instruction `idx` completed (pc = idx + 1); `a` = flags location.
     pub const DONE: u8 = 6;
+    /// Register remapping state changes to `a`: 0 canonical, 1 victims and
+    /// candidates in the state page, 2 remapped (candidates in the victims'
+    /// host registers, victims in the page).
+    pub const REMAP: u8 = 7;
 }
 
 /// Flag locations for `kind::INSN` points.
@@ -168,10 +172,11 @@ impl Header {
 }
 
 /// Serialize metadata into `b`; returns bytes written.
-pub fn write_meta(b: &mut [u8], points: &[Point], exits: &[Exit]) -> Option<usize> {
+pub fn write_meta(b: &mut [u8], points: &[Point], exits: &[Exit], remap: &[(u8, u8)]) -> Option<usize> {
     let np = u16::try_from(points.len()).ok()?;
     let ne = u16::try_from(exits.len()).ok()?;
-    if !(put16(b, 0, np) && put16(b, 2, ne) && put32(b, 4, 0)) {
+    let nr = u32::try_from(remap.len()).ok()?;
+    if !(put16(b, 0, np) && put16(b, 2, ne) && put32(b, 4, nr)) {
         return None;
     }
     let mut off = META_HDR_SIZE;
@@ -190,6 +195,12 @@ pub fn write_meta(b: &mut [u8], points: &[Point], exits: &[Exit]) -> Option<usiz
             return None;
         }
         off += EXIT_SIZE;
+    }
+    for (v, c) in remap {
+        let d = b.get_mut(off..off + 2)?;
+        d[0] = *v;
+        d[1] = *c;
+        off += 2;
     }
     Some(off)
 }
@@ -270,6 +281,7 @@ pub fn recover(blk: &[u8], host_off: u32, h: &HostRegs, st: &mut CpuState) -> bo
     // the enclosing instruction start.
     let mut best: Option<Point> = None;
     let mut flags_loc = FLAGS_MEM;
+    let mut remap_mode = 0u8;
     for i in 0..np {
         let p = match read_point(m, i) {
             Some(p) => p,
@@ -281,6 +293,10 @@ pub fn recover(blk: &[u8], host_off: u32, h: &HostRegs, st: &mut CpuState) -> bo
         match p.kind {
             kind::INSN => flags_loc = p.a,
             kind::FLAGS_MEM => flags_loc = FLAGS_MEM,
+            kind::REMAP => {
+                remap_mode = p.a;
+                continue;
+            }
             _ => {}
         }
         best = Some(p);
@@ -290,7 +306,28 @@ pub fn recover(blk: &[u8], host_off: u32, h: &HostRegs, st: &mut CpuState) -> bo
         None => return false,
     };
 
+    // Page values of remap victims (pinned registers that were spilled).
+    let nr = get32(m, 4).unwrap_or(0) as usize;
+    let (_, ne) = meta_counts(m).unwrap_or((0, 0));
+    let roff = META_HDR_SIZE + np * POINT_SIZE + ne * EXIT_SIZE;
+    let mut pairs = [(0u32, 0u32, 0u64); 4];
+    let nr = nr.min(4);
+    for (k, slot) in pairs.iter_mut().enumerate().take(nr) {
+        let v = m.get(roff + 2 * k).copied().unwrap_or(0) as u32;
+        let c = m.get(roff + 2 * k + 1).copied().unwrap_or(0) as u32;
+        let page_v = if v == GUEST_SP { st.sp } else { st.xr(v) };
+        *slot = (v, c, page_v);
+    }
     pinned_from_host(st, h);
+    if remap_mode != 0 {
+        for &(v, c, page_v) in pairs.iter().take(nr) {
+            let host_val = regmap::host_of(v).map(|r| h.gpr[(r & 15) as usize]).unwrap_or(0);
+            set_guest(st, v, page_v);
+            if remap_mode == 2 {
+                set_guest(st, c, host_val);
+            }
+        }
+    }
     let pc_of = |idx: u16| hdr.guest_pc.wrapping_add((idx as u64) * 4);
     let flags_from = |st: &mut CpuState, loc: u8| match loc {
         FLAGS_HOST => st.nzcv = regmap::nzcv_from_rflags(h.rflags, false),

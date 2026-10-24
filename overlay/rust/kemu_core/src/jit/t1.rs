@@ -111,7 +111,17 @@ struct Gen<'s, 'b> {
     overflow: bool,
     /// Operand size of MADD/MSUB (from the instruction's sf bit).
     mul_sz: Sz,
+    /// Register remapping for this block: (victim guest, candidate guest).
+    /// While `remapped`, each candidate lives in its victim's host
+    /// register and each victim lives in the state page.
+    remap: [(u32, u32); MAX_REMAP],
+    nremap: usize,
+    remapped: bool,
+    /// Loop-body entry (after the remap prologue); self-loops jump here.
+    body_off: usize,
 }
+
+pub const MAX_REMAP: usize = 4;
 
 fn rd_sp(rd: u32) -> u32 {
     if rd == 31 {
@@ -246,10 +256,62 @@ impl<'s, 'b> Gen<'s, 'b> {
         } else {
             n
         };
+        if self.remapped {
+            for &(v, c) in self.remap.iter().take(self.nremap) {
+                if n == c {
+                    if let Some(r) = host_of(v) {
+                        return Gp::R(r);
+                    }
+                }
+                if n == v {
+                    return Gp::M(slot_of(v));
+                }
+            }
+        }
         match host_of(n) {
             Some(r) => Gp::R(r),
             None => Gp::M(slot_of(n)),
         }
+    }
+
+    /// Establish the block's register remapping (canonical -> remapped).
+    fn remap_prologue(&mut self) {
+        if self.nremap == 0 || self.remapped {
+            return;
+        }
+        for &(v, _) in self.remap.iter().take(self.nremap) {
+            if let Some(r) = host_of(v) {
+                self.a.store(Sz::Q, Mem::gs(slot_of(v)), r);
+            }
+        }
+        self.point(kind::REMAP, 1, 0);
+        for &(v, c) in self.remap.iter().take(self.nremap) {
+            if let Some(r) = host_of(v) {
+                self.a.load(Sz::Q, r, Mem::gs(slot_of(c)));
+            }
+        }
+        self.remapped = true;
+        self.point(kind::REMAP, 2, 0);
+    }
+
+    /// Return to the canonical register map (remapped -> canonical).
+    fn remap_epilogue(&mut self) {
+        if !self.remapped {
+            return;
+        }
+        for &(v, c) in self.remap.iter().take(self.nremap) {
+            if let Some(r) = host_of(v) {
+                self.a.store(Sz::Q, Mem::gs(slot_of(c)), r);
+            }
+        }
+        self.remapped = false;
+        self.point(kind::REMAP, 1, 0);
+        for &(v, _) in self.remap.iter().take(self.nremap) {
+            if let Some(r) = host_of(v) {
+                self.a.load(Sz::Q, r, Mem::gs(slot_of(v)));
+            }
+        }
+        self.point(kind::REMAP, 0, 0);
     }
 
     /// `mov` an immediate without touching flags.
@@ -355,9 +417,11 @@ impl<'s, 'b> Gen<'s, 'b> {
     /// Unconditional exit to guest `target`. Flags must be in memory.
     fn exit_to(&mut self, target: u64, main_off: usize) {
         if target == self.pc0 {
-            self.a.jmp(Some(main_off));
+            let t = if self.remapped { self.body_off } else { main_off };
+            self.a.jmp(Some(t));
             return;
         }
+        self.remap_epilogue();
         self.pad_for_rel32(1);
         let at = self.a.jmp(None);
         self.add_exit(at as u32, target);
@@ -366,7 +430,20 @@ impl<'s, 'b> Gen<'s, 'b> {
     /// Conditional exit to guest `target` if `cc`.
     fn exit_if(&mut self, cc: Cc, target: u64, main_off: usize) {
         if target == self.pc0 {
-            self.a.jcc(cc, Some(main_off));
+            let t = if self.remapped { self.body_off } else { main_off };
+            self.a.jcc(cc, Some(t));
+            return;
+        }
+        if self.remapped {
+            // Out-of-line exit with the epilogue; fall through stays remapped.
+            let skip = self.a.jcc(cc.invert(), None);
+            self.remap_epilogue();
+            self.pad_for_rel32(1);
+            let at = self.a.jmp(None);
+            self.add_exit(at as u32, target);
+            self.a.bind32(skip);
+            self.remapped = true;
+            self.point(kind::REMAP, 2, 0);
             return;
         }
         self.pad_for_rel32(2);
@@ -376,12 +453,14 @@ impl<'s, 'b> Gen<'s, 'b> {
 
     /// Indirect exit: target guest PC in %rax.
     fn exit_rax(&mut self) {
+        self.remap_epilogue();
         self.point(kind::EXIT_RAX, 0, 0);
         self.jmp_abs(self.cfg.stubs.dispatch_rax);
     }
 
     /// Indirect jump through a per-site inline cache (target PC in %rax).
     fn exit_ic(&mut self) {
+        self.remap_epilogue();
         self.point(kind::EXIT_RAX, 0, 0);
         self.pad_for_rel32(1);
         let at = self.a.jmp(None);
@@ -397,6 +476,7 @@ impl<'s, 'b> Gen<'s, 'b> {
     /// Guest call: host `call` so the matching guest RET is predicted by
     /// the CPU's return stack. `target` None = indirect (in %rax).
     fn call_to(&mut self, target: Option<u64>, next: u64, main_off: usize) {
+        self.remap_epilogue();
         self.mov_imm(RSI, next);
         match target {
             Some(t) if t == self.pc0 => {
@@ -434,12 +514,17 @@ impl<'s, 'b> Gen<'s, 'b> {
     fn helper(&mut self) {
         self.flags_to_mem();
         self.fl.host = false;
+        let was = self.remapped;
+        self.remap_epilogue();
         let pc = self.pc();
         self.mov_imm(RAX, pc);
         self.a.store(Sz::Q, Mem::gs(OFF_PC), RAX);
         self.call_abs(self.cfg.stubs.helper);
         self.fl = Flags { host: false, inv: false, mem: true };
         self.point(kind::DONE, FLAGS_MEM, 0);
+        if was {
+            self.remap_prologue();
+        }
     }
 
     // ---- shifted / extended operands ----
@@ -1564,6 +1649,155 @@ impl<'s, 'b> Gen<'s, 'b> {
     }
 }
 
+/// GPR fields of an instruction (conservative: V register numbers in FP
+/// forms may be included, which only makes the choice more cautious).
+fn gpr_fields(i: &Insn, out: &mut [u32; 6]) -> usize {
+    let mut n = 0;
+    let mut push = |r: u32| {
+        if let Some(x) = out.get_mut(n) {
+            *x = r;
+            n += 1;
+        }
+    };
+    match *i {
+        Insn::Adr { rd, .. } | Insn::Adrp { rd, .. } => push(rd),
+        Insn::AddSubImm { rd, rn, .. } | Insn::LogicImm { rd, rn, .. } | Insn::Bitfield { rd, rn, .. } => {
+            push(rd);
+            push(rn)
+        }
+        Insn::MovN { rd, .. } | Insn::MovZ { rd, .. } | Insn::MovK { rd, .. } => push(rd),
+        Insn::Extr { rd, rn, rm, .. }
+        | Insn::AddSubShift { rd, rn, rm, .. }
+        | Insn::AddSubExt { rd, rn, rm, .. }
+        | Insn::LogicShift { rd, rn, rm, .. }
+        | Insn::AddSubCarry { rd, rn, rm, .. }
+        | Insn::CondSel { rd, rn, rm, .. }
+        | Insn::Dp2 { rd, rn, rm, .. } => {
+            push(rd);
+            push(rn);
+            push(rm)
+        }
+        Insn::CondCmp { rn, imm_or_rm, reg, .. } => {
+            push(rn);
+            if reg {
+                push(imm_or_rm)
+            }
+        }
+        Insn::Dp1 { rd, rn, .. } => {
+            push(rd);
+            push(rn)
+        }
+        Insn::Mul { rd, rn, rm, ra, .. } => {
+            push(rd);
+            push(rn);
+            push(rm);
+            push(ra)
+        }
+        Insn::Cbz { rt, .. } | Insn::Tbz { rt, .. } => push(rt),
+        Insn::Br { rn } | Insn::Blr { rn } | Insn::Ret { rn } => push(rn),
+        Insn::LdSt { rt, rn, fp, .. } => {
+            if !fp {
+                push(rt)
+            }
+            push(rn)
+        }
+        Insn::LdStReg { rt, rn, rm, fp, .. } => {
+            if !fp {
+                push(rt)
+            }
+            push(rn);
+            push(rm)
+        }
+        Insn::LdStPair { rt, rt2, rn, fp, .. } => {
+            if !fp {
+                push(rt);
+                push(rt2)
+            }
+            push(rn)
+        }
+        Insn::LdStLiteral { rt, fp, .. } => {
+            if !fp {
+                push(rt)
+            }
+        }
+        _ => {}
+    }
+    n
+}
+
+/// Pick up to MAX_REMAP (victim, candidate) pairs for a block: candidates
+/// are frequently used unpinned registers, victims pinned registers the
+/// block never touches. Returns 0 for blocks that use anything we cannot
+/// account for (helpers, syscalls, unknown register uses).
+fn choose_remap(words: &[u32], out: &mut [(u32, u32); MAX_REMAP]) -> usize {
+    let mut count = [0u32; 33];
+    let mut used_pinned = [false; 33];
+    let mut f = [0u32; 6];
+    let mut self_loop = false;
+    for (k, w) in words.iter().enumerate() {
+        let i = decode::decode(*w);
+        if !is_native(&i) || matches!(i, Insn::Svc { .. } | Insn::Mrs { .. } | Insn::MsrReg { .. }) {
+            return 0;
+        }
+        // Anything outside the integer/memory/branch subset: be safe.
+        let nf = gpr_fields(&i, &mut f);
+        if nf == 0
+            && !matches!(
+                i,
+                Insn::B { .. } | Insn::Bl { .. } | Insn::BCond { .. } | Insn::Nop | Insn::Prfm | Insn::Dmb | Insn::Dsb
+            )
+        {
+            return 0;
+        }
+        if let Insn::BCond { imm, .. } | Insn::Cbz { imm, .. } | Insn::Tbz { imm, .. } | Insn::B { imm } = i {
+            if (k as i64) * 4 + imm == 0 {
+                self_loop = true;
+            }
+        }
+        if matches!(i, Insn::Bl { .. } | Insn::Blr { .. }) {
+            used_pinned[30] = true;
+        }
+        for r in f.iter().take(nf) {
+            let g = if *r == 31 { GUEST_SP } else { *r };
+            if host_of(g).is_some() {
+                used_pinned[g as usize] = true;
+            } else if (g as usize) < 31 {
+                count[g as usize] += 1;
+            }
+        }
+    }
+    let threshold = if self_loop { 2 } else { 4 };
+    let mut n = 0;
+    let mut victims = PINNED.iter().map(|(g, _)| *g).filter(|g| !used_pinned[*g as usize]);
+    loop {
+        // most used remaining candidate
+        let mut best = None;
+        for g in 0..31u32 {
+            if count[g as usize] >= threshold && best.is_none_or(|b: u32| count[g as usize] > count[b as usize]) {
+                best = Some(g);
+            }
+        }
+        let c = match best {
+            Some(c) => c,
+            None => break,
+        };
+        count[c as usize] = 0;
+        match victims.next() {
+            Some(v) => {
+                if let Some(slot) = out.get_mut(n) {
+                    *slot = (v, c);
+                    n += 1;
+                }
+            }
+            None => break,
+        }
+        if n == MAX_REMAP {
+            break;
+        }
+    }
+    n
+}
+
 /// Does `i` read the guest flags?
 fn uses_flags(i: &Insn) -> bool {
     match i {
@@ -1699,7 +1933,12 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
         ne: 0,
         overflow: false,
         mul_sz: Sz::Q,
+        remap: [(0, 0); MAX_REMAP],
+        nremap: 0,
+        remapped: false,
+        body_off: 0,
     };
+    g.nremap = choose_remap(&g.s.words[..n.min(MAX_INSNS)], &mut g.remap);
     // Header placeholder.
     for _ in 0..meta::HEADER_SIZE {
         g.a.byte(0);
@@ -1723,6 +1962,10 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
     g.rel_abs(jm, cfg.stubs.miss);
     let main_off = g.a.pos;
     g.a.patch_rel32(jmain, main_off);
+    g.idx = 0;
+    g.point(kind::INSN, FLAGS_MEM, 0);
+    g.remap_prologue();
+    g.body_off = g.a.pos;
 
     let mut ended = false;
     let mut idx = 0usize;
@@ -1967,6 +2210,7 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
             Insn::Ret { rn } => {
                 g.flags_to_mem();
                 g.get_into(rn, false, Sz::Q, RAX);
+                g.remap_epilogue();
                 g.point(kind::EXIT_RAX, 0, 0);
                 g.a.ret();
                 ended = true;
@@ -1989,6 +2233,7 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
             Insn::Svc { .. } => {
                 g.flags_to_mem();
                 g.fl.host = false;
+                g.remap_epilogue();
                 g.mov_imm(RAX, next);
                 g.a.store(Sz::Q, Mem::gs(OFF_PC), RAX);
                 g.call_abs(cfg.stubs.svc);
@@ -2043,6 +2288,8 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
     let meta_off = g.a.pos;
     let np = g.np;
     let overflow = g.overflow;
+    let g_nremap = g.nremap;
+    let g_remap = g.remap;
     let mut a = g.a;
     let s = g.s;
     if overflow || !a.ok() {
@@ -2050,7 +2297,9 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
     }
     let points = s.points.get(..np).unwrap_or(&[]);
     let exits = s.exits.get(..ne).unwrap_or(&[]);
-    let need = meta::META_HDR_SIZE + np * meta::POINT_SIZE + ne * meta::EXIT_SIZE;
+    let nremap = g_nremap;
+    let remap = g_remap;
+    let need = meta::META_HDR_SIZE + np * meta::POINT_SIZE + ne * meta::EXIT_SIZE + 2 * nremap;
     for _ in 0..need {
         a.byte(0);
     }
@@ -2060,7 +2309,11 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
     let total = a.pos;
     drop(a);
     let meta_buf = out.get_mut(meta_off..total).ok_or(TErr::NoSpace)?;
-    let mlen = meta::write_meta(meta_buf, points, exits).ok_or(TErr::NoSpace)?;
+    let mut pairs = [(0u8, 0u8); MAX_REMAP];
+    for (d, s) in pairs.iter_mut().zip(remap.iter().take(nremap)) {
+        *d = (s.0 as u8, s.1 as u8);
+    }
+    let mlen = meta::write_meta(meta_buf, points, exits, &pairs[..nremap]).ok_or(TErr::NoSpace)?;
     let hdr = Header {
         main_off: main_off as u32,
         code_end: code_end as u32,

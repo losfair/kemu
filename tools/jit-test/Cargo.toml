@@ -6,6 +6,7 @@ license = "GPL-2.0"
 description = "Userspace differential tester for the kemu JIT (JIT vs interpreter)"
 
 [dependencies]
+libc = "0.2"
 kemu_core = { path = "../../overlay/rust/kemu_core", features = ["std"] }
 
 [profile.release]
