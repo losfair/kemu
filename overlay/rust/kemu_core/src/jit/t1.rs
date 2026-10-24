@@ -47,7 +47,12 @@ pub struct Scratch {
     live_after: [u8; MAX_INSNS],
     points: [Point; MAX_POINTS],
     exits: [Exit; MAX_EXITS],
+    /// Direct exit targets at which the guest flags are dead.
+    dead: [u64; MAX_DEAD],
+    ndead: u32,
 }
+
+const MAX_DEAD: usize = 32;
 
 impl Scratch {
     pub const fn new() -> Self {
@@ -56,6 +61,8 @@ impl Scratch {
             live_after: [0; MAX_INSNS],
             points: [Point { off: 0, idx: 0, kind: 0, a: 0, b: 0 }; MAX_POINTS],
             exits: [Exit { site: 0, kind: 0, target: 0 }; MAX_EXITS],
+            dead: [0; MAX_DEAD],
+            ndead: 0,
         }
     }
 }
@@ -210,6 +217,18 @@ impl<'s, 'b> Gen<'s, 'b> {
             self.a.store(Sz::W, Mem::gs(OFF_FLAGS_X86), RAX);
             self.fl.mem = true;
             self.point(kind::FLAGS_MEM, 0, 0);
+        }
+    }
+
+    /// Guest flags are dead at direct exit target `t` (see flags_dead_at).
+    fn dead_at(&self, t: u64) -> bool {
+        self.s.dead.iter().take(self.s.ndead as usize).any(|&d| d == t)
+    }
+
+    /// Write the flags image before exiting to `t`, unless dead there.
+    fn flags_for_exit(&mut self, t: u64) {
+        if !self.dead_at(t) {
+            self.flags_to_mem();
         }
     }
 
@@ -475,7 +494,8 @@ impl<'s, 'b> Gen<'s, 'b> {
     /// Note: writing the image may flip the carry polarity (cmc), so the
     /// host condition is computed after any inline save.
     fn bcond_exit(&mut self, cond: u32, target: u64, main_off: usize) -> bool {
-        let inline_save = if target == self.pc0 { self.live_in0 } else { !self.fl.host || self.fl.mem };
+        let dead = if target == self.pc0 { !self.live_in0 } else { self.dead_at(target) };
+        let inline_save = !dead && (target == self.pc0 || !self.fl.host || self.fl.mem);
         if inline_save {
             self.flags_to_mem();
         }
@@ -483,7 +503,7 @@ impl<'s, 'b> Gen<'s, 'b> {
             Some(cc) => cc,
             None => return false,
         };
-        if target == self.pc0 || !self.fl.host || self.fl.mem {
+        if dead || target == self.pc0 || !self.fl.host || self.fl.mem {
             self.exit_if(cc, target, main_off);
             return true;
         }
@@ -1937,6 +1957,38 @@ fn choose_remap(words: &[u32], out: &mut [(u32, u32); MAX_REMAP]) -> usize {
 }
 
 /// Does `i` read the guest flags?
+/// Are the guest flags dead on entry to `pc`, i.e. written before being
+/// read on every path? Looks at a few straight-line instructions, follows
+/// B and both arms of CBZ/TBZ up to `depth`; anything else is "live".
+fn flags_dead_at<E: Env>(env: &mut E, mut pc: u64, depth: u32) -> bool {
+    for _ in 0..12 {
+        let insn = match env.fetch(pc) {
+            Ok(w) => decode::decode(w),
+            Err(_) => return false,
+        };
+        match insn {
+            Insn::B { imm } => {
+                pc = pc.wrapping_add(imm as u64);
+                continue;
+            }
+            Insn::Cbz { imm, .. } | Insn::Tbz { imm, .. } => {
+                return depth > 0
+                    && flags_dead_at(env, pc.wrapping_add(imm as u64), depth - 1)
+                    && flags_dead_at(env, pc.wrapping_add(4), depth - 1);
+            }
+            _ => {}
+        }
+        if uses_flags(&insn) || ends_block(&insn) {
+            return false;
+        }
+        if defs_flags(&insn) {
+            return true;
+        }
+        pc = pc.wrapping_add(4);
+    }
+    false
+}
+
 fn uses_flags(i: &Insn) -> bool {
     match i {
         // Side exits leave the block with the flags in memory, so the
@@ -2056,8 +2108,29 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
         }
     }
 
-    // 2. Flag liveness (live after each instruction; live-out at block end).
-    let mut live = true;
+    // 2. Flag liveness (live after each instruction). Direct exits look
+    // ahead into their targets: flags written before any read are dead.
+    s.ndead = 0;
+    let note_target = |s: &mut Scratch, env: &mut E, t: u64| -> bool {
+        let dead = flags_dead_at(env, t, 2);
+        if dead {
+            if let Some(d) = s.dead.get_mut(s.ndead as usize) {
+                *d = t;
+                s.ndead += 1;
+            } else {
+                return false;
+            }
+        }
+        dead
+    };
+    let last_pc = pc.wrapping_add((n.saturating_sub(1) as u64) * 4);
+    let last = decode::decode(s.words.get(n.wrapping_sub(1)).copied().unwrap_or(0));
+    let mut live = match last {
+        Insn::B { imm } => !note_target(s, env, last_pc.wrapping_add(imm as u64)),
+        Insn::Bl { imm } => !note_target(s, env, last_pc.wrapping_add(imm as u64)),
+        _ if !ends_block(&last) => !note_target(s, env, last_pc.wrapping_add(4)),
+        _ => true,
+    };
     let mut i = n;
     while i > 0 {
         i -= 1;
@@ -2065,7 +2138,18 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
             *l = live as u8;
         }
         let insn = decode::decode(s.words.get(i).copied().unwrap_or(0));
-        live = uses_flags(&insn) || (live && !defs_flags(&insn));
+        let ipc = pc.wrapping_add((i as u64) * 4);
+        live = match insn {
+            Insn::Cbz { imm, .. } | Insn::Tbz { imm, .. } => {
+                // The block's own last insn already exits to `next`.
+                live || !note_target(s, env, ipc.wrapping_add(imm as u64))
+            }
+            Insn::BCond { imm, .. } => {
+                note_target(s, env, ipc.wrapping_add(imm as u64));
+                true
+            }
+            _ => uses_flags(&insn) || (live && !defs_flags(&insn)),
+        };
     }
     let live_in0 = live;
 
@@ -2328,13 +2412,13 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
 
             // ---- branches ----
             Insn::B { imm } => {
-                g.flags_to_mem();
+                g.flags_for_exit(ipc.wrapping_add(imm as u64));
                 g.exit_to(ipc.wrapping_add(imm as u64), main_off);
                 ended = true;
                 true
             }
             Insn::Bl { imm } => {
-                g.flags_to_mem();
+                g.flags_for_exit(ipc.wrapping_add(imm as u64));
                 g.call_to(Some(ipc.wrapping_add(imm as u64)), next, main_off);
                 ended = true;
                 true
@@ -2344,12 +2428,12 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
                 g.flags_to_host();
                 if g.bcond_exit(cond, target, main_off) {
                     if idx + 1 == n {
-                        g.flags_to_mem();
+                        g.flags_for_exit(next);
                         g.exit_to(next, main_off);
                         ended = true;
                     }
                 } else {
-                    g.flags_to_mem();
+                    g.flags_for_exit(target);
                     g.exit_to(target, main_off);
                     ended = true;
                 }
@@ -2357,7 +2441,9 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
             }
             Insn::Cbz { sf, nz, rt, imm } => {
                 let target = ipc.wrapping_add(imm as u64);
-                g.flags_to_mem();
+                if g.live_after || !g.dead_at(target) {
+                    g.flags_to_mem();
+                }
                 g.fl.host = false;
                 let sz = Sz::from_sf(sf);
                 match g.gp(rt, false) {
@@ -2374,7 +2460,9 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
             }
             Insn::Tbz { bit, nz, rt, imm } => {
                 let target = ipc.wrapping_add(imm as u64);
-                g.flags_to_mem();
+                if g.live_after || !g.dead_at(target) {
+                    g.flags_to_mem();
+                }
                 g.fl.host = false;
                 let r = g.rm(rt, false, RAX);
                 g.a.bt_ri(Sz::Q, r, bit as u8);
@@ -2437,7 +2525,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
     }
     if !ended {
         g.idx = n;
-        g.flags_to_mem();
+        g.flags_for_exit(pc.wrapping_add((n as u64) * 4));
         let next = pc.wrapping_add((n as u64) * 4);
         g.idx = n.saturating_sub(1);
         g.point(kind::DONE, FLAGS_MEM, 0);
