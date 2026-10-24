@@ -26,7 +26,8 @@ Key decisions:
 | Syscalls | A third syscall ABI next to native and IA32 compat, with arm64 numbers and arm64 layouts, dispatched to the existing kernel implementations |
 | Signals and faults | Exact. The kernel rebuilds guest state from host state plus translator metadata and builds real arm64 signal frames |
 | Language | Translator, optimizer, code generator and guest-state model in **Rust** (`kemu-core`, `no_std`, no kernel deps). A thin, auditable **C** layer for entry, mm and signal hooks |
-| Performance | Two-tier JIT (fast baseline plus optimizing region compiler), static register pinning, lazy flags, call/return prediction, optional APX/AVX-512 back ends, shared per-inode translation cache |
+| Performance | Two-tier JIT (fast baseline plus optimizing region compiler), static register pinning, lazy flags, call/return prediction, shared per-inode translation cache. One back end: x86-64-v3 (AVX2), no APX/AVX-512 paths |
+| Distribution | Out-of-tree patch set against Linux v6.18. Not intended for upstream |
 | Target | ≥ 80% of native x86_64 throughput (geomean, methodology in §13), ≥ 95% on syscall/IO-bound workloads |
 
 ---
@@ -65,7 +66,11 @@ Key decisions:
 - System-mode emulation, arm64 kernel modules, arm64 KVM.
 - Calling host x86_64 libraries from guest code ("thunking", as in FEX/box64).
   Possible later (§16), but it breaks transparency and is out of scope.
-- Hosts without x86-64-v3 (AVX2, BMI1/2, FMA, LZCNT, MOVBE).
+- Hosts without x86-64-v3 (AVX2, BMI1/2, FMA, LZCNT, MOVBE) plus AES-NI and PCLMULQDQ.
+- APX and AVX-512/AVX10 back ends. kemu generates only VEX-encoded x86-64-v3 code,
+  so there is one register model, one encoder, and one performance profile to
+  validate. Hosts with APX or AVX-512 run the same code.
+- Upstream submission. kemu is maintained as an out-of-tree patch set (§5.6).
 
 ---
 
@@ -158,7 +163,8 @@ Lifecycle of a guest instruction:
 
 All core-kernel changes are small hooks guarded by `CONFIG_KEMU` and a static key
 (`kemu_enabled_key`), so they cost nothing when kemu is unused. kemu is built in
-(`bool`, not tristate) because it hooks entry and mm code. It can be turned off at
+(`bool`, not tristate) because it hooks entry and mm code, which rules out a loadable
+module. It ships as a kernel patch set (§5.6). It can be turned off at
 runtime with `/proc/sys/kernel/kemu/enabled` (new execs only).
 
 ### 5.1 Source layout
@@ -270,6 +276,35 @@ signal with the guest PC, guest `si_addr`, and an arm64 `ESR` value in the
 Guest state lives in host GPRs, XMM/YMM registers, MXCSR, and the user GS base, all
 of which the x86 context switch already saves (XSAVE plus FSGSBASE). **kemu adds
 nothing to the context-switch path.**
+
+### 5.6 Out-of-tree patch set
+
+kemu is maintained as an out-of-tree patch set against **Linux v6.18**, tracking the
+6.18 stable branch. We don't plan to submit it upstream, so the design is optimized
+for cheap rebases rather than for upstream review:
+
+- **New files over edits.** Almost all code lives in new directories
+  (`kernel/kemu/`, `arch/x86/kemu/`, `rust/kemu_core/`, selftests, tools). Changes
+  to existing files are limited to the hook call sites listed below. Each is a
+  one-to-three-line call into kemu behind `CONFIG_KEMU` plus a static key.
+- **Hook inventory** (the only touched core files): generic entry
+  (`kernel/entry/common.c`, `include/linux/entry-common.h`, the `SYSCALL_WORK_KEMU`
+  bit), x86 entry and signal (`arch/x86/entry/syscall_64.c`,
+  `arch/x86/kernel/signal.c`, `arch/x86/include/asm/syscall.h`, the trap and fault
+  handlers in `arch/x86/kernel/traps.c` and `arch/x86/mm/fault.c`), mm
+  (`mm/vma.c`, `mm/mprotect.c`, `mm/mremap.c`, `mm/memory.c` for
+  `access_process_vm`, `vm_get_page_prot`), `fs/exec.c` and `fs/binfmt_elf.c`
+  (re-include points), `fs/proc/` (maps, cpuinfo, stat, auxv), `kernel/rseq.c`,
+  `kernel/ptrace.c` regset view selection, `kernel/events/` callchain,
+  `include/linux/sched.h` and `mm_types.h` (two pointers), Kconfig and Makefiles.
+- **Patch series layout.** One patch per hook area, then the self-contained kemu
+  directories, so a rebase conflict is confined to a small, obvious patch.
+- **Rust bindings are carried in the series.** The mm/VMA, `task_work`, signal and
+  regset abstractions kemu needs beyond the 6.18 `kernel` crate live in
+  `kernel/kemu/rust/`, not in `rust/kernel/`, so they never conflict with upstream
+  Rust-for-Linux changes.
+- **CI** builds and runs the selftests on every 6.18.y stable release, and runs the
+  conformance and performance suites (§15, §13) on each rebase.
 
 ---
 
@@ -403,8 +438,8 @@ rust/kemu_core/src/
   frontend/         A64 → IR lifting (one function per instruction class)
   t1/               baseline translator: IR-light, linear, block-local
   t2/               region optimizer: CFG/loop discovery, SSA opts, global regalloc
-  backend/x86/      x86_64 encoder (legacy, VEX, EVEX, REX2/APX), instruction selection
-  regmap/           static guest-register pinning profiles (AVX2, AVX-512, APX)
+  backend/x86/      x86_64 encoder (legacy + VEX, x86-64-v3 only), instruction selection
+  regmap/           static guest-register pinning profiles
   meta/             host-PC → guest-state recovery tables (compressed)
   verify/           code-cache verifier (§12.2)
   state/            guest architectural state model, NZCV/FPCR/FPSR semantics
@@ -431,7 +466,7 @@ The same source builds as an ordinary Rust crate with `cargo` for unit tests, fu
 runs translated code in a ptrace'd sandbox. Kernel-specific code (allocation,
 locking, page writes, FFI) lives in `kernel/kemu/rust/`, which uses the 6.18
 `kernel` crate (`KBox`, `KVec`, `Arc`, `Mutex`, `SpinLock`, `Opaque`, task/mm
-abstractions) and adds small bindings where they're missing.
+abstractions) and carries its own bindings where they're missing (§5.6).
 
 ### 7.2 Safety rules
 
@@ -471,8 +506,9 @@ exhaustively over the 2^32 encoding space against LLVM's disassembler in CI.
 ### 8.1 Register mapping
 
 AArch64 has 31 GPRs plus SP and 32 × 128-bit vector registers. x86_64 has 16 GPRs
-(only 15 usable, since `rsp` is the host return stack) and 16 or 32 vector
-registers. Spilling is the biggest structural cost of this emulation direction, so
+(only 15 usable, since `rsp` is the host return stack) and, with AVX2, 16 vector
+registers. kemu deliberately doesn't use APX or AVX-512 (§2.2), so this is the only
+register file it targets. Spilling is the biggest structural cost of this emulation direction, so
 kemu pins guest registers statically at block boundaries (the "canonical map") and
 lets T2 reallocate freely inside regions.
 
@@ -495,17 +531,26 @@ multiplies need no fixed registers. The mapping is a translator *profile*. kemu 
 pick a different profile per process from a cheap static histogram of register use
 in the main executable's `.text`.
 
-**APX hosts (REX2/EVEX, r16–r31).** 31 allocatable GPRs, so 29 guest registers are
-pinned (X0–X15, X19–X28, X29, X30, SP). Only X16/X17 (PLT veneer scratch) and X18
-(unused platform register on Linux) live in memory. APX's **NDD** (three-operand)
-forms and **NF** (no-flags) forms match AArch64's three-operand, flag-optional ALU
-directly, which removes most `mov`s and flag-clobber constraints. APX is the
-single most effective host feature for kemu.
+**Living with 15 registers.** Without APX, register pressure has to be handled
+in the translator:
+- **Memory operands instead of reloads.** A spilled guest register is used
+  directly as an x86 memory operand (`add rdi, gs:[x22]`, `cmp gs:[x23], rcx`).
+  On current cores that's a micro-fused load+op that hits L1, so a read of a spilled
+  register costs about one extra cycle of latency, not an extra instruction.
+- **Per-region maps.** T2 chooses its own register assignment for each hot region
+  and only converts to the canonical map on region exits. Most hot loops in
+  compiled AArch64 code touch fewer than 13 GPRs.
+- **Profile-guided canonical maps.** The canonical map is chosen per binary from
+  observed register use (persisted in the per-inode cache, §10.4), instead of the
+  fixed default above.
+- **Spill hoisting.** Fills and spills of guest registers that aren't live-through
+  a loop are moved to the loop's preheader and exits.
 
-**Vector registers.** AVX2: V0–V13 pinned to `xmm0–xmm13`, two scratch.
-AVX-512/AVX10: V0–V29 pinned to `xmm0–xmm29` (EVEX-encoded), two scratch. Upper
-YMM/ZMM halves are kept clean (VEX/EVEX encoding everywhere, no legacy SSE), so
-there are no transition penalties and no `vzeroupper`.
+**Vector registers.** V0–V13 are pinned to `xmm0–xmm13`, with `xmm14`/`xmm15` as
+scratch. V14–V31 live in `gs:[…]`. That's a good fit for AAPCS code, where V16–V31
+are short-lived temporaries T2 can allocate inside regions. Upper YMM halves are kept
+clean (VEX encoding everywhere, no legacy SSE), so there are no transition penalties
+and no `vzeroupper`.
 
 ### 8.2 Flags (NZCV)
 
@@ -528,7 +573,9 @@ there are no transition penalties and no `vzeroupper`.
 - `CCMP`/`CCMN` become `jcc`-free sequences using `cmov` on precomputed flag
   images, or a branch in T2 when profitable. `ADC`/`SBC` reuse CF directly,
   inverting with `cmc` when polarity needs it.
-- APX NF forms let T2 keep live flags across intervening ALU operations.
+- T2 schedules flag-clobbering x86 instructions (most ALU ops) away from live
+  AArch64 flags, using flag-neutral forms (`lea`, `mov`, BMI2 `shlx`/`rorx`/`andn`,
+  `mulx`) where it can, so flags rarely need saving inside a region.
 
 ### 8.3 Memory accesses
 
@@ -582,12 +629,12 @@ NEON maps mostly 1:1 onto SSE4.2/AVX2. Notable cases:
 
 | AArch64 | x86 |
 |---|---|
-| `TBL`/`TBX` (1–4 regs) | `vpshufb` with range fix-ups (`vpcmpgtb`+blend), or `vpermi2b` with AVX512-VBMI |
-| `ZIP`/`UZP`/`TRN`/`EXT` | `vpunpck*`, `vpshufd`, `vpalignr`, `vpermt2*` (AVX-512) |
+| `TBL`/`TBX` (1–4 regs) | `vpshufb` per table register with range fix-ups (`vpcmpgtb` + `vpblendvb`) |
+| `ZIP`/`UZP`/`TRN`/`EXT` | `vpunpck*`, `vpshufd`, `vpshufb`, `vpalignr` |
 | `XTN`/`SQXTN`/`UQXTN` | `vpshufb` / `vpackss*`/`vpackus*` (with sign fixups) |
 | `UADDLV`, `ADDV` | `vpsadbw` / horizontal shuffles |
-| `CNT` | `vpshufb` nibble LUT, or `vpopcntb` (AVX512-BITALG) |
-| `SDOT`/`UDOT` | `vpdpbusd` (AVX-VNNI/AVX512-VNNI) with sign-correction, else `vpmaddubsw` sequences |
+| `CNT` | `vpshufb` nibble lookup table |
+| `SDOT`/`UDOT` | `vpmaddubsw`/`vpmaddwd` sequences with sign correction |
 | `FMLA` | `vfmadd231ps/pd` (fused, matches AArch64) |
 | `AESE`+`AESMC` pair | `vpxor x,k` + `vaesenc x, zero` (fused by peephole; standalone `AESMC` via `aesdeclast`/`aesenc` identities) |
 | `PMULL`/`PMULL2` | `vpclmulqdq` |
@@ -607,10 +654,10 @@ default** and adds fix-ups only where results can differ:
   results that may be NaN get a cheap fix-up (`vcmpunord` + blend) **only when T2
   can't prove non-NaN-ness**. A per-process `kemu.fp=fast` opt-out drops it.
 - **`FMIN`/`FMAX`/`FMINNM`/`FMAXNM`.** x86 `minps`/`maxps` are not commutative with
-  NaN/±0. kemu emits correct sequences, or `vminmaxps` with AVX10.2.
+  NaN/±0. kemu emits correct compare-and-blend sequences.
 - **`FCVTZS`/`FCVTZU` and friends** saturate on AArch64. x86 returns the
-  "integer indefinite" value. Compare-and-fix-up sequences, or `vcvttps2dqs`
-  (saturating, AVX10.2).
+  "integer indefinite" value, so kemu emits compare-and-fix-up sequences. T2
+  drops them when range analysis proves the input is in range.
 - **`FRECPE`/`FRSQRTE`** must match Arm's estimate tables bit-for-bit, so they're
   table-driven (not x86 `rcpps`).
 - **FPSR** cumulative flags come from MXCSR exception bits, read lazily. IDC has no
@@ -624,7 +671,7 @@ extensions**:
 
 - HWCAP: `FP ASIMD AES PMULL SHA1 SHA2 CRC32 ATOMICS FPHP ASIMDHP CPUID ASIMDRDM
   JSCVT FCMA LRCPC DCPOP ASIMDDP USCAT ILRCPC FLAGM SB`.
-- HWCAP2: `DCPODP FLAGM2 FRINT RNG` (+ `I8MM`/`BF16` where the host has AVX-VNNI-INT8 / AVX512-BF16).
+- HWCAP2: `DCPODP FLAGM2 FRINT`, plus `RNG` when the host has RDRAND and RDSEED.
 - **Not advertised:** SVE/SME, MTE, PACA/PACG, BTI, POE, GCS, SSBS, plus anything
   not fully implemented.
 
@@ -1025,8 +1072,8 @@ x86, `-march=armv8.2-a` for arm64), run natively on the same host.
   self-compile, nginx/Redis throughput with wrk/memtier).
 - Report per benchmark, not just the geomean, plus startup latency
   (`/bin/true`, `python -c pass`) and translation overhead as a share of total CPU time.
-- Host matrix: one AVX2-only part, one AVX-512 part, and one APX part once
-  available.
+- Host matrix: one recent Intel and one recent AMD part. kemu emits the same
+  x86-64-v3 code on both.
 
 ### 13.2 Where time goes, and the budget
 
@@ -1034,14 +1081,14 @@ x86, `-march=armv8.2-a` for arm64), run natively on the same host.
 |---|---|---|---|
 | Address translation | — | Identity mapping: zero | 0% |
 | Memory ordering | — | x86 TSO ⊇ AArch64; only `STLR` and full `DMB` cost anything | <1% |
-| Register pressure (31 → 15 GPRs) | — | Static pinning of hot regs; T2 global regalloc and spill hoisting; APX removes almost all of it | 6–10% (AVX2), 1–3% (APX) |
+| Register pressure (31 → 15 GPRs) | — | Static pinning of hot regs; spilled regs used as memory operands; per-region maps, global regalloc and spill hoisting in T2 | 6–10% |
 | Flags | — | Liveness elimination, polarity tracking, compare-branch fusion | 1–2% |
 | Indirect branches | 1 `jmp` | Inline cache → inline hash probe | 1–3% (higher for interpreters, mitigated by per-site caches) |
 | Calls/returns | `call`/`ret` | Mapped onto real `call`/`ret` (RSB-predicted) plus a 2-instruction check | 1–2% |
-| Instruction expansion (addressing modes, `UXTW`, `CSEL` chains, NEON shuffles, FP fix-ups) | — | T2 idiom matching; AVX-512/AVX10.2 forms | 3–6% |
+| Instruction expansion (addressing modes, `UXTW`, `CSEL` chains, NEON shuffles, FP fix-ups) | — | T2 idiom matching, range analysis to drop FP fix-ups | 3–7% |
 | Translation time | — | Fast T1, sliced T2, per-inode shared cache | <1% (long-running), visible at startup |
 | Syscalls | 1 transition | 1 transition (same as native) plus the guest-ABI dispatch (~20 ns) | ~0% |
-| **Total** | | | **~13–20% overhead → 80–87%** |
+| **Total** | | | **~14–22% overhead → 78–86%** |
 
 The arm64 compilation itself also helps: GCC/LLVM output for AArch64 assumes 31
 registers and three-operand ALU ops, so it has fewer memory operands and fewer
@@ -1051,9 +1098,10 @@ redundant moves. That partly offsets expansion when we re-allocate on x86.
 (Rosetta 2, with AOT plus hardware TSO help) land around 70–80%, and open-source
 userspace translators are usually lower. kemu's advantages are the easy memory-model
 direction, identity mapping, zero-copy syscalls, and exact signals without polling.
-The deciding factor is register pressure on non-APX hosts. Expected outcome:
-**80%+ on APX hosts and FP/SIMD-heavy code, 72–82% on AVX2-only hosts for
-integer-heavy, branchy code.** Workloads dominated by guest JITs (V8, HotSpot) are
+The deciding factor is register pressure: with APX and AVX-512 out of scope, the
+15-register x86 file is a permanent constraint. Expected outcome: **about 80%
+geomean, with FP/SIMD-heavy code at 80–90% and integer-heavy, branchy code at
+72–82%.** Workloads dominated by guest JITs (V8, HotSpot) are
 the weak point, because frequent code invalidation and translating JIT output twice
 hurts. We track these separately.
 
@@ -1062,10 +1110,9 @@ hurts. We track these separately.
 1. T1 + chaining + call/ret mapping → 40–55%.
 2. T2 region compiler with global regalloc and flag elimination → 70–80%.
 3. Per-inode cache, vDSO intrinsics → startup and short-lived-process parity.
-4. AVX-512/AVX10 and APX back ends → 80–90% on capable hosts.
-5. Profile-guided canonical maps (per-binary register profiles persisted in the
+4. Profile-guided canonical maps (per-binary register profiles persisted in the
    per-inode cache), indirect-branch target profiling, and superblock formation
-   across calls.
+   across calls → ≥ 80% geomean.
 
 ---
 
@@ -1086,7 +1133,7 @@ hurts. We track these separately.
 The kernel command line `kemu.mode=interp` forces the reference interpreter
 everywhere. It's for bring-up and bisection.
 
-The host CPU check at boot requires x86-64-v3 and FSGSBASE. Without them kemu
+The host CPU check at boot requires x86-64-v3, AES-NI, PCLMULQDQ, and FSGSBASE. Without them kemu
 refuses to enable and logs why.
 
 ---
@@ -1129,26 +1176,25 @@ refuses to enable and logs why.
 | **2. T1 JIT** | Decoder, T1 translator, chaining, call/ret mapping, metadata + precise state, invalidation protocol, verifier | Differential tests clean; 40%+ of native; JITs (Node, Java) run |
 | **3. T2 optimizer** | Region formation, SSA opts, global regalloc, flag elimination, NEON/FP fix-up minimization | 70–80% of native on SPEC (AVX2 host) |
 | **4. Caching and startup** | Per-inode shared translation cache with relocations, vDSO intrinsics | Startup within 1.5× native for `python -c pass` |
-| **5. Wide back ends** | AVX-512/AVX10, APX register file + NDD/NF | ≥ 80% geomean target met on capable hosts |
-| **6. Hardening and upstreaming** | CET-SS option, LSM hook, documentation, syzkaller coverage, patch series split into reviewable pieces | — |
+| **5. Profile-guided tuning** | Per-binary canonical register maps, indirect-branch profiling, cross-call superblocks | ≥ 80% geomean on SPEC |
+| **6. Hardening and maintenance** | CET-SS option, LSM hook, documentation, syzkaller coverage, rebase tooling and CI on 6.18.y stable releases | — |
 
-**Possible later work:** SVE/SVE2 at VL=128/256 (SVE predicates map well onto
-AVX-512 mask registers), opt-in native library thunks, on-disk persistent cache,
-AArch32 guests.
+**Possible later work:** SVE/SVE2 at VL=128 on AVX2 (predicates emulated with
+vector masks), opt-in native library thunks, on-disk persistent cache, AArch32
+guests.
 
 ---
 
 ## 17. Open questions and risks
 
-1. **Upstream acceptance.** A JIT in the kernel and a new syscall ABI are big asks.
-   Keeping the C hooks small and generic (they look like the existing IA32 compat
-   and Syscall User Dispatch hooks) is the main mitigation. An out-of-tree patch set
-   rebased on LTS kernels is the fallback.
+1. **Out-of-tree maintenance cost.** Every rebase risks conflicts in entry, signal,
+   and mm code, which change often upstream. The hook inventory (§5.6) keeps that
+   surface small. Moving off the 6.18 line later will need a deliberate port.
 2. **Rust-for-Linux surface.** kemu needs mm/VMA, task_work, signal, and regset
-   abstractions beyond what 6.18 provides. We'll write minimal bindings in
-   `kernel/kemu/rust` first and upstream generic pieces separately.
-3. **Register pressure on AVX2 hosts** may keep integer workloads below 80% (§13.2).
-   APX availability decides how far this goes.
+   abstractions beyond what 6.18 provides. They're carried privately in
+   `kernel/kemu/rust`, and kemu owns their soundness.
+3. **Register pressure.** With APX out of scope, integer-heavy code may stay below
+   80% (§13.2). The mitigations are all in the translator (§8.1).
 4. **Exclusive-monitor ABA** is a known deviation. Strict mode exists, but we need
    data on whether any real software is affected.
 5. **On-disk translation cache trust model** (signed by a kernel-held key? only
