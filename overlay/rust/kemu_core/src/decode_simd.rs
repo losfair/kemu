@@ -270,6 +270,12 @@ fn decode_asimd(x: u32) -> Insn {
     // Route by high-level pattern. We use the explicit top-level groups.
     let q = bit(x, 30);
     let u = bit(x, 29);
+    // Vector AdvSIMD data-processing encodings all have bit31 == 0. The
+    // scalar forms (handled below) have bits 31:24 in the 0b0x011110/0b0x011111
+    // space, also with bit31 == 0. Reject bit31 == 1 up front.
+    if bit(x, 31) {
+        return Insn::Undefined;
+    }
 
     // --- Advanced SIMD three same (0Q U 01110 size 1 Rm opcode 1 Rn Rd) ---
     if bits(x, 28, 24) == 0b01110 && bit(x, 21) && bit(x, 10) {

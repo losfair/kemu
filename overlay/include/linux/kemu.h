@@ -55,6 +55,7 @@ void kemu_user_step(struct task_struct *child, bool on);
 void kemu_unmapped(struct mm_struct *mm, unsigned long start, unsigned long end);
 bool kemu_vma_hidden(struct vm_area_struct *vma);
 int kemu_show_cpuinfo(struct seq_file *m, unsigned int cpu);
+bool kemu_user_fault(struct pt_regs *regs, unsigned long address);
 
 #else /* !CONFIG_KEMU */
 

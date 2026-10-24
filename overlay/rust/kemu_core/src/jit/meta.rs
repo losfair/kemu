@@ -19,6 +19,10 @@ use crate::state::CpuState;
 
 pub const BLOCK_MAGIC: u32 = 0x4b42_4c4b; // "KBLK"
 pub const HEADER_SIZE: usize = 32;
+/// Inline-cache entry: checks %rax, falls back to the lookup table.
+pub const IC_OFF: usize = 32;
+/// Table entry: checks %rax, falls back to the translate stub.
+pub const CHECK_OFF: usize = 64;
 pub const POINT_SIZE: usize = 12;
 pub const EXIT_SIZE: usize = 16;
 pub const META_HDR_SIZE: usize = 8;
@@ -67,8 +71,15 @@ pub struct Point {
 pub struct Exit {
     /// Offset of the patchable rel32 field, or NO_SITE.
     pub site: u32,
+    /// EXIT_DIRECT (patch to the target's main entry) or EXIT_IC
+    /// (indirect-branch inline cache: patch to the IC entry of whatever
+    /// target was seen first).
+    pub kind: u32,
     pub target: u64,
 }
+
+pub const EXIT_DIRECT: u32 = 0;
+pub const EXIT_IC: u32 = 1;
 
 fn put16(b: &mut [u8], off: usize, v: u16) -> bool {
     match b.get_mut(off..off + 2) {
@@ -175,7 +186,7 @@ pub fn write_meta(b: &mut [u8], points: &[Point], exits: &[Exit]) -> Option<usiz
         off += POINT_SIZE;
     }
     for e in exits {
-        if !(put32(b, off, e.site) && put32(b, off + 4, 0) && put64(b, off + 8, e.target)) {
+        if !(put32(b, off, e.site) && put32(b, off + 4, e.kind) && put64(b, off + 8, e.target)) {
             return None;
         }
         off += EXIT_SIZE;
@@ -196,7 +207,7 @@ pub fn read_point(m: &[u8], i: usize) -> Option<Point> {
 pub fn read_exit(m: &[u8], i: usize) -> Option<Exit> {
     let (np, _) = meta_counts(m)?;
     let off = META_HDR_SIZE + np * POINT_SIZE + i * EXIT_SIZE;
-    Some(Exit { site: get32(m, off)?, target: get64(m, off + 8)? })
+    Some(Exit { site: get32(m, off)?, kind: get32(m, off + 4)?, target: get64(m, off + 8)? })
 }
 
 /// Is `site` (block-relative offset of a rel32 field) a patchable exit?

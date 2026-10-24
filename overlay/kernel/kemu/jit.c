@@ -246,8 +246,9 @@ static int kemu_translate(struct kemu_mm *km, u64 pc, unsigned long *main,
 					km->chunk_used[c] - (off & (KEMU_CHUNK_SIZE - 1)),
 					&gpc, &moff) || gpc != pc)
 			return -EIO;
-		kemu_table_set(km, pc, km->code_base + off + 32);
+		kemu_table_set(km, pc, km->code_base + off + KEMU_BLK_CHECK_OFF);
 		*main = km->code_base + off + moff;
+		res->ic_entry = km->code_base + off + KEMU_BLK_IC_OFF;
 		return 0;
 	}
 
@@ -282,17 +283,19 @@ static int kemu_translate(struct kemu_mm *km, u64 pc, unsigned long *main,
 	km->translations++;
 	kemu_table_set(km, pc, km->code_base + off + res->check_off);
 	*main = km->code_base + off + res->main_off;
+	res->ic_entry = km->code_base + off + KEMU_BLK_IC_OFF;
 	return 0;
 }
 
 /* Patch a block exit (rel32 at user address @site) to jump to @main. */
 static void kemu_chain(struct kemu_mm *km, unsigned long site, u64 target,
-		       unsigned long main)
+		       unsigned long main, unsigned long ic_entry)
 {
 	unsigned long off;
 	u8 *blk;
 	size_t len;
 	u64 t;
+	u32 kind;
 	s64 rel;
 
 	if (site < km->code_base || site >= km->code_base + KEMU_CODE_SIZE || (site & 3))
@@ -302,8 +305,11 @@ static void kemu_chain(struct kemu_mm *km, unsigned long site, u64 target,
 	if (!blk || km->chunk_retired[off >> KEMU_CHUNK_SHIFT])
 		return;
 	if (!kemu_rs_find_exit(blk, len, ((u8 *)km->chunks[off >> KEMU_CHUNK_SHIFT] +
-					   (off & (KEMU_CHUNK_SIZE - 1))) - blk, &t) ||
-	    t != target)
+					   (off & (KEMU_CHUNK_SIZE - 1))) - blk, &t, &kind))
+		return;
+	if (kind == KEMU_EXIT_KIND_IC)
+		main = ic_entry;	/* the IC entry re-checks the target */
+	else if (t != target)
 		return;
 	rel = (s64)main - (s64)(site + 4);
 	if (rel != (s32)rel)
@@ -323,6 +329,7 @@ void kemu_enter_op(struct kemu_thread *kt)
 	if (kt->flags & KEMU_TF_KSTATE)
 		return;
 	cpu->nzcv = kemu_rs_nzcv_from_image(READ_ONCE(cpu->flags_x86));
+	cpu->fpsr = kemu_rs_fpsr_merge(cpu->fpsr, cpu->scratch[KEMU_MXCSR_SLOT]);
 	kt->flags |= KEMU_TF_KSTATE;
 }
 
@@ -428,6 +435,8 @@ void kemu_jit_exit_to_user(struct kemu_thread *kt, struct pt_regs *regs)
 	}
 	if (kt->flags & KEMU_TF_KSTATE) {
 		kt->cpu->flags_x86 = kemu_rs_image_from_nzcv(kt->cpu->nzcv);
+		kt->cpu->scratch[KEMU_MXCSR_SLOT] =
+			kemu_rs_mxcsr_from(kt->cpu->fpcr, kt->cpu->fpsr);
 		kt->flags &= ~KEMU_TF_KSTATE;
 	}
 }
@@ -445,7 +454,7 @@ static unsigned long kemu_op_translate(struct kemu_thread *kt, struct kemu_mm *k
 	mutex_lock(&km->lock);
 	err = kemu_translate(km, pc, &main, &res);
 	if (!err && chain)
-		kemu_chain(km, kt->cpu->exit_info, pc, main);
+		kemu_chain(km, kt->cpu->exit_info, pc, main, res.ic_entry);
 	mutex_unlock(&km->lock);
 
 	switch (err) {

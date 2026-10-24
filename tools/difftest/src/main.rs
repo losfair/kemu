@@ -108,6 +108,7 @@ fn fault(a: u64, acc: Access) -> Fault {
 fn run_interp(a: &Arch, word: u32) -> (Arch, Option<Exit>) {
     let mut cpu = CpuState::new();
     cpu.x = a.x;
+    cpu.x[2] = SCRATCH + 64;
     cpu.sp = a.sp;
     cpu.pc = 0x1000;
     cpu.nzcv = a.nzcv;
@@ -162,7 +163,11 @@ fn run_interp(a: &Arch, word: u32) -> (Arch, Option<Exit>) {
         }
     }
     let _ = &mut mem;
-    let mut env = One { word, mem: Mem { base: SCRATCH, data: vec![0u8; 4096] } };
+    let mut memdata = vec![0u8; 4096];
+    for (i, b) in memdata.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(37).wrapping_add(5);
+    }
+    let mut env = One { word, mem: Mem { base: SCRATCH, data: memdata } };
     let (exit, _n) = interp::run(&mut cpu, &mut env, 1);
     let out = Arch {
         x: cpu.x,
@@ -326,7 +331,7 @@ fn run_fixed(word: u32, count: usize, batch: usize, seed: u64) {
 }
 
 fn compare(q: &Arch, i: &Arch) -> Option<String> {
-    for r in 2..31 {
+    for r in 3..31 {
         if q.x[r] != i.x[r] {
             return Some(format!("x{r}: qemu={:#018x} interp={:#018x}", q.x[r], i.x[r]));
         }
@@ -463,6 +468,10 @@ fn parse_dump(bytes: &[u8], n: usize) -> Result<Vec<QResult>, String> {
 fn emit_asm(cases: &[(Arch, u32)]) -> String {
     let mut s = String::new();
     s.push_str(".text\n.global _start\n_start:\n");
+    // Prefill the scratch buffer with the same pattern the interp uses.
+    s.push_str("  adrp x9, scratch\n  add x9, x9, :lo12:scratch\n");
+    s.push_str("  adrp x10, scratch_init\n  add x10, x10, :lo12:scratch_init\n");
+    s.push_str("  mov x11, #0\n1:\n  ldr x12, [x10, x11]\n  str x12, [x9, x11]\n  add x11, x11, #8\n  cmp x11, #4096\n  b.lo 1b\n");
     for (idx, (_, w)) in cases.iter().enumerate() {
         // --- load state ---
         s.push_str(&format!("  adrp x0, in_{idx}\n  add x0, x0, :lo12:in_{idx}\n"));
@@ -478,6 +487,8 @@ fn emit_asm(cases: &[(Arch, u32)]) -> String {
         }
         s.push_str("  ldr x1, [x0, #8]\n");
         s.push_str("  ldr x0, [x0, #0]\n");
+        // Point x2 at the shared scratch buffer (+64) for memory classes.
+        s.push_str("  adrp x2, scratch\n  add x2, x2, :lo12:scratch\n  add x2, x2, #64\n");
         // --- instruction under test ---
         s.push_str(&format!("  .inst {:#010x}\n", w));
         // --- dump --- (x0,x1 are scratch; not written by the test insn)
@@ -519,7 +530,18 @@ fn emit_asm(cases: &[(Arch, u32)]) -> String {
             s.push_str(&format!("  .quad {:#x}\n  .quad {:#x}\n", a.v[r][0], a.v[r][1]));
         }
     }
-    s.push_str(&format!(".bss\n.balign 16\noutbuf: .zero {}\n", REC_BYTES + 64));
+    s.push_str(".balign 16\nscratch_init:\n");
+    {
+        let mut bytes = String::from("  .byte ");
+        for i in 0..4096 {
+            let v = (i as u8).wrapping_mul(37).wrapping_add(5);
+            if i > 0 { bytes.push(','); }
+            bytes.push_str(&v.to_string());
+        }
+        bytes.push('\n');
+        s.push_str(&bytes);
+    }
+    s.push_str(&format!(".bss\n.balign 16\nscratch: .zero 4096\noutbuf: .zero {}\n", REC_BYTES + 64));
     s
 }
 

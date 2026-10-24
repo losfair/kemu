@@ -58,8 +58,12 @@ pub const CTR_EL0: u64 = {
     idc | dic | cwg | erg | dmin | l1ip | imin
 };
 
-/// DCZID_EL0: block size 2^4 words = 64 bytes, DZP=0 (permitted).
-pub const DCZID_EL0: u64 = 4;
+/// DCZID_EL0: DZP=1 (DC ZVA prohibited at EL0), BS=4. Reporting DZP=1 steers
+/// glibc's memset/memmove ifunc selection to the generic path instead of the
+/// DC-ZVA variant, matching how the reference (QEMU) is exercised and avoiding
+/// reliance on DC ZVA block-size assumptions. DC ZVA itself is still emulated
+/// (64-byte block) if a guest uses it directly.
+pub const DCZID_EL0: u64 = (1 << 4) | 4;
 
 pub const MIDR_EL1: u64 = 0x0000_0000; // implementer 0 (software)
 pub const MPIDR_EL1: u64 = 0x8000_0000;

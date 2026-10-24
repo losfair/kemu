@@ -3,7 +3,7 @@
 
 #[allow(clippy::too_many_arguments)]
 fn shift_imm(cpu: &mut CpuState, q: bool, u: bool, immh: u32, immb: u32, opcode: u8, rd: u32, rn: u32, scalar: bool) {
-    // Determine element size from immh.
+    // Source element size from immh (highest set bit).
     let esize: u8 = if immh & 0b1000 != 0 {
         3
     } else if immh & 0b0100 != 0 {
@@ -15,64 +15,112 @@ fn shift_imm(cpu: &mut CpuState, q: bool, u: bool, immh: u32, immb: u32, opcode:
     };
     let esz_bits = 8u32 << esize;
     let immhb = (immh << 3) | immb;
-    // Left shift amount = immhb - esz_bits ; right = 2*esz_bits - immhb.
-    let shl = immhb.wrapping_sub(esz_bits);
-    let shr = (2 * esz_bits).wrapping_sub(immhb);
+    let shl = immhb.wrapping_sub(esz_bits);       // left-shift amount
+    let shr = (2 * esz_bits).wrapping_sub(immhb); // right-shift amount
     let lanes = if scalar { 1 } else { vbytes(q) >> esize };
     let mask = if esz_bits >= 64 { u64::MAX } else { (1u64 << esz_bits) - 1 };
 
-    // Narrowing shifts (SHRN/RSHRN/SQSHRN...) have opcode in 0b1000x..
-    let narrowing = matches!(opcode, 0b10000 | 0b10001 | 0b10010 | 0b10011 | 0b10100 | 0b10101);
-    if narrowing {
+    // Narrowing shifts (result element is half the source): SHRN/RSHRN,
+    // SQSHRUN, SQSHRN/UQSHRN, SQRSHRN/UQRSHRN.
+    if matches!(opcode, 0b10000 | 0b10001 | 0b10010 | 0b10011) {
         let src_es = esize + 1;
         let nlanes = 8u32 >> esize;
-        let top = q; // Q selects the upper-half (2) variant
+        let top = q;
         let mut out = if top { cpu.vreg(rd) } else { [0u64; 2] };
         let off = if top { nlanes } else { 0 };
-        let rshn = (2 * esz_bits).wrapping_sub(immhb); // shift right amount
+        let rshn = (2 * esz_bits).wrapping_sub(immhb);
+        let rounding = matches!(opcode, 0b10001 | 0b10011);
         for i in 0..nlanes {
             let v = get_lane(cpu, rn, src_es, i);
-            let round = if matches!(opcode, 0b10001 | 0b10011 | 0b10101) {
-                1u64 << (rshn - 1)
-            } else {
-                0
-            };
-            let shifted = (v.wrapping_add(round)) >> rshn;
-            let r = shifted & mask;
+            let round = if rounding && rshn > 0 { 1u64 << (rshn - 1) } else { 0 };
+            let r = (v.wrapping_add(round) >> rshn) & mask;
             put_lane(&mut out, esize, off + i, r);
         }
         cpu.set_vreg(rd, out);
         return;
     }
 
+    // Widening left-shift long: SSHLL/USHLL (SHLL/SXTL/UXTL are aliases).
+    if opcode == 0b10100 {
+        let dst_es = esize + 1;
+        let nlanes = 8u32 >> esize;
+        let off = if q { nlanes } else { 0 };
+        let dbits = 8u32 << dst_es;
+        let dmask = if dbits >= 64 { u64::MAX } else { (1u64 << dbits) - 1 };
+        let mut out = [0u64; 2];
+        for i in 0..nlanes {
+            let v = get_lane(cpu, rn, esize, off + i);
+            let ext = if u { v } else { sext(v, esize) as u64 };
+            put_lane(&mut out, dst_es, i, (ext << (shl & 63)) & dmask);
+        }
+        cpu.set_vreg(rd, out);
+        return;
+    }
+
+    // Fixed-point convert: SCVTF/UCVTF (0b11100), FCVTZS/FCVTZU (0b11111).
+    if opcode == 0b11100 || opcode == 0b11111 {
+        let fbits = (2 * esz_bits).wrapping_sub(immhb);
+        let f = fmt_of(esize);
+        let mut c = sf::FpCtx::new(cpu.fpcr, cpu.fpsr);
+        let mut out = [0u64; 2];
+        for i in 0..lanes {
+            let v = get_lane(cpu, rn, esize, i);
+            let r = if opcode == 0b11100 {
+                { let rm = c.rmode(); sf::from_fixed(&mut c, f, v, fbits, !u, esz_bits, rm) }
+            } else {
+                sf::to_fixed(&mut c, f, v, fbits, u, esz_bits, crate::softfloat::Rounding::Zero)
+            };
+            put_lane(&mut out, esize, i, r);
+        }
+        cpu.fpsr = c.fpsr & sf::FPSR_MASK;
+        cpu.set_vreg(rd, out);
+        return;
+    }
+
+    // Element-wise shifts.
     let mut out = [0u64; 2];
     for i in 0..lanes {
         let v = get_lane(cpu, rn, esize, i);
         let d = get_lane(cpu, rd, esize, i);
         let r = match opcode {
-            0b00000 => v << (shl & 63),                     // SHL
-            0b00010 => {
-                // SSRA/USRA (accumulate) & SSHR/USHR distinguished by... opcode
-                let s = if u { v >> (shr & 63) } else { (sext(v, esize) >> (shr & 63)) as u64 };
-                s
-            }
-            0b01010 => v << (shl & 63),                     // SHL (alt slot)
-            _ => {
-                // Right shifts: opcode 0b00000 SSHR? Use standard mapping:
-                shift_right_variant(opcode, u, v, d, shr, esize, mask)
-            }
+            0b01010 => v << (shl & 63),                      // SHL (U=0) / SLI (U=1)
+            0b01100 => sat_shl(v, shl, esize, u),            // SQSHL/UQSHL
+            0b01110 => sat_shl(v, shl, esize, true),         // SQSHLU
+            0b01000 if u => shift_right_insert(v, d, shr, mask), // SRI
+            _ => shift_right_variant(opcode, u, v, d, shr, esize, mask),
         };
         put_lane(&mut out, esize, i, r & mask);
     }
-    // SHL uses opcode 0b01010; fix by recomputing for known opcodes.
-    if opcode == 0b01010 {
-        out = [0u64; 2];
-        for i in 0..lanes {
-            let v = get_lane(cpu, rn, esize, i);
-            put_lane(&mut out, esize, i, (v << (shl & 63)) & mask);
-        }
-    }
     cpu.set_vreg(rd, out);
+}
+
+fn shift_right_insert(v: u64, d: u64, shr: u32, mask: u64) -> u64 {
+    let sh = shr & 63;
+    let shifted = (v & mask) >> sh;
+    // Preserve the top `sh` bits of the destination.
+    let keep = if sh == 0 { 0 } else { !((1u64 << (64 - sh)).wrapping_sub(1)) } & mask;
+    let _ = keep;
+    let hi_mask = if sh >= 64 { mask } else { !(mask >> sh) & mask };
+    (d & hi_mask) | shifted
+}
+
+fn sat_shl(v: u64, shl: u32, esize: u8, unsigned: bool) -> u64 {
+    let sh = shl & 63;
+    let bits = 8u32 << esize;
+    if unsigned {
+        let m = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let r = (v & m).checked_shl(sh).unwrap_or(u64::MAX);
+        // saturate: if shifting out any bits, clamp to max
+        let shifted_out = if sh == 0 { 0 } else { (v & m) >> (bits - sh.min(bits)) };
+        if shifted_out != 0 || r > m { m } else { r & m }
+    } else {
+        let sv = sext(v, esize);
+        let max = (1i64 << (bits - 1)) - 1;
+        let min = -(1i64 << (bits - 1));
+        let r = (sv as i128) << sh;
+        let sat = r.clamp(min as i128, max as i128) as i64;
+        (sat as u64) & (if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 })
+    }
 }
 
 fn shift_right_variant(opcode: u8, u: bool, v: u64, d: u64, shr: u32, esize: u8, mask: u64) -> u64 {

@@ -38,6 +38,7 @@ pub struct StubOffsets {
     pub svc: u32,
     pub interp_svc: u32,
     pub step: u32,
+    pub fcmp_table: u32,
     pub end: u32,
     /// Sorted list of (start, end, info) ranges; see `STUB_*`.
     pub ranges: [(u32, u32, u8); 16],
@@ -57,6 +58,8 @@ pub struct StubAddrs {
     pub chain: u64,
     pub helper: u64,
     pub svc: u64,
+    /// 8 x u16 flag images indexed by (ZF<<2 | PF<<1 | CF) after ucomis.
+    pub fcmp_table: u64,
 }
 
 impl StubOffsets {
@@ -67,6 +70,7 @@ impl StubOffsets {
             chain: base + self.chain as u64,
             helper: base + self.helper as u64,
             svc: base + self.svc as u64,
+            fcmp_table: base + self.fcmp_table as u64,
         }
     }
 
@@ -109,6 +113,11 @@ pub fn gen_stubs(out: &mut [u8], mode: ExitMode, table_base: u64, table_mask8: u
         ExitMode::Call(f) => f,
         ExitMode::Syscall => 0,
     });
+    // FCMP flag images: greater, less, -, -, equal, -, -, unordered.
+    o.fcmp_table = a.pos as u32;
+    for v in [0x0300u16, 0x8200, 0x0301, 0x0301, 0x4300, 0x0301, 0x0301, 0x0301] {
+        a.u16(v);
+    }
     let slot = o.call_slot as usize;
     let tb = o.table_base as usize;
     a.align(64);
@@ -127,6 +136,9 @@ pub fn gen_stubs(out: &mut [u8], mode: ExitMode, table_base: u64, table_mask8: u
     a.store(Sz::Q, Mem::gs(OFF_PC), RAX);
     o.push(reloaded, a.pos, STUB_PINNED_LIVE_PC_RAX);
     let s2 = a.pos;
+    // Recover from return-stack underflow (sentinel returns land here).
+    a.alu_rm(Alu::Cmp, Sz::Q, RSP, Rm::M(Mem::gs(336)));
+    a.cmov(Cc::A, Sz::Q, RSP, Rm::M(Mem::gs(336)));
     a.lea(Sz::D, RDX, Mem::bisd(RAX, RAX, 0, 0));
     a.alu_ri(Alu::And, Sz::D, Rm::R(RDX), table_mask8 as i32);
     a.alu_rm(Alu::Add, Sz::Q, RDX, Rm::M(Mem::rip(tb as i32)));

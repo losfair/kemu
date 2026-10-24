@@ -49,21 +49,28 @@ fn decode_simd_ldst(x: u32) -> Insn {
     // Element size and index depend on opcode[2:1]:
     let (esize, index) = match opcode >> 1 {
         0b00 => (0u8, ((q as u32) << 3) | ((s as u32) << 2) | size as u32), // B
-        0b01 => (1u8, ((q as u32) << 2) | ((s as u32) << 1) | (size as u32 >> 1)), // H
-        0b10 => {
-            if size & 1 == 0 {
-                (2u8, ((q as u32) << 1) | (s as u32)) // S
-            } else {
-                (3u8, q as u32) // D
+        0b01 => {
+            if size & 1 != 0 {
+                return Insn::Undefined;
             }
+            (1u8, ((q as u32) << 2) | ((s as u32) << 1) | (size as u32 >> 1)) // H
         }
-        _ => (size, 0),
+        0b10 => match size {
+            0b00 => (2u8, ((q as u32) << 1) | (s as u32)), // S
+            0b01 if !s => (3u8, q as u32),                 // D
+            _ => return Insn::Undefined,
+        },
+        _ => {
+            if s {
+                return Insn::Undefined;
+            }
+            (size, 0)
+        }
     };
-    let _ = esize;
     Insn::SimdLdSt {
         load,
         q,
-        size: if replicate { size } else { (opcode >> 1).min(3) },
+        size: if replicate { size } else { esize },
         opcode,
         rt,
         rn,

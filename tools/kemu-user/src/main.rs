@@ -35,6 +35,10 @@ macro_rules! rd {
 macro_rules! wr {
     ($name:ident, $t:ty) => {
         fn $name(&mut self, a: u64, v: $t) -> Result<(), Fault> {
+            let w = WATCH.load(Ordering::Relaxed);
+            if w != 0 && a <= w + 7 && a + core::mem::size_of::<$t>() as u64 > w {
+                eprintln!("WATCH write {:#x} size {} val {:#x} at pc {:#x}", a, core::mem::size_of::<$t>(), v, CUR_PC.load(Ordering::Relaxed));
+            }
             unsafe { core::ptr::write_unaligned(a as *mut $t, v) };
             Ok(())
         }
@@ -204,6 +208,8 @@ fn install_segv() {
     }
 }
 
+static WATCH: AtomicU64 = AtomicU64::new(0);
+
 fn trace_enabled() -> usize {
     std::env::var("KEMU_TRACE_INSN").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
 }
@@ -220,12 +226,16 @@ fn print_state(cpu: &CpuState) {
 fn run_loop(cpu: &mut CpuState, env: &mut HostMem) {
     install_segv();
     CPU_PTR.store(cpu as *const CpuState as u64, Ordering::SeqCst);
-    let tracen = trace_enabled();
+    let mut tracen = trace_enabled();
+    if let Ok(w) = std::env::var("KEMU_WATCH") {
+        WATCH.store(u64::from_str_radix(w.trim_start_matches("0x"), 16).unwrap_or(0), Ordering::SeqCst);
+        tracen = usize::MAX; // single-step so CUR_PC is exact
+    }
     let mut traced = 0usize;
     loop {
         CUR_PC.store(cpu.pc, Ordering::SeqCst);
         let budget = if tracen != 0 && traced < tracen { 1 } else { 100_000 };
-        if tracen != 0 && traced < tracen {
+        if tracen != 0 && traced < tracen && WATCH.load(Ordering::Relaxed) == 0 {
             print_state(cpu);
             traced += 1;
         }

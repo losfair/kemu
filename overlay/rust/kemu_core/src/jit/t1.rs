@@ -22,6 +22,8 @@ use crate::decode::{
 };
 use crate::env::{Env, Fault};
 
+mod fp;
+
 pub const MAX_INSNS: usize = 64;
 pub const MAX_POINTS: usize = 640;
 pub const MAX_EXITS: usize = 4;
@@ -43,7 +45,7 @@ impl Scratch {
             words: [0; MAX_INSNS],
             live_after: [0; MAX_INSNS],
             points: [Point { off: 0, idx: 0, kind: 0, a: 0, b: 0 }; MAX_POINTS],
-            exits: [Exit { site: 0, target: 0 }; MAX_EXITS],
+            exits: [Exit { site: 0, kind: 0, target: 0 }; MAX_EXITS],
         }
     }
 }
@@ -343,7 +345,7 @@ impl<'s, 'b> Gen<'s, 'b> {
     fn add_exit(&mut self, site: u32, target: u64) {
         match self.s.exits.get_mut(self.ne) {
             Some(e) => {
-                *e = Exit { site, target };
+                *e = Exit { site, kind: meta::EXIT_DIRECT, target };
                 self.ne += 1;
             }
             None => self.overflow = true,
@@ -376,6 +378,47 @@ impl<'s, 'b> Gen<'s, 'b> {
     fn exit_rax(&mut self) {
         self.point(kind::EXIT_RAX, 0, 0);
         self.jmp_abs(self.cfg.stubs.dispatch_rax);
+    }
+
+    /// Indirect jump through a per-site inline cache (target PC in %rax).
+    fn exit_ic(&mut self) {
+        self.point(kind::EXIT_RAX, 0, 0);
+        self.pad_for_rel32(1);
+        let at = self.a.jmp(None);
+        match self.s.exits.get_mut(self.ne) {
+            Some(e) => {
+                *e = Exit { site: at as u32, kind: meta::EXIT_IC, target: 0 };
+                self.ne += 1;
+            }
+            None => self.overflow = true,
+        }
+    }
+
+    /// Guest call: host `call` so the matching guest RET is predicted by
+    /// the CPU's return stack. `target` None = indirect (in %rax).
+    fn call_to(&mut self, target: Option<u64>, next: u64, main_off: usize) {
+        self.mov_imm(RSI, next);
+        match target {
+            Some(t) if t == self.pc0 => {
+                self.a.call(Some(main_off));
+            }
+            Some(t) => {
+                self.pad_for_rel32(1);
+                let at = self.a.call(None);
+                self.add_exit(at as u32, t);
+            }
+            None => {
+                self.point(kind::EXIT_RAX, 0, 0);
+                self.call_abs(self.cfg.stubs.dispatch_rax);
+            }
+        }
+        // Landing pad: a guest RET arrives here with the target in %rax.
+        self.point(kind::EXIT_RAX, 0, 0);
+        self.a.mov_ri64(RDX, next);
+        self.a.alu_rr(Alu::Cmp, Sz::Q, RAX, RDX);
+        let j = self.a.jcc(Cc::Ne, None);
+        self.rel_abs(j, self.cfg.stubs.dispatch_rax);
+        self.exit_to(next, main_off);
     }
 
     /// Run the current instruction in the kernel interpreter.
@@ -1537,7 +1580,7 @@ fn defs_flags(i: &Insn) -> bool {
         | Insn::AddSubExt { setflags, .. }
         | Insn::AddSubCarry { setflags, .. } => *setflags,
         Insn::LogicImm { op, .. } | Insn::LogicShift { op, .. } => *op == LogicOp::Ands,
-        Insn::CondCmp { .. } => true,
+        Insn::CondCmp { .. } | Insn::FpCmp { .. } => true,
         _ => false,
     }
 }
@@ -1552,30 +1595,13 @@ fn is_native(i: &Insn) -> bool {
             | Insn::Brk { .. }
             | Insn::IcIvau { .. }
             | Insn::LdStExcl { .. }
-            | Insn::FpImm { .. }
-            | Insn::FpCmp { .. }
             | Insn::FpCCmp { .. }
-            | Insn::FpCSel { .. }
-            | Insn::Fp1 { .. }
-            | Insn::Fp2 { .. }
-            | Insn::Fp3 { .. }
-            | Insn::FpCvt { .. }
-            | Insn::SimdThree { .. }
-            | Insn::SimdMisc { .. }
             | Insn::SimdAcross { .. }
-            | Insn::SimdDup { .. }
-            | Insn::SimdInsElt { .. }
-            | Insn::SimdInsGpr { .. }
-            | Insn::SimdUmov { .. }
             | Insn::SimdSmov { .. }
-            | Insn::SimdModImm { .. }
-            | Insn::SimdShift { .. }
-            | Insn::SimdExt { .. }
             | Insn::SimdPermute { .. }
             | Insn::SimdTbl { .. }
             | Insn::SimdIndexed { .. }
             | Insn::SimdScalarCopy { .. }
-            | Insn::SimdLdSt { .. }
             | Insn::Aese { .. }
             | Insn::Aesd { .. }
             | Insn::Aesmc { .. }
@@ -1668,14 +1694,25 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
     for _ in 0..meta::HEADER_SIZE {
         g.a.byte(0);
     }
-    // Checking entry: %rax must hold our guest PC.
+    // Inline-cache entry: %rax holds the branch target; mismatches go to
+    // the lookup table.
+    g.point(kind::EXIT_RAX, 0, 0);
+    g.a.mov_ri64(RDX, pc);
+    g.a.alu_rr(Alu::Cmp, Sz::Q, RAX, RDX);
+    let jd = g.a.jcc(Cc::Ne, None);
+    g.rel_abs(jd, cfg.stubs.dispatch_rax);
+    let jmain = g.a.jmp(None);
+    while g.a.pos < meta::CHECK_OFF {
+        g.a.byte(0xcc);
+    }
+    // Checking entry (lookup table): mismatches go to the translator.
     let check_off = g.a.pos;
-    g.point(kind::INSN, FLAGS_MEM, 0);
     g.a.mov_ri64(RDX, pc);
     g.a.alu_rr(Alu::Cmp, Sz::Q, RAX, RDX);
     let jm = g.a.jcc(Cc::Ne, None);
     g.rel_abs(jm, cfg.stubs.miss);
     let main_off = g.a.pos;
+    g.a.patch_rel32(jmain, main_off);
 
     let mut ended = false;
     let mut idx = 0usize;
@@ -1833,6 +1870,25 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
             Insn::Cas { pair: false, size, acquire: _, release: _, rs, rt, rn } => g.cas(size, rs, rt, rn),
             Insn::DcZva { rt } => g.dc_zva(rt),
             Insn::Mrs { rt, enc } => g.mrs(rt, enc),
+            Insn::FpImm { ftype, rd, imm8 } => g.fp_imm_insn(ftype, rd, imm8),
+            Insn::Fp2 { ftype, op, rd, rn, rm } => g.fp2(ftype, op, rd, rn, rm),
+            Insn::Fp3 { ftype, neg, sub, rd, rn, rm, ra } => g.fp3(ftype, neg, sub, rd, rn, rm, ra),
+            Insn::Fp1 { ftype, op, to, rd, rn } => g.fp1(ftype, op, to, rd, rn),
+            Insn::FpCmp { ftype, rn, rm, zero, signal } => g.fp_cmp(ftype, rn, rm, zero, signal),
+            Insn::FpCSel { ftype, rd, rn, rm, cond } => g.fp_csel(ftype, rd, rn, rm, cond),
+            Insn::FpCvt { ftype, sf, op, rd, rn } => g.fp_cvt(ftype, sf, op, rd, rn),
+            Insn::SimdThree { q, u, size, op, rd, rn, rm, scalar } => g.simd_three(q, u, size, op, rd, rn, rm, scalar),
+            Insn::SimdMisc { q, u, size, op, rd, rn, scalar } => g.simd_misc(q, u, size, op, rd, rn, scalar),
+            Insn::SimdDup { q, imm5, rd, rn, from_gpr } => g.simd_dup(q, imm5, rd, rn, from_gpr),
+            Insn::SimdModImm { q, op, cmode, rd, imm, fp } => g.simd_mod_imm(q, op, cmode, rd, imm, fp),
+            Insn::SimdShift { q, u, immh, immb, opcode, rd, rn, scalar } => g.simd_shift(q, u, immh, immb, opcode, rd, rn, scalar),
+            Insn::SimdExt { q, imm4, rd, rn, rm } => g.simd_ext(q, imm4, rd, rn, rm),
+            Insn::SimdUmov { q: _, imm5, rd, rn } => g.simd_umov(imm5, rd, rn),
+            Insn::SimdInsGpr { imm5, rd, rn } => g.simd_ins_gpr(imm5, rd, rn),
+            Insn::SimdInsElt { imm5, imm4, rd, rn } => g.simd_ins_elt(imm5, imm4, rd, rn),
+            Insn::SimdLdSt { load, q, size: _, opcode, rt, rn, rm, single, index: _, replicate: _, selem: _, post } => {
+                g.simd_ldst(load, q, opcode, rt, rn, rm, single, post)
+            }
             Insn::MsrReg { rt, enc } => g.msr(rt, enc),
 
             // ---- branches ----
@@ -1844,8 +1900,7 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
             }
             Insn::Bl { imm } => {
                 g.flags_to_mem();
-                g.mov_imm(RSI, next);
-                g.exit_to(ipc.wrapping_add(imm as u64), main_off);
+                g.call_to(Some(ipc.wrapping_add(imm as u64)), next, main_off);
                 ended = true;
                 true
             }
@@ -1890,18 +1945,25 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
                 ended = true;
                 true
             }
-            Insn::Br { rn } | Insn::Ret { rn } => {
+            Insn::Ret { rn } => {
                 g.flags_to_mem();
                 g.get_into(rn, false, Sz::Q, RAX);
-                g.exit_rax();
+                g.point(kind::EXIT_RAX, 0, 0);
+                g.a.ret();
+                ended = true;
+                true
+            }
+            Insn::Br { rn } => {
+                g.flags_to_mem();
+                g.get_into(rn, false, Sz::Q, RAX);
+                g.exit_ic();
                 ended = true;
                 true
             }
             Insn::Blr { rn } => {
                 g.flags_to_mem();
                 g.get_into(rn, false, Sz::Q, RAX);
-                g.mov_imm(RSI, next);
-                g.exit_rax();
+                g.call_to(None, next, main_off);
                 ended = true;
                 true
             }
@@ -1945,8 +2007,12 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
         let e = g.s.exits.get(k).copied().unwrap_or_default();
         let t = g.a.pos;
         g.idx = n.saturating_sub(1);
-        g.point(kind::EXIT, k as u8, 0);
-        g.a.mov_ri64(RAX, e.target);
+        if e.kind == meta::EXIT_IC {
+            g.point(kind::EXIT_RAX, 0, 0);
+        } else {
+            g.point(kind::EXIT, k as u8, 0);
+            g.a.mov_ri64(RAX, e.target);
+        }
         g.a.lea(Sz::Q, RDX, Mem::rip(e.site as i32));
         g.jmp_abs(cfg.stubs.chain);
         g.a.patch_rel32(e.site as usize, t);

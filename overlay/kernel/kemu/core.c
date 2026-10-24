@@ -250,6 +250,15 @@ static struct kemu_thread *kemu_thread_new(struct kemu_mm *km, int slot,
 	/* Leave headroom: barriers touch [rsp] even when the stack is empty. */
 	kt->rstack_top = kemu_slot_base(km, slot) + KEMU_SLOT_RSTACK_TOP_PG * PAGE_SIZE - 64;
 	kt->cpu->host_rsp_top = kt->rstack_top;
+	/* Return-stack underflow sentinels: "return" into dispatch_rax. */
+	{
+		struct kemu_slot *s = xa_load(&km->slots, slot);
+		u64 *top = page_address(s->pages[KEMU_SLOT_USED_PAGES - 1]) + PAGE_SIZE - 64;
+		int i;
+
+		for (i = 0; i < 8; i++)
+			top[i] = kemu_stub(km, km->stubs.dispatch_rax);
+	}
 	return kt;
 }
 
@@ -385,6 +394,7 @@ void kemu_start_thread(struct pt_regs *regs, unsigned long pc, unsigned long sp)
 	cpu->sp = sp;
 	cpu->excl_addr = ~0ULL;
 	cpu->host_rsp_top = kt->rstack_top;
+	cpu->scratch[KEMU_MXCSR_SLOT] = 0x1f80;
 
 	static_branch_enable(&kemu_active_key);
 	current->kemu = kt;
@@ -602,6 +612,25 @@ bool kemu_vma_hidden(struct vm_area_struct *vma)
 	return vma_is_special_mapping(vma, &kemu_code_mapping) ||
 	       vma_is_special_mapping(vma, &kemu_table_mapping) ||
 	       vma_is_special_mapping(vma, &kemu_slots_mapping);
+}
+
+/*
+ * A user page fault of a kemu task: the host return stack overflowed into
+ * its guard page (deep or unbalanced guest calls). The entries are only
+ * prediction hints, so reset the stack and retry.
+ */
+bool kemu_user_fault(struct pt_regs *regs, unsigned long address)
+{
+	struct kemu_thread *kt = current->kemu;
+	struct kemu_mm *km = current->mm->kemu;
+	unsigned long guard = km->slots_base + (unsigned long)kt->slot * KEMU_SLOT_SIZE +
+			      PAGE_SIZE;
+
+	if (address < guard || address >= guard + PAGE_SIZE ||
+	    regs->ip < km->code_base || regs->ip >= km->code_base + KEMU_CODE_SIZE)
+		return false;
+	regs->sp = kt->rstack_top;
+	return true;
 }
 
 unsigned long kemu_user_sp(struct task_struct *tsk)

@@ -90,20 +90,46 @@ pub const OFF_EXCL_SIZE: i32 = 304;
 pub const OFF_EXCL_VAL: i32 = 312;
 pub const OFF_EXIT_INFO: i32 = 408;
 pub const OFF_FLAGS_X86: i32 = 416;
+/// MXCSR image (scratch slot 7), saved/restored by the stubs.
+pub const OFF_MXCSR: i32 = 400;
 pub const OFF_V: i32 = 512;
 
-/// Spill all pinned registers to the state page.
+/// Spill all pinned registers (and MXCSR) to the state page.
 pub fn spill_all(a: &mut Asm<'_>) {
     for (g, h) in PINNED.iter() {
         a.store(Sz::Q, Mem::gs(slot_of(*g)), *h);
     }
+    a.vex(1, 0, false, false, 0xae, 3, 0, Rm::M(Mem::gs(OFF_MXCSR))); // vstmxcsr
 }
 
-/// Reload all pinned registers from the state page.
+/// Reload all pinned registers (and MXCSR) from the state page.
 pub fn reload_all(a: &mut Asm<'_>) {
     for (g, h) in PINNED.iter() {
         a.load(Sz::Q, *h, Mem::gs(slot_of(*g)));
     }
+    a.vex(1, 0, false, false, 0xae, 2, 0, Rm::M(Mem::gs(OFF_MXCSR))); // vldmxcsr
+}
+
+/// MXCSR for a guest FPCR/FPSR: rounding mode, flush-to-zero, all
+/// exceptions masked, and the cumulative flags from FPSR.
+pub fn mxcsr_from(fpcr: u32, fpsr: u32) -> u32 {
+    let rc = match (fpcr >> 22) & 3 {
+        0 => 0, // RN
+        1 => 2, // RP -> round up
+        2 => 1, // RM -> round down
+        _ => 3, // RZ
+    };
+    let fz = if fpcr & (1 << 24) != 0 { (1 << 15) | (1 << 6) } else { 0 };
+    let f = |b: u32| (fpsr >> b) & 1;
+    let flags = f(0) | (f(1) << 2) | (f(2) << 3) | (f(3) << 4) | (f(4) << 5);
+    0x1f80 | (rc << 13) | fz | flags
+}
+
+/// Merge MXCSR exception flags into FPSR's cumulative flags.
+pub fn fpsr_merge(fpsr: u32, mxcsr: u32) -> u32 {
+    let m = |b: u32| (mxcsr >> b) & 1;
+    // IE->IOC, ZE->DZC, OE->OFC, UE->UFC, PE->IXC (DE has no equivalent)
+    fpsr | m(0) | (m(2) << 1) | (m(3) << 2) | (m(4) << 3) | (m(5) << 4)
 }
 
 /// x86 flags image stored at `OFF_FLAGS_X86` (16 bits): AL = V, AH = lahf

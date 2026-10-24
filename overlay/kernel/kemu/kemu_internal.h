@@ -81,7 +81,7 @@ struct kemu_slot {
 
 /* Offsets of the user-mode stubs (mirror of KemuStubs in kemu_rs.rs). */
 struct kemu_stubs {
-	u32 dispatch, dispatch_rax, miss, chain, helper, svc, interp_svc, step, end;
+	u32 dispatch, dispatch_rax, miss, chain, helper, svc, interp_svc, step, fcmp_table, end;
 	u32 nranges;
 	u32 ranges[16][3];
 };
@@ -249,6 +249,7 @@ struct kemu_trans {
 	u32 ninsns;
 	u32 fault_access;
 	u64 fault_addr;
+	u64 ic_entry;		/* filled in by jit.c, not Rust */
 };
 
 struct kemu_host_regs {
@@ -266,9 +267,19 @@ bool kemu_rs_recover(const u8 *blk, size_t len, u32 host_off,
 		     const struct kemu_host_regs *h, struct kemu_cpu *cpu);
 void kemu_rs_pinned_from_host(const struct kemu_host_regs *h, struct kemu_cpu *cpu);
 size_t kemu_rs_block_info(const u8 *blk, size_t len, u64 *guest_pc, u32 *main_off);
-bool kemu_rs_find_exit(const u8 *blk, size_t len, u32 site_off, u64 *target);
+bool kemu_rs_find_exit(const u8 *blk, size_t len, u32 site_off, u64 *target,
+		       u32 *kind);
+
+/* Block layout (rust/kemu_core/src/jit/meta.rs). */
+#define KEMU_BLK_IC_OFF		32
+#define KEMU_BLK_CHECK_OFF	64
+#define KEMU_EXIT_KIND_IC	1
 u64 kemu_rs_nzcv_from_image(u64 img);
 u64 kemu_rs_image_from_nzcv(u64 nzcv);
+u32 kemu_rs_mxcsr_from(u32 fpcr, u32 fpsr);
+u32 kemu_rs_fpsr_merge(u32 fpsr, u32 mxcsr);
+
+#define KEMU_MXCSR_SLOT	7	/* kemu_cpu.scratch[] index of the MXCSR image */
 u64 kemu_rs_hwcap(void);
 u64 kemu_rs_hwcap2(void);
 int kemu_rs_build_ucontext(u8 *buf, size_t len, const struct kemu_cpu *cpu,

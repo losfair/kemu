@@ -203,22 +203,26 @@ fn ins_elt(cpu: &mut CpuState, imm5: u32, imm4: u32, rd: u32, rn: u32) {
 }
 
 fn mod_imm(cpu: &mut CpuState, q: bool, op: u8, cmode: u8, rd: u32, imm: u64, _fp: bool) {
-    // imm is replicated per 64-bit; MVNI/BIC/ORR adjust.
-    let mut out = [imm, imm];
-    if op == 1 && (cmode & 0b1110 != 0b1110) {
-        // MVNI / BIC (op==1): for cmode 0..13, op==1 means BIC/MVNI.
-        if cmode & 1 == 1 && cmode < 0b1110 && (cmode >> 1) >= 0b100 {
+    // op/cmode selects MOVI / MVNI / ORR / BIC / FMOV. `imm` already carries
+    // the expanded (MSL/replicated) pattern from adv_simd_expand_imm.
+    let odd = cmode & 1 == 1;
+    let is_bic_orr = odd && (cmode >> 1) <= 0b101; // cmode 0001..1011 odd
+    let mut out;
+    if is_bic_orr {
+        let cur = cpu.vreg(rd);
+        if op == 1 {
             // BIC (immediate): AND with NOT imm
-            let cur = cpu.vreg(rd);
             out = [cur[0] & !imm, cur[1] & !imm];
         } else {
-            // MVNI
-            out = [!imm, !imm];
+            // ORR (immediate)
+            out = [cur[0] | imm, cur[1] | imm];
         }
-    } else if op == 0 && cmode & 1 == 1 && (cmode >> 1) >= 0b100 && cmode < 0b1100 {
-        // ORR (immediate)
-        let cur = cpu.vreg(rd);
-        out = [cur[0] | imm, cur[1] | imm];
+    } else if op == 1 && !(cmode == 0b1110) && !(cmode == 0b1111) {
+        // MVNI (including cmode 110x MSL): bitwise-NOT of the pattern.
+        out = [!imm, !imm];
+    } else {
+        // MOVI / FMOV / MOVI-64: use the pattern directly.
+        out = [imm, imm];
     }
     if !q {
         out[1] = 0;

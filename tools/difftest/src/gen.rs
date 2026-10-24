@@ -5,11 +5,12 @@ use crate::{Arch, Rng};
 
 /// Destination GPR: 2..=30 (x0/x1 are harness scratch).
 fn rd(r: &mut Rng) -> u32 {
-    2 + r.bits(5) % 29
+    3 + r.bits(5) % 28
 }
-/// Any source GPR 0..=30 (31 would be XZR/SP depending on form).
+/// Any source GPR 0..=30, excluding x2 (reserved as memory base).
 fn rn(r: &mut Rng) -> u32 {
-    r.bits(5) % 31
+    let v = r.bits(5) % 31;
+    if v == 2 { 3 } else { v }
 }
 /// Vector register 0..=31.
 fn vr(r: &mut Rng) -> u32 {
@@ -103,6 +104,11 @@ pub static CLASSES: &[Class] = &[
     Class { name: "simd_three", gen: g_simd_three },
     Class { name: "simd_misc", gen: g_simd_misc },
     Class { name: "simd_dup", gen: g_simd_dup },
+    Class { name: "ldr_imm", gen: g_ldr_imm },
+    Class { name: "ldr_pair", gen: g_ldr_pair },
+    Class { name: "ldr_reg", gen: g_ldr_reg },
+    Class { name: "simd_shift", gen: g_simd_shift },
+    Class { name: "simd_modimm", gen: g_simd_modimm },
 ];
 
 fn sf(r: &mut Rng) -> u32 {
@@ -323,4 +329,56 @@ fn g_simd_dup(r: &mut Rng) -> u32 {
     let q = r.bits(1);
     let imm5 = (r.bits(5) | 1) & 0x1f; // ensure a nonzero low bit sometimes
     (q << 30) | (0b001110000 << 21) | (imm5 << 16) | (1 << 10) | (vr(r) << 5) | vr(r)
+}
+
+/// LDR/LDRB/LDRH/LDRSW (unsigned-offset) from x2.
+fn g_ldr_imm(r: &mut Rng) -> u32 {
+    let size = r.bits(2); // 0..3 byte/half/word/dword
+    let opc = match r.bits(2) { 0 => 1u32, 1 => 1, 2 if size < 3 => 2, _ => 1 }; // LDR / LDRS*
+    let imm12 = (r.bits(4) % 8) as u32; // small offset in elements
+    (size << 30) | (0b111001 << 24) | (opc << 22) | (imm12 << 10) | (2 << 5) | rd(r)
+}
+
+/// LDP (signed offset) from x2.
+fn g_ldr_pair(r: &mut Rng) -> u32 {
+    let sf = r.bits(1); // 0 => 32-bit, 1 => 64-bit (opc 00/10)
+    let opc = if sf == 1 { 0b10 } else { 0b00 };
+    let imm7 = (r.bits(3) % 4) as u32;
+    (opc << 30) | (0b10100 << 25) | (0b10 << 23) | (1 << 22) | (imm7 << 15) | (rd(r) << 10) | (2 << 5) | rd(r)
+}
+
+/// LDR (register offset) from x2 + x3 (x3 small).
+fn g_ldr_reg(r: &mut Rng) -> u32 {
+    let size = r.bits(2);
+    let opc = 1u32; // LDR
+    // option=011 (LSL/UXTX), S=0, Rm = x1 (holds a small index from state? use x1)
+    (size << 30) | (0b111000 << 24) | (opc << 22) | (1 << 21) | (1 << 16) | (0b011 << 13) | (0b10 << 10) | (2 << 5) | rd(r)
+}
+
+fn g_simd_shift(r: &mut Rng) -> u32 {
+    let q = r.bits(1);
+    let u = r.bits(1);
+    // pick a valid esize via immh, and a right/left opcode
+    let immh = 1u32 << (r.bits(2)); // 1,2,4,8
+    let immb = r.bits(3);
+    let opcode = match r.bits(3) {
+        0 => 0b00000, // USHR/SSHR
+        1 => 0b00010, // USRA/SSRA
+        2 => 0b00100, // URSHR/SRSHR
+        3 => 0b01010, // SHL
+        4 => 0b10000, // SHRN
+        5 => 0b10100, // SSHLL/USHLL
+        6 => 0b01100, // SQSHL/UQSHL
+        _ => 0b00000,
+    };
+    (q << 30) | (u << 29) | (0b011110 << 23) | (immh << 19) | (immb << 16) | (opcode << 11) | (1 << 10) | (vr(r) << 5) | vr(r)
+}
+
+fn g_simd_modimm(r: &mut Rng) -> u32 {
+    let q = r.bits(1);
+    let op = r.bits(1);
+    let cmode = r.bits(4);
+    let abc = r.bits(3);
+    let defgh = r.bits(5);
+    (q << 30) | (op << 29) | (0b0111100000 << 19) | (abc << 16) | (cmode << 12) | (defgh << 5) | vr(r)
 }

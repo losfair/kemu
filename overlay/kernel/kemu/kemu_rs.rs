@@ -265,6 +265,7 @@ pub struct KemuStubs {
     pub svc: u32,
     pub interp_svc: u32,
     pub step: u32,
+    pub fcmp_table: u32,
     pub end: u32,
     pub nranges: u32,
     pub ranges: [[u32; 3]; 16],
@@ -278,6 +279,7 @@ impl KemuStubs {
             chain: base + self.chain as u64,
             helper: base + self.helper as u64,
             svc: base + self.svc as u64,
+            fcmp_table: base + self.fcmp_table as u64,
         }
     }
 }
@@ -308,6 +310,7 @@ pub unsafe extern "C" fn kemu_rs_gen_stubs(
     info.svc = o.svc;
     info.interp_svc = o.interp_svc;
     info.step = o.step;
+    info.fcmp_table = o.fcmp_table;
     info.end = o.end;
     info.nranges = o.nranges as u32;
     for (d, s) in info.ranges.iter_mut().zip(o.ranges.iter()) {
@@ -453,6 +456,7 @@ pub unsafe extern "C" fn kemu_rs_find_exit(
     len: usize,
     site_off: u32,
     target: *mut u64,
+    kind: *mut u32,
 ) -> bool {
     // SAFETY: guaranteed by the caller.
     let blk = unsafe { core::slice::from_raw_parts(blk, len) };
@@ -467,7 +471,10 @@ pub unsafe extern "C" fn kemu_rs_find_exit(
     match meta::find_exit_site(m, site_off) {
         Some(e) => {
             // SAFETY: guaranteed by the caller.
-            unsafe { target.write(e.target) };
+            unsafe {
+                target.write(e.target);
+                kind.write(e.kind);
+            }
             true
         }
         None => false,
@@ -482,4 +489,14 @@ pub extern "C" fn kemu_rs_nzcv_from_image(img: u64) -> u64 {
 #[no_mangle]
 pub extern "C" fn kemu_rs_image_from_nzcv(nzcv: u64) -> u64 {
     regmap::image_from_nzcv(nzcv)
+}
+
+#[no_mangle]
+pub extern "C" fn kemu_rs_mxcsr_from(fpcr: u32, fpsr: u32) -> u32 {
+    regmap::mxcsr_from(fpcr, fpsr)
+}
+
+#[no_mangle]
+pub extern "C" fn kemu_rs_fpsr_merge(fpsr: u32, mxcsr: u32) -> u32 {
+    regmap::fpsr_merge(fpsr, mxcsr)
 }

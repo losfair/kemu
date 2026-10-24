@@ -1,0 +1,15 @@
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index 998bd807f..0ccf0c668 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -1235,6 +1235,10 @@ void do_user_addr_fault(struct pt_regs *regs,
+ 	}
+ 
+ 	/* kprobes don't want to hook the spurious faults: */
++	/* kemu: overflow of a guest thread's host return stack. */
++	if (user_mode(regs) && task_is_kemu(tsk) && kemu_user_fault(regs, address))
++		return;
++
+ 	if (WARN_ON_ONCE(kprobe_page_fault(regs, X86_TRAP_PF)))
+ 		return;
+ 

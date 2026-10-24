@@ -9,9 +9,10 @@
 use kemu_core::decode::{decode, Insn};
 use kemu_core::env::{Access, Env, Fault};
 use kemu_core::interp::{self, Exit};
-use kemu_core::jit::regmap::{image_from_nzcv, nzcv_from_image};
+use kemu_core::jit::regmap::{fpsr_merge, image_from_nzcv, mxcsr_from, nzcv_from_image};
 use kemu_core::jit::stubs::{self, ExitMode, StubOffsets, OP_CHAIN, OP_HELPER, OP_SVC, OP_TRANSLATE};
 use kemu_core::jit::t1::{self, Cfg, Scratch};
+use kemu_core::jit::meta;
 use kemu_core::state::CpuState;
 use std::collections::HashMap;
 use std::arch::global_asm;
@@ -177,6 +178,7 @@ struct Harness {
     stubs: StubOffsets,
     code_used: usize,
     map: HashMap<u64, (u64, u64)>,
+    blocks: Vec<(u64, usize)>,
     scratch: Box<Scratch>,
     stop: Option<Exit>,
     translations: usize,
@@ -209,6 +211,7 @@ fn lookup_or_translate(pc: u64) -> Result<u64, Fault> {
     let cfg = Cfg { stubs: hh.stubs.addrs(REGION), code_uaddr: base };
     match t1::translate(&mut UEnv, pc, out, &cfg, &mut hh.scratch) {
         Ok(r) => {
+            hh.blocks.push((base, r.size));
             hh.code_used += r.size;
             hh.translations += 1;
             let check = base + r.check_off as u64;
@@ -220,6 +223,13 @@ fn lookup_or_translate(pc: u64) -> Result<u64, Fault> {
         Err(t1::TErr::Fault(f)) => Err(f),
         Err(e) => panic!("translate failed: {e:?}"),
     }
+}
+
+/// Offset of `main` from its block start.
+fn main_off_of(main: u64) -> u64 {
+    let hh = h();
+    let &(b, _) = hh.blocks.iter().find(|(b, sz)| main >= *b && main < *b + *sz as u64).unwrap();
+    main - b
 }
 
 #[repr(C)]
@@ -236,8 +246,21 @@ pub extern "C" fn jt_handle_op(op: u32) -> Ret {
             Ok(main) => {
                 if op == OP_CHAIN {
                     let site = st.exit_info;
-                    let rel = main.wrapping_sub(site + 4) as i64 as i32;
-                    unsafe { (site as *mut i32).write_unaligned(rel) };
+                    let hh = h();
+                    if let Some(&(b, sz)) = hh.blocks.iter().find(|(b, sz)| site >= *b && site < *b + *sz as u64) {
+                        let blk = unsafe { std::slice::from_raw_parts(b as *const u8, sz) };
+                        let hdr = meta::Header::read(blk).unwrap();
+                        let m = &blk[hdr.meta_off as usize..(hdr.meta_off + hdr.meta_len) as usize];
+                        if let Some(e) = meta::find_exit_site(m, (site - b) as u32) {
+                            let dest = if e.kind == meta::EXIT_IC { main - main_off_of(main) + meta::IC_OFF as u64 } else { main };
+                            let rel = dest.wrapping_sub(site + 4) as i64 as i32;
+                            unsafe { (site as *mut i32).write_unaligned(rel) };
+                        } else {
+                            panic!("chain: unknown exit site {site:#x}");
+                        }
+                    } else {
+                        panic!("chain: site {site:#x} not in a block");
+                    }
                 }
                 Ret { val: main, stop: 0 }
             }
@@ -249,9 +272,11 @@ pub extern "C" fn jt_handle_op(op: u32) -> Ret {
         OP_HELPER => {
             h().helpers += 1;
             st.nzcv = nzcv_from_image(st.flags_x86);
+            st.fpsr = fpsr_merge(st.fpsr, st.scratch[7] as u32);
             let pc = st.pc;
             let (ex, _) = interp::run(st, &mut UEnv, 1);
             st.flags_x86 = image_from_nzcv(st.nzcv);
+            st.scratch[7] = mxcsr_from(st.fpcr, st.fpsr) as u64;
             match ex {
                 Exit::Budget | Exit::IcInvalidate(_) if st.pc == pc + 4 => Ret { val: 0, stop: 0 },
                 e => {
@@ -271,6 +296,7 @@ pub extern "C" fn jt_handle_op(op: u32) -> Ret {
 fn reset_cache() {
     let hh = h();
     hh.map.clear();
+    hh.blocks.clear();
     hh.code_used = 4096;
     let miss = REGION + hh.stubs.miss as u64;
     for e in table().iter_mut() {
@@ -284,10 +310,16 @@ fn run_jit(init: &CpuState) -> (CpuState, Option<Exit>) {
     *st = *init;
     st.pc = GUEST;
     st.flags_x86 = image_from_nzcv(init.nzcv);
-    st.host_rsp_top = RSTACK_TOP;
+    st.scratch[7] = mxcsr_from(init.fpcr, init.fpsr) as u64;
+    st.host_rsp_top = RSTACK_TOP - 64;
+    // Return-stack underflow sentinels.
+    for i in 0..8 {
+        unsafe { ((RSTACK_TOP - 64 + i * 8) as *mut u64).write(REGION + h().stubs.dispatch_rax as u64) };
+    }
     h().stop = None;
-    unsafe { jt_enter(RSTACK_TOP, REGION + h().stubs.dispatch as u64) };
+    unsafe { jt_enter(RSTACK_TOP - 64, REGION + h().stubs.dispatch as u64) };
     let mut out = *st;
+    out.fpsr = fpsr_merge(out.fpsr, out.scratch[7] as u32);
     // After a helper stop, nzcv is authoritative; otherwise the image is.
     if !matches!(h().stop, Some(Exit::Brk(_)) | Some(Exit::Undefined(_)) | Some(Exit::Fault(_))) {
         out.nzcv = nzcv_from_image(out.flags_x86);
@@ -427,13 +459,74 @@ fn gen_mem(r: &mut Rng) -> u32 {
 
 static mut MAXLEN: u64 = 24;
 
+fn alu_safe(r: &mut Rng) -> u32 {
+    loop {
+        let w = gen_alu(r);
+        let rd = w & 31;
+        if ![16, 17, 30, 31].contains(&rd) {
+            return w;
+        }
+    }
+}
+
+/// Calls, returns and indirect branches with a known layout.
+fn gen_calls(r: &mut Rng) -> Vec<u32> {
+    let mut v: Vec<u32> = Vec::new();
+    let mut fix: Vec<(usize, &'static str)> = Vec::new();
+    let mut alu = |v: &mut Vec<u32>, r: &mut Rng, n: u64| {
+        for _ in 0..r.below(n + 1) {
+            v.push(alu_safe(r));
+        }
+    };
+    alu(&mut v, r, 4);
+    fix.push((v.len(), "bl_f"));
+    v.push(0);
+    alu(&mut v, r, 3);
+    fix.push((v.len(), "adr16_f"));
+    v.push(0);
+    v.push(0xd63f0200); // blr x16
+    alu(&mut v, r, 3);
+    fix.push((v.len(), "adr17_after"));
+    v.push(0);
+    v.push(0xd61f0220); // br x17
+    let after = v.len();
+    alu(&mut v, r, 3);
+    fix.push((v.len(), "bl_f"));
+    v.push(0);
+    fix.push((v.len(), "b_end"));
+    v.push(0);
+    let f = v.len();
+    alu(&mut v, r, 5);
+    v.push(0xd65f03c0); // ret
+    let end = v.len();
+    v.push(0xd420_0000);
+    for (at, what) in fix {
+        let off = |t: usize| (t as i64 - at as i64) as i32;
+        v[at] = match what {
+            "bl_f" => 0x9400_0000 | (off(f) as u32 & 0x3ff_ffff),
+            "b_end" => 0x1400_0000 | (off(end) as u32 & 0x3ff_ffff),
+            "adr16_f" | "adr17_after" => {
+                let (rd, t) = if what == "adr16_f" { (16, f) } else { (17, after) };
+                let b = off(t) * 4;
+                0x1000_0000 | (((b & 3) as u32) << 29) | ((((b >> 2) as u32) & 0x7ffff) << 5) | rd
+            }
+            _ => unreachable!(),
+        };
+    }
+    v
+}
+
 fn gen_case(r: &mut Rng, mode: u32) -> Vec<u32> {
+    if mode == 4 {
+        return gen_calls(r);
+    }
     let n = 1 + r.below(unsafe { MAXLEN }) as usize;
     let mut v = Vec::new();
     for k in 0..n {
         let w = match mode {
             0 => gen_alu(r),
             1 => gen_mem(r),
+            3 => gen_fp(r),
             _ => {
                 // mixed with forward branches
                 match r.below(6) {
@@ -447,7 +540,18 @@ fn gen_case(r: &mut Rng, mode: u32) -> Vec<u32> {
                         }
                     }
                     1 => gen_mem(r),
-                    _ => gen_alu(r),
+                    _ => {
+                        // keep the memory base registers (x20, x22, x23, sp) intact
+                        let mut w;
+                        loop {
+                            w = gen_alu(r);
+                            let rd = w & 31;
+                            if ![20, 22, 23, 31].contains(&rd) {
+                                break;
+                            }
+                        }
+                        w
+                    }
                 }
             }
         };
@@ -455,6 +559,53 @@ fn gen_case(r: &mut Rng, mode: u32) -> Vec<u32> {
     }
     v.push(0xd420_0000); // brk #0
     v
+}
+
+fn is_fp(i: &Insn) -> bool {
+    matches!(
+        i,
+        Insn::FpImm { .. }
+            | Insn::Fp1 { .. }
+            | Insn::Fp2 { .. }
+            | Insn::Fp3 { .. }
+            | Insn::FpCmp { .. }
+            | Insn::FpCSel { .. }
+            | Insn::FpCvt { .. }
+            | Insn::SimdThree { .. }
+            | Insn::SimdMisc { .. }
+            | Insn::SimdDup { .. }
+            | Insn::SimdModImm { .. }
+            | Insn::SimdShift { .. }
+            | Insn::SimdExt { .. }
+            | Insn::SimdUmov { .. }
+            | Insn::SimdInsGpr { .. }
+            | Insn::SimdInsElt { .. }
+    )
+}
+
+fn gen_fp(r: &mut Rng) -> u32 {
+    loop {
+        let w = (r.next() as u32 & !(0x7 << 25)) | (0x7 << 25);
+        let i = decode(w);
+        if is_fp(&i) {
+            return w;
+        }
+    }
+}
+
+fn fpval(r: &mut Rng) -> u64 {
+    let d: [u64; 12] = [
+        0x3ff0000000000000, 0xbff8000000000000, 0x7ff0000000000000, 0xfff0000000000000,
+        0x7ff8000000000001, 0x7ff4000000000000, 0x0000000000000001, 0x8000000000000000,
+        0x4059000000000000, 0x41dfffffffc00000, 0x43e0000000000000, 0xc1e0000000200000,
+    ];
+    let s: [u64; 8] = [0x3f800000, 0xbfc00000, 0x7f800000, 0x7fc00001, 0x7fa00000, 0x00000001, 0x80000000, 0x4f000000];
+    match r.below(4) {
+        0 => d[r.below(12) as usize],
+        1 => s[r.below(8) as usize] | (s[r.below(8) as usize] << 32),
+        2 => r.next(),
+        _ => (r.next() & 0x800f_ffff_ffff_ffff) | (0x3fe0u64 + r.below(0x40)) << 52,
+    }
 }
 
 fn init_state(r: &mut Rng) -> CpuState {
@@ -468,8 +619,9 @@ fn init_state(r: &mut Rng) -> CpuState {
     s.sp = DATA + 0x8000;
     s.nzcv = (r.below(16)) << 28;
     for i in 0..32 {
-        s.v[i] = [r.val(), r.val()];
+        s.v[i] = [fpval(r), fpval(r)];
     }
+    s.fpcr = (r.below(4) as u32) << 22;
     s
 }
 
@@ -496,6 +648,7 @@ fn main() {
             stubs: so,
             code_used: 4096,
             map: HashMap::new(),
+            blocks: Vec::new(),
             scratch: Box::new(Scratch::new()),
             stop: None,
             translations: 0,
@@ -507,6 +660,7 @@ fn main() {
     let mut data_init = vec![0u8; DATA_SIZE];
     let mut fails = 0;
     let mut shown = 0;
+    let mut fpsr_diffs = 0;
     let mut classes: HashMap<String, usize> = HashMap::new();
     for it in 0..iters {
         let mode = only_mode.unwrap_or((it % 3) as u32);
@@ -554,6 +708,9 @@ fn main() {
         if format!("{:?}", Some(ref_ex)) != format!("{:?}", jit_ex) {
             bad.push(format!("exit: ref {ref_ex:?} jit {jit_ex:?}"));
         }
+        if ref_st.fpsr != jit_st.fpsr {
+            fpsr_diffs += 1;
+        }
         if !bad.is_empty() {
             for w in &code {
                 let name = format!("{:?}", decode(*w));
@@ -581,6 +738,7 @@ fn main() {
     let mut cv: Vec<_> = classes.into_iter().collect();
     cv.sort_by(|a, b| b.1.cmp(&a.1));
     println!("classes in failing cases: {:?}", cv);
+    println!("fpsr differences (not counted as failures): {fpsr_diffs}");
     let hh = h();
     println!(
         "{iters} cases, {fails} failures; {} translations, {} helper calls",
