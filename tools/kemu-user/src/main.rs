@@ -14,12 +14,13 @@ use kemu_core::sysregs;
 use std::os::unix::ffi::OsStrExt;
 
 mod elf;
+mod jit;
 mod syscalls;
 
 /// Host-memory-backed environment: guest VA == host VA.
-struct HostMem {
+pub(crate) struct HostMem {
     /// Whether to trace syscalls to stderr.
-    trace: bool,
+    pub(crate) trace: bool,
 }
 
 macro_rules! rd {
@@ -126,15 +127,19 @@ impl Env for HostMem {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut trace = false;
+    let mut use_jit = false;
     let mut idx = 1;
     while idx < args.len() && args[idx].starts_with("--") {
         if args[idx] == "--trace" {
             trace = true;
         }
+        if args[idx] == "--jit" {
+            use_jit = true;
+        }
         idx += 1;
     }
     if idx >= args.len() {
-        eprintln!("usage: kemu-user [--trace] <aarch64-elf> [args...]");
+        eprintln!("usage: kemu-user [--trace] [--jit] <aarch64-elf> [args...]");
         std::process::exit(2);
     }
     let prog = &args[idx];
@@ -175,6 +180,10 @@ fn main() {
             let v = unsafe { core::ptr::read(a as *const u64) };
             eprintln!("  [{:#x}] (+{:#x}) = {:#018x}", a, i*8, v);
         }
+    }
+    if use_jit {
+        install_segv();
+        std::process::exit(jit::run(&cpu, env));
     }
     run_loop(&mut cpu, &mut env);
 }

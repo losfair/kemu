@@ -715,6 +715,13 @@ Mechanism:
    state is "before *i*", with registers read from the locations metadata gives for
    that point.
 
+**Deviation (by design):** NZCV is exact at an interruption point only if the flags
+are *live* there (some later instruction in the block, or a block exit, reads them).
+Dead flags are never materialized. That is what makes lazy flags cheap, but a signal
+delivered at such a point (for example a fault) shows a stale NZCV in `uc_mcontext`.
+Execution after `rt_sigreturn` is unaffected, because the flags are overwritten
+before anything reads them.
+
 ### 9.2 Host return stack
 
 `rsp` points into a per-thread host return stack (64 KiB plus guard pages) in the

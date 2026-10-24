@@ -26,7 +26,7 @@ mod fp;
 
 pub const MAX_INSNS: usize = 64;
 pub const MAX_POINTS: usize = 640;
-pub const MAX_EXITS: usize = 4;
+pub const MAX_EXITS: usize = 16;
 
 /// Working memory for one translation (provided by the caller so that the
 /// translator never allocates and keeps its stack small). Contains only
@@ -408,8 +408,17 @@ impl<'s, 'b> Gen<'s, 'b> {
                 self.add_exit(at as u32, t);
             }
             None => {
+                // Indirect call through a per-site inline cache.
                 self.point(kind::EXIT_RAX, 0, 0);
-                self.call_abs(self.cfg.stubs.dispatch_rax);
+                self.pad_for_rel32(1);
+                let at = self.a.call(None);
+                match self.s.exits.get_mut(self.ne) {
+                    Some(e) => {
+                        *e = Exit { site: at as u32, kind: meta::EXIT_IC, target: 0 };
+                        self.ne += 1;
+                    }
+                    None => self.overflow = true,
+                }
             }
         }
         // Landing pad: a guest RET arrives here with the target in %rax.
@@ -1558,7 +1567,11 @@ impl<'s, 'b> Gen<'s, 'b> {
 /// Does `i` read the guest flags?
 fn uses_flags(i: &Insn) -> bool {
     match i {
+        // Side exits leave the block with the flags in memory, so the
+        // flags are live at every conditional branch.
         Insn::BCond { .. }
+        | Insn::Cbz { .. }
+        | Insn::Tbz { .. }
         | Insn::CondSel { .. }
         | Insn::CondCmp { .. }
         | Insn::AddSubCarry { .. }
@@ -1620,9 +1633,6 @@ fn ends_block(i: &Insn) -> bool {
         i,
         Insn::B { .. }
             | Insn::Bl { .. }
-            | Insn::BCond { .. }
-            | Insn::Cbz { .. }
-            | Insn::Tbz { .. }
             | Insn::Br { .. }
             | Insn::Blr { .. }
             | Insn::Ret { .. }
@@ -1912,11 +1922,16 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
                 match cc {
                     Some(cc) => {
                         g.exit_if(cc, target, main_off);
-                        g.exit_to(next, main_off);
+                        if idx + 1 == n {
+                            g.exit_to(next, main_off);
+                            ended = true;
+                        }
                     }
-                    None => g.exit_to(target, main_off),
+                    None => {
+                        g.exit_to(target, main_off);
+                        ended = true;
+                    }
                 }
-                ended = true;
                 true
             }
             Insn::Cbz { sf, nz, rt, imm } => {
@@ -1930,8 +1945,10 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
                     Gp::Zero => g.a.alu_rr(Alu::Xor, Sz::D, RAX, RAX),
                 }
                 g.exit_if(if nz { Cc::Ne } else { Cc::E }, target, main_off);
-                g.exit_to(next, main_off);
-                ended = true;
+                if idx + 1 == n {
+                    g.exit_to(next, main_off);
+                    ended = true;
+                }
                 true
             }
             Insn::Tbz { bit, nz, rt, imm } => {
@@ -1941,8 +1958,10 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
                 let r = g.rm(rt, false, RAX);
                 g.a.bt_ri(Sz::Q, r, bit as u8);
                 g.exit_if(if nz { Cc::B } else { Cc::Ae }, target, main_off);
-                g.exit_to(next, main_off);
-                ended = true;
+                if idx + 1 == n {
+                    g.exit_to(next, main_off);
+                    ended = true;
+                }
                 true
             }
             Insn::Ret { rn } => {

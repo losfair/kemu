@@ -23,7 +23,7 @@ pub const PINNED: [(u32, Reg); 13] = [
     (19, R12),
     (20, R13),
     (21, R14),
-    (9, R15),
+    (22, R15),
 ];
 
 /// Scratch registers never holding guest state across instructions.
@@ -45,7 +45,7 @@ pub const fn host_of(n: u32) -> Option<Reg> {
         19 => Some(R12),
         20 => Some(R13),
         21 => Some(R14),
-        9 => Some(R15),
+        22 => Some(R15),
         _ => None,
     }
 }
@@ -65,7 +65,7 @@ pub const fn guest_of(r: Reg) -> Option<u32> {
         R12 => Some(19),
         R13 => Some(20),
         R14 => Some(21),
-        R15 => Some(9),
+        R15 => Some(22),
         _ => None,
     }
 }
