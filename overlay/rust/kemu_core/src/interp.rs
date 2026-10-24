@@ -422,7 +422,9 @@ fn step<E: Env>(cpu: &mut CpuState, env: &mut E, insn: Insn, word: u32) -> Step 
         Insn::Cas { .. } => mem::exec_cas(cpu, env, insn),
         Insn::DcZva { rt } => mem::exec_dc_zva(cpu, env, rt),
         Insn::IcIvau { rt } => {
+            // Exit::IcInvalidate is reported with the PC already advanced.
             let addr = cpu.xr(rt);
+            cpu.pc = cpu.pc.wrapping_add(4);
             Step::Exit(Exit::IcInvalidate(addr))
         }
 
