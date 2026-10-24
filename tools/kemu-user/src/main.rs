@@ -193,7 +193,13 @@ static CUR_PC: AtomicU64 = AtomicU64::new(0);
 static FAULT_ADDR: AtomicU64 = AtomicU64::new(0);
 static CPU_PTR: AtomicU64 = AtomicU64::new(0);
 
-extern "C" fn segv_handler(_sig: i32, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
+extern "C" fn segv_handler(_sig: i32, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    if !ctx.is_null() {
+        // SAFETY: the kernel passes a ucontext_t for SA_SIGINFO handlers.
+        let rip = unsafe { (*(ctx as *const libc::ucontext_t)).uc_mcontext.gregs[libc::REG_RIP as usize] };
+        let m = format!("kemu-user: host rip={rip:#x}\n");
+        unsafe { libc::write(2, m.as_ptr() as *const _, m.len()); }
+    }
     // si_addr is at a fixed offset; read it portably via the struct.
     let addr = unsafe { (*info).si_addr() } as u64;
     FAULT_ADDR.store(addr, Ordering::SeqCst);

@@ -127,6 +127,8 @@ struct Gen<'s, 'b> {
     remap: [(u32, u32); MAX_REMAP],
     nremap: usize,
     remapped: bool,
+    /// Guest flags are live on entry to the block (back-edge targets).
+    live_in0: bool,
     /// Loop-body entry (after the remap prologue); self-loops jump here.
     body_off: usize,
 }
@@ -149,9 +151,10 @@ impl<'s, 'b> Gen<'s, 'b> {
     fn point(&mut self, kind: u8, a: u8, b: u8) {
         let p = Point { off: self.a.pos as u32, idx: self.idx as u16, kind, a, b };
         // Collapse points at the same offset (the later one wins).
-        if self.np > 0 {
+        // REMAP points are state changes, not resume points: keep them.
+        if self.np > 0 && kind != kind::REMAP {
             if let Some(prev) = self.s.points.get_mut(self.np - 1) {
-                if prev.off == p.off {
+                if prev.off == p.off && prev.kind != kind::REMAP {
                     *prev = p;
                     return;
                 }
@@ -463,6 +466,44 @@ impl<'s, 'b> Gen<'s, 'b> {
         self.pad_for_rel32(2);
         let at = self.a.jcc(cc, None);
         self.add_exit(at as u32, target);
+    }
+
+    /// B.cond with the flags in host EFLAGS: the flags image is written
+    /// only on the taken path (or not at all for a back-edge into a block
+    /// that doesn't read flags before defining them). Returns false if the
+    /// condition is "always" (caller emits an unconditional exit).
+    /// Note: writing the image may flip the carry polarity (cmc), so the
+    /// host condition is computed after any inline save.
+    fn bcond_exit(&mut self, cond: u32, target: u64, main_off: usize) -> bool {
+        let inline_save = if target == self.pc0 { self.live_in0 } else { !self.fl.host || self.fl.mem };
+        if inline_save {
+            self.flags_to_mem();
+        }
+        let cc = match self.cond_cc(cond) {
+            Some(cc) => cc,
+            None => return false,
+        };
+        if target == self.pc0 || !self.fl.host || self.fl.mem {
+            self.exit_if(cc, target, main_off);
+            return true;
+        }
+        let saved = self.fl;
+        let was_remapped = self.remapped;
+        let skip = self.a.jcc(cc.invert(), None);
+        self.flags_to_mem();
+        self.remap_epilogue();
+        self.pad_for_rel32(1);
+        let at = self.a.jmp(None);
+        self.add_exit(at as u32, target);
+        self.a.bind32(skip);
+        self.fl = saved;
+        self.remapped = was_remapped;
+        if was_remapped {
+            self.point(kind::REMAP, 2, 0);
+        }
+        // Fall-through: the instruction can restart with flags in EFLAGS.
+        self.insn_point();
+        true
     }
 
     /// Indirect exit: target guest PC in %rax.
@@ -2026,6 +2067,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
         let insn = decode::decode(s.words.get(i).copied().unwrap_or(0));
         live = uses_flags(&insn) || (live && !defs_flags(&insn));
     }
+    let live_in0 = live;
 
     // 3. Emit.
     let mut g = Gen {
@@ -2044,6 +2086,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
         nremap: 0,
         remapped: false,
         body_off: 0,
+        live_in0,
     };
     if jit_off() & 32 == 0 {
         g.nremap = choose_remap(&g.s.words[..n.min(MAX_INSNS)], &mut g.remap);
@@ -2299,20 +2342,16 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
             Insn::BCond { cond, imm } => {
                 let target = ipc.wrapping_add(imm as u64);
                 g.flags_to_host();
-                g.flags_to_mem();
-                let cc = g.cond_cc(cond);
-                match cc {
-                    Some(cc) => {
-                        g.exit_if(cc, target, main_off);
-                        if idx + 1 == n {
-                            g.exit_to(next, main_off);
-                            ended = true;
-                        }
-                    }
-                    None => {
-                        g.exit_to(target, main_off);
+                if g.bcond_exit(cond, target, main_off) {
+                    if idx + 1 == n {
+                        g.flags_to_mem();
+                        g.exit_to(next, main_off);
                         ended = true;
                     }
+                } else {
+                    g.flags_to_mem();
+                    g.exit_to(target, main_off);
+                    ended = true;
                 }
                 true
             }
