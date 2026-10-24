@@ -68,6 +68,7 @@ struct Jit {
     exit_code: i32,
     translations: u64,
     helpers: u64,
+    hstat: HashMap<String, u64>,
 }
 
 static mut JIT: Option<Jit> = None;
@@ -192,6 +193,12 @@ fn handle(op: u32) -> Ret {
         OP_HELPER | OP_STEP => {
             jit().helpers += 1;
             let pc = s.pc;
+            if std::env::var("KEMU_JIT_STATS").is_ok() {
+                let w = unsafe { (pc as *const u32).read() };
+                let name = format!("{:?}", kemu_core::decode::decode(w));
+                let key: String = name.chars().take(48).collect();
+                *jit().hstat.entry(key).or_insert(0) += 1;
+            }
             let (ex, _) = interp::run(s, &mut jit().env, 1);
             match ex {
                 Exit::Budget if s.pc == pc + 4 => Ret { val: 0, stop: 0 },
@@ -261,6 +268,7 @@ pub fn run(cpu: &CpuState, env: HostMem) -> i32 {
             exit_code: 0,
             translations: 0,
             helpers: 0,
+            hstat: HashMap::new(),
         });
     }
     flush();
@@ -280,6 +288,11 @@ pub fn run(cpu: &CpuState, env: HostMem) -> i32 {
             j.helpers,
             j.used / 1024
         );
+        let mut v: Vec<_> = j.hstat.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        for (k, n) in v.iter().take(12) {
+            eprintln!("  helper {n:>10}  {k}");
+        }
     }
     j.exit_code
 }

@@ -25,6 +25,16 @@ use crate::env::{Env, Fault};
 mod fp;
 
 pub const MAX_INSNS: usize = 64;
+
+/// Debug knob (kemu.jitoff=): disable JIT features to bisect bugs.
+/// 1 = helper for all non-control-flow insns, 2 = helper for SIMD/FP,
+/// 4 = single-instruction blocks, 32 = no register remapping.
+/// (8 = no chaining is handled by the kernel.)
+pub static JIT_OFF: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn jit_off() -> u32 {
+    JIT_OFF.load(core::sync::atomic::Ordering::Relaxed)
+}
 pub const MAX_POINTS: usize = 640;
 pub const MAX_EXITS: usize = 16;
 
@@ -1966,10 +1976,22 @@ fn ends_block(i: &Insn) -> bool {
 
 /// Translate the guest block at `pc` into `out`.
 pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut Scratch) -> Result<TOk, TErr> {
+    // A superblock can run out of exit slots or recovery points; retry with
+    // fewer guest instructions before reporting failure.
+    let mut limit = if jit_off() & 4 != 0 { 1 } else { MAX_INSNS };
+    loop {
+        match translate_n(env, pc, out, cfg, s, limit) {
+            Err(TErr::NoSpace) if limit > 1 => limit /= 2,
+            r => return r,
+        }
+    }
+}
+
+fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut Scratch, limit: usize) -> Result<TOk, TErr> {
     // 1. Fetch and decode.
     let mut n = 0usize;
     let mut p = pc;
-    while n < MAX_INSNS {
+    while n < limit.min(MAX_INSNS) {
         if n > 0 && p & 0xfff == 0 {
             break;
         }
@@ -2023,7 +2045,9 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
         remapped: false,
         body_off: 0,
     };
-    g.nremap = choose_remap(&g.s.words[..n.min(MAX_INSNS)], &mut g.remap);
+    if jit_off() & 32 == 0 {
+        g.nremap = choose_remap(&g.s.words[..n.min(MAX_INSNS)], &mut g.remap);
+    }
     // Header placeholder.
     for _ in 0..meta::HEADER_SIZE {
         g.a.byte(0);
@@ -2063,7 +2087,32 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
         g.insn_point();
         let ipc = g.pc();
         let next = ipc.wrapping_add(4);
-        let ok = match insn {
+        let off = jit_off();
+        let branch = ends_block(&insn) || matches!(insn, Insn::BCond { .. } | Insn::Cbz { .. } | Insn::Tbz { .. });
+        let simdfp = matches!(
+            insn,
+            Insn::Fp2 { .. }
+                | Insn::Fp3 { .. }
+                | Insn::Fp1 { .. }
+                | Insn::FpCmp { .. }
+                | Insn::FpCSel { .. }
+                | Insn::FpCvt { .. }
+                | Insn::SimdThree { .. }
+                | Insn::SimdMisc { .. }
+                | Insn::SimdDup { .. }
+                | Insn::SimdModImm { .. }
+                | Insn::SimdShift { .. }
+                | Insn::SimdExt { .. }
+                | Insn::SimdUmov { .. }
+                | Insn::SimdInsGpr { .. }
+                | Insn::SimdInsElt { .. }
+                | Insn::SimdLdSt { .. }
+                | Insn::SimdPermute { .. }
+        );
+        let ok = if (off & 1 != 0 && !branch) || (off & 2 != 0 && simdfp) {
+            false
+        } else {
+            match insn {
             Insn::Nop | Insn::Prfm | Insn::CacheNop | Insn::Sb => true,
             Insn::Dmb | Insn::Dsb => {
                 g.clobber();
@@ -2334,6 +2383,7 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
                 true
             }
             _ => false,
+            }
         };
         if !ok {
             // Discard any partial code? Lowerings that return false emit

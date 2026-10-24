@@ -503,6 +503,11 @@ pub extern "C" fn kemu_rs_fpsr_merge(fpsr: u32, mxcsr: u32) -> u32 {
 
 /// Fill the CRC-32 table used by translated CRC32* instructions.
 ///
+#[no_mangle]
+pub extern "C" fn kemu_rs_set_jit_off(mask: u32) {
+    kemu_core::jit::t1::JIT_OFF.store(mask, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// # Safety
 /// `out` must point to 256 writable u32.
 #[no_mangle]

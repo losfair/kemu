@@ -38,6 +38,18 @@ static int __init kemu_jit_setup(char *str)
 }
 __setup("kemu.jit=", kemu_jit_setup);
 
+/* Debug: kemu.jitoff=<mask> disables JIT features (see t1::JIT_OFF). */
+static u32 kemu_jit_off;
+
+static int __init kemu_jit_off_setup(char *str)
+{
+	if (kstrtou32(str, 0, &kemu_jit_off))
+		return 0;
+	kemu_rs_set_jit_off(kemu_jit_off);
+	return 1;
+}
+__setup("kemu.jitoff=", kemu_jit_off_setup);
+
 static unsigned long kemu_table_mask8(void)
 {
 	return (KEMU_TABLE_ENTRIES - 1) << 3;
@@ -298,7 +310,8 @@ static void kemu_chain(struct kemu_mm *km, unsigned long site, u64 target,
 	u32 kind;
 	s64 rel;
 
-	if (site < km->code_base || site >= km->code_base + KEMU_CODE_SIZE || (site & 3))
+	if (site < km->code_base || site >= km->code_base + KEMU_CODE_SIZE || (site & 3) ||
+	    (kemu_jit_off & 8))
 		return;
 	off = site - km->code_base;
 	blk = kemu_find_block(km, off, &len);
