@@ -211,6 +211,16 @@ fn main() {
                 classes.push(args[i + 1].clone());
                 i += 1;
             }
+            "-f" => {
+                // Every instruction word listed in a file (hex, one per line).
+                let text = std::fs::read_to_string(&args[i + 1]).unwrap();
+                let words: Vec<u32> = text
+                    .lines()
+                    .filter_map(|l| u32::from_str_radix(l.trim().trim_start_matches("0x"), 16).ok())
+                    .collect();
+                run_list(&words, count, seed);
+                return;
+            }
             "-i" => {
                 let w = u32::from_str_radix(args[i + 1].trim_start_matches("0x"), 16).unwrap();
                 run_fixed(w, count, batch, seed);
@@ -289,6 +299,37 @@ fn main() {
     if mism > 0 {
         std::process::exit(1);
     }
+}
+
+/// Run each word with `count` random states (batched across words).
+fn run_list(words: &[u32], count: usize, seed: u64) {
+    let mut rng = Rng(seed);
+    let mut bad: Vec<u32> = Vec::new();
+    for chunk in words.chunks(64) {
+        let mut cases = Vec::new();
+        for w in chunk {
+            for _ in 0..count {
+                cases.push((gen::random_state(&mut rng), *w));
+            }
+        }
+        let qout = eval_cases(&cases);
+        for (idx, (a, w)) in cases.iter().enumerate() {
+            let (iout, abn) = run_interp(a, *w);
+            let wrong = match &qout[idx] {
+                QResult::State(qa) => abn.is_some() || compare(qa, &iout).is_some(),
+                QResult::Trap(_) => abn.is_none(),
+            };
+            if wrong && !bad.contains(w) {
+                bad.push(*w);
+                let why = match &qout[idx] {
+                    QResult::State(qa) => compare(qa, &iout).unwrap_or_else(|| "interp trapped".into()),
+                    QResult::Trap(s) => format!("qemu trapped {s}, interp ran"),
+                };
+                println!("MISMATCH {:08x} {:?}: {}", w, kemu_core::decode::decode(*w), why);
+            }
+        }
+    }
+    println!("{} words, {} mismatching", words.len(), bad.len());
 }
 
 fn run_fixed(word: u32, count: usize, batch: usize, seed: u64) {

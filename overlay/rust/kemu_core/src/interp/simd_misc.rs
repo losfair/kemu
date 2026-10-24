@@ -10,6 +10,20 @@ fn two_misc(cpu: &mut CpuState, q: bool, _u: bool, size: u8, op: Simd2Op, rd: u3
     let bits = 8u32 << esize;
     let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
 
+    // REV16/32/64 reverse elements within containers spanning lanes.
+    if let Simd2Op::Rev16 | Simd2Op::Rev32 | Simd2Op::Rev64 = op {
+        let cont = match op {
+            Simd2Op::Rev16 => 1,
+            Simd2Op::Rev32 => 2,
+            _ => 3,
+        };
+        let v = cpu.vreg(rn);
+        let r0 = rev_in(v[0], esize, cont);
+        let r1 = if q { rev_in(v[1], esize, cont) } else { 0 };
+        cpu.set_vreg(rd, [r0, r1]);
+        return;
+    }
+
     // Narrowing ops write the lower/upper half.
     match op {
         Simd2Op::Xtn | Simd2Op::Xtn2 | Simd2Op::SqXtn | Simd2Op::SqXtn2 | Simd2Op::UqXtn

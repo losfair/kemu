@@ -15,10 +15,12 @@ fn decode_simd_fp(x: u32) -> Insn {
     //     and Advanced SIMD" top-level. ---
 
     // Scalar FP data processing: 0001 1110 ... (op0=0001, bit24=1, bit21=1)
-    if bits(x, 28, 24) == 0b11110 {
+    // Scalar FP requires bit 30 == 0; with bit 30 set this is AdvSIMD
+    // scalar (e.g. SHA1C 0x5e000000).
+    if bits(x, 28, 24) == 0b11110 && !bit(x, 30) {
         return decode_fp(x);
     }
-    if bits(x, 28, 24) == 0b11111 {
+    if bits(x, 28, 24) == 0b11111 && !bit(x, 30) {
         return decode_fp_3src(x);
     }
     // Advanced SIMD: everything else in this group.
@@ -380,21 +382,18 @@ fn decode_asimd(x: u32) -> Insn {
             _ => Insn::Undefined,
         };
     }
-    // --- SHA1/SHA256 three-reg (01011110 00 0 Rm 0 opcode 00 Rn Rd) ---
-    if bits(x, 31, 24) == 0b01011110 && bits(x, 23, 22) == 0b00 && bit(x, 21) == false && bit(x, 15) == false && bits(x, 11, 10) == 0b00 {
+    // --- SHA1/SHA256 three-reg (01011110 000 Rm 0 opcode 00 Rn Rd) ---
+    // opcode 0-3: SHA1C/P/M/SU0 -> Sha1{op}; 4-6: SHA256H/H2/SU1 -> Sha256{op}
+    if bits(x, 31, 21) == 0b0101_1110_000 && !bit(x, 15) && bits(x, 11, 10) == 0b00 {
         let opcode = bits(x, 14, 12) as u8;
         let rm = bits(x, 20, 16);
         let rn = bits(x, 9, 5);
         let rd = bits(x, 4, 0);
-        return Insn::Sha1 { op: opcode, rd, rn, rm };
-    }
-    if bits(x, 31, 24) == 0b01011110 && bits(x, 23, 22) == 0b00 && bit(x, 21) == false && bit(x, 15) == false && bits(x, 11, 10) == 0b01 {
-        // SHA256H/H2/SU1 (bits 11:10 vary); group under Sha256 three-reg
-        let opcode = bits(x, 14, 12) as u8;
-        let rm = bits(x, 20, 16);
-        let rn = bits(x, 9, 5);
-        let rd = bits(x, 4, 0);
-        return Insn::Sha256 { op: opcode, rd, rn, rm };
+        return match opcode {
+            0..=3 => Insn::Sha1 { op: opcode, rd, rn, rm },
+            4..=6 => Insn::Sha256 { op: opcode, rd, rn, rm },
+            _ => Insn::Undefined,
+        };
     }
     // --- SHA1/SHA256 two-reg (01011110 28:24=10100 ...) ---
     if bits(x, 31, 24) == 0b01011110 && bits(x, 23, 22) == 0b00 && bits(x, 21, 17) == 0b10100 && bits(x, 11, 10) == 0b10 {
@@ -404,7 +403,7 @@ fn decode_asimd(x: u32) -> Insn {
         return match opcode {
             0b00000 => Insn::Sha1 { op: 0b100, rd, rn, rm: 0 }, // SHA1H
             0b00001 => Insn::Sha1 { op: 0b101, rd, rn, rm: 0 }, // SHA1SU1
-            0b00010 => Insn::Sha256 { op: 0b100, rd, rn, rm: 0 }, // SHA256SU0
+            0b00010 => Insn::Sha256 { op: 0x10, rd, rn, rm: 0 }, // SHA256SU0
             _ => Insn::Undefined,
         };
     }

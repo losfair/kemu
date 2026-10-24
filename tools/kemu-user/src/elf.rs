@@ -236,7 +236,10 @@ fn setup_stack(
     }
 
     // Build the auxv/argv/envp block from the top down.
-    let mut sp = stack_top;
+    // Debug aid: shift the initial stack (e.g. to match another
+    // emulator's alignment in lockstep traces).
+    let adj: u64 = std::env::var("KEMU_STACK_ADJ").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut sp = stack_top - adj;
     let mut push_bytes = |sp: &mut u64, data: &[u8]| -> u64 {
         *sp -= data.len() as u64;
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), *sp as *mut u8, data.len()) };

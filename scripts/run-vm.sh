@@ -12,4 +12,5 @@ exec timeout ${KEMU_TIMEOUT:-300} qemu-system-x86_64 -enable-kvm -cpu host -smp 
   -kernel "$kernel" -initrd "$initrd" -append "$append" \
   -nographic -no-reboot \
   -fsdev local,id=fs0,path="$here",security_model=none -device virtio-9p-pci,fsdev=fs0,mount_tag=kemu \
+  ${KEMU_DISK:+-drive file=$KEMU_DISK,if=virtio,format=raw,cache=unsafe} \
   -fsdev local,id=fs1,path=/usr/aarch64-linux-gnu,security_model=none,readonly=on -device virtio-9p-pci,fsdev=fs1,mount_tag=sysroot

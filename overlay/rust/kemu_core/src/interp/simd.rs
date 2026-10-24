@@ -161,6 +161,20 @@ pub(super) fn exec<E: Env>(cpu: &mut CpuState, env: &mut E, insn: Insn, word: u3
             aesmc(cpu, rd, rn, true);
             Step::Next
         }
+        Insn::Sha1 { op, rd, rn, rm } => {
+            if sha1(cpu, op, rd, rn, rm) {
+                Step::Next
+            } else {
+                Step::Exit(Exit::Undefined(word))
+            }
+        }
+        Insn::Sha256 { op, rd, rn, rm } => {
+            if sha256(cpu, op, rd, rn, rm) {
+                Step::Next
+            } else {
+                Step::Exit(Exit::Undefined(word))
+            }
+        }
         _ => Step::Exit(Exit::Undefined(word)),
     }
 }

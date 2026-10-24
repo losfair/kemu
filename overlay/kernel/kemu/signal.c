@@ -160,6 +160,12 @@ void kemu_do_signal(struct pt_regs *regs)
 		}
 		pr_info("kemu:   x1=%llx x2=%llx x19=%llx x20=%llx x21=%llx\n",
 			cpu->x[1], cpu->x[2], cpu->x[19], cpu->x[20], cpu->x[21]);
+		if (sigismember(&current->pending.signal, SIGILL)) {
+			u32 w = 0;
+
+			if (!get_user(w, (u32 __user *)cpu->pc))
+				pr_info("kemu:   SIGILL insn %08x\n", w);
+		}
 	}
 
 	if (syscall) {

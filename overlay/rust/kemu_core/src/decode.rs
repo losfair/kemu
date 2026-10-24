@@ -784,9 +784,10 @@ pub fn adv_simd_expand_imm(op: u8, cmode: u8, imm8: u64) -> (u64, bool) {
             (rep(v, 32), false)
         }
         0b100 | 0b101 => {
+            // 16-bit elements: imm8 << (8 * cmode<1>)
             let sel = (cmode >> 1) & 1;
             let v = imm8 << (8 * sel as u64);
-            (rep(v, 32), false)
+            (rep(v, 16), false)
         }
         0b110 => {
             // cmode 0b1100: (imm8<<8)|0xff ; 0b1101: (imm8<<16)|0xffff

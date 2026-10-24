@@ -131,3 +131,127 @@ fn aesmc(cpu: &mut CpuState, rd: u32, rn: u32, inverse: bool) {
     }
     cpu.set_vreg(rd, vec_of(out));
 }
+
+// ---- SHA1 / SHA256 (Arm ARM shared pseudocode) ----
+
+fn words(v: [u64; 2]) -> [u32; 4] {
+    [v[0] as u32, (v[0] >> 32) as u32, v[1] as u32, (v[1] >> 32) as u32]
+}
+
+fn unwords(w: [u32; 4]) -> [u64; 2] {
+    [(w[0] as u64) | ((w[1] as u64) << 32), (w[2] as u64) | ((w[3] as u64) << 32)]
+}
+
+fn sha_choose(x: u32, y: u32, z: u32) -> u32 {
+    ((y ^ z) & x) ^ z
+}
+
+fn sha_majority(x: u32, y: u32, z: u32) -> u32 {
+    (x & y) | ((x | y) & z)
+}
+
+fn sha1(cpu: &mut CpuState, op: u8, rd: u32, rn: u32, rm: u32) -> bool {
+    let d = words(cpu.vreg(rd));
+    let n = words(cpu.vreg(rn));
+    let m = words(cpu.vreg(rm));
+    let r = match op {
+        0..=2 => {
+            // SHA1C / SHA1P / SHA1M: X = Qd, Y = Sn, W = Vm
+            let mut x = d;
+            let mut y = n[0];
+            for e in 0..4 {
+                let t = match op {
+                    0 => sha_choose(x[1], x[2], x[3]),
+                    1 => x[1] ^ x[2] ^ x[3],
+                    _ => sha_majority(x[1], x[2], x[3]),
+                };
+                y = y.wrapping_add(x[0].rotate_left(5)).wrapping_add(t).wrapping_add(m[e]);
+                x[1] = x[1].rotate_left(30);
+                // <Y, X> = ROL(Y:X, 32)
+                let nx = [y, x[0], x[1], x[2]];
+                y = x[3];
+                x = nx;
+            }
+            x
+        }
+        3 => {
+            // SHA1SU0: (n[63:0] : d[127:64]) ^ d ^ m
+            let t = [d[2], d[3], n[0], n[1]];
+            [t[0] ^ d[0] ^ m[0], t[1] ^ d[1] ^ m[1], t[2] ^ d[2] ^ m[2], t[3] ^ d[3] ^ m[3]]
+        }
+        4 => {
+            // SHA1H: ROL(Sn, 30)
+            [n[0].rotate_left(30), 0, 0, 0]
+        }
+        5 => {
+            // SHA1SU1: T = d ^ (n >> 32)
+            let t = [d[0] ^ n[1], d[1] ^ n[2], d[2] ^ n[3], d[3]];
+            [
+                t[0].rotate_left(1),
+                t[1].rotate_left(1),
+                t[2].rotate_left(1),
+                t[3].rotate_left(1) ^ t[0].rotate_left(2),
+            ]
+        }
+        _ => return false,
+    };
+    cpu.set_vreg(rd, unwords(r));
+    true
+}
+
+fn sha256_hash(mut x: [u32; 4], mut y: [u32; 4], w: [u32; 4], part1: bool) -> [u32; 4] {
+    for e in 0..4 {
+        let chs = sha_choose(y[0], y[1], y[2]);
+        let maj = sha_majority(x[0], x[1], x[2]);
+        let s1 = y[0].rotate_right(6) ^ y[0].rotate_right(11) ^ y[0].rotate_right(25);
+        let s0 = x[0].rotate_right(2) ^ x[0].rotate_right(13) ^ x[0].rotate_right(22);
+        let t = y[3].wrapping_add(s1).wrapping_add(chs).wrapping_add(w[e]);
+        x[3] = t.wrapping_add(x[3]);
+        y[3] = t.wrapping_add(s0).wrapping_add(maj);
+        // <Y, X> = ROL(Y:X, 32)
+        let nx = [y[3], x[0], x[1], x[2]];
+        let ny = [x[3], y[0], y[1], y[2]];
+        x = nx;
+        y = ny;
+    }
+    if part1 {
+        x
+    } else {
+        y
+    }
+}
+
+fn sha256(cpu: &mut CpuState, op: u8, rd: u32, rn: u32, rm: u32) -> bool {
+    let d = words(cpu.vreg(rd));
+    let n = words(cpu.vreg(rn));
+    let m = words(cpu.vreg(rm));
+    let r = match op {
+        4 => sha256_hash(d, n, m, true),
+        5 => sha256_hash(n, d, m, false),
+        6 => {
+            // SHA256SU1
+            let t0 = [n[1], n[2], n[3], m[0]];
+            let s = |v: u32| v.rotate_right(17) ^ v.rotate_right(19) ^ (v >> 10);
+            let mut r = [0u32; 4];
+            r[0] = s(m[2]).wrapping_add(d[0]).wrapping_add(t0[0]);
+            r[1] = s(m[3]).wrapping_add(d[1]).wrapping_add(t0[1]);
+            r[2] = s(r[0]).wrapping_add(d[2]).wrapping_add(t0[2]);
+            r[3] = s(r[1]).wrapping_add(d[3]).wrapping_add(t0[3]);
+            r
+        }
+        0x10 => {
+            // SHA256SU0
+            let t = [d[1], d[2], d[3], n[0]];
+            let s = |v: u32| v.rotate_right(7) ^ v.rotate_right(18) ^ (v >> 3);
+            [
+                s(t[0]).wrapping_add(d[0]),
+                s(t[1]).wrapping_add(d[1]),
+                s(t[2]).wrapping_add(d[2]),
+                s(t[3]).wrapping_add(d[3]),
+            ]
+        }
+        _ => return false,
+    };
+    cpu.set_vreg(rd, unwords(r));
+    true
+}
