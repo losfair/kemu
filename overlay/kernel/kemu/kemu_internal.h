@@ -81,7 +81,7 @@ struct kemu_slot {
 
 /* Offsets of the user-mode stubs (mirror of KemuStubs in kemu_rs.rs). */
 struct kemu_stubs {
-	u32 dispatch, dispatch_rax, miss, chain, helper, svc, interp_svc, end;
+	u32 dispatch, dispatch_rax, miss, chain, helper, svc, interp_svc, step, end;
 	u32 nranges;
 	u32 ranges[16][3];
 };
@@ -104,6 +104,7 @@ struct kemu_mm {
 	int cur_chunk;			/* chunk receiving translations, -1 none */
 	struct xarray blocks;		/* guest pc >> 2 -> xa_mk_value(block offset) */
 	u64 epoch;			/* bumped on every flush */
+	atomic_t flush_pending;		/* executable mapping went away */
 	void *scratch;			/* translator scratch (kemu_rs_scratch_size) */
 	struct kemu_stubs stubs;
 	spinlock_t threads_lock;
@@ -124,6 +125,8 @@ struct kemu_mm {
 #define KEMU_TF_REDIRECT	BIT(0)	/* resume at dispatch with state from page */
 #define KEMU_TF_IN_SVC		BIT(1)	/* inside a guest syscall */
 #define KEMU_TF_KSTATE		BIT(2)	/* state page authoritative (in kernel) */
+#define KEMU_TF_STEP		BIT(3)	/* ptrace single-step */
+#define KEMU_TF_STEP_SVC	BIT(4)	/* trap after the stepped svc */
 
 struct kemu_thread {
 	struct task_struct *task;
@@ -185,6 +188,7 @@ void kemu_jit_flush(struct kemu_mm *km);
 void kemu_materialize(struct pt_regs *regs);
 void kemu_enter_op(struct kemu_thread *kt);
 void kemu_jit_exit_to_user(struct kemu_thread *kt, struct pt_regs *regs);
+unsigned long kemu_op_step(struct kemu_thread *kt, struct kemu_mm *km);
 
 /* signal.c */
 void kemu_force_fault(u64 addr, int access, bool align);

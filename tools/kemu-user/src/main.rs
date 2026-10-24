@@ -139,6 +139,7 @@ fn main() {
         .map(|s| s.as_bytes().to_vec())
         .collect();
     let envp: Vec<Vec<u8>> = std::env::vars_os()
+        .filter(|(k, _)| !k.to_string_lossy().starts_with("KEMU_"))
         .map(|(k, v)| {
             let mut b = k.as_bytes().to_vec();
             b.push(b'=');
@@ -161,6 +162,16 @@ fn main() {
     let mut env = HostMem { trace };
     let _ = sysregs::HWCAP;
 
+    if std::env::var("KEMU_DUMP_STACK").is_ok() {
+        let sp = cpu.sp;
+        let argc = unsafe { core::ptr::read(sp as *const u64) };
+        eprintln!("sp={:#x} argc={}", sp, argc);
+        for i in 0..80u64 {
+            let a = sp + i * 8;
+            let v = unsafe { core::ptr::read(a as *const u64) };
+            eprintln!("  [{:#x}] (+{:#x}) = {:#018x}", a, i*8, v);
+        }
+    }
     run_loop(&mut cpu, &mut env);
 }
 
@@ -193,12 +204,32 @@ fn install_segv() {
     }
 }
 
+fn trace_enabled() -> usize {
+    std::env::var("KEMU_TRACE_INSN").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+fn print_state(cpu: &CpuState) {
+    let mut line = format!("PC={:016x}", cpu.pc);
+    for r in 0..31 {
+        line.push_str(&format!(" X{:02}={:016x}", r, cpu.x[r]));
+    }
+    line.push_str(&format!(" SP={:016x}", cpu.sp));
+    eprintln!("{line}");
+}
+
 fn run_loop(cpu: &mut CpuState, env: &mut HostMem) {
     install_segv();
     CPU_PTR.store(cpu as *const CpuState as u64, Ordering::SeqCst);
+    let tracen = trace_enabled();
+    let mut traced = 0usize;
     loop {
         CUR_PC.store(cpu.pc, Ordering::SeqCst);
-        let (exit, _n) = interp::run(cpu, env, 100_000);
+        let budget = if tracen != 0 && traced < tracen { 1 } else { 100_000 };
+        if tracen != 0 && traced < tracen {
+            print_state(cpu);
+            traced += 1;
+        }
+        let (exit, _n) = interp::run(cpu, env, budget);
         CUR_PC.store(cpu.pc, Ordering::SeqCst);
         match exit {
             Exit::Svc => {

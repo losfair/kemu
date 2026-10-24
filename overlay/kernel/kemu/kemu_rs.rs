@@ -8,7 +8,7 @@
 
 // kemu_core is also a standalone (cargo) crate with its own conventions;
 // relax the kernel's documentation lints for it.
-#![allow(missing_docs)]
+#![allow(missing_docs, unused)]
 
 use core::ffi::c_int;
 
@@ -264,6 +264,7 @@ pub struct KemuStubs {
     pub helper: u32,
     pub svc: u32,
     pub interp_svc: u32,
+    pub step: u32,
     pub end: u32,
     pub nranges: u32,
     pub ranges: [[u32; 3]; 16],
@@ -306,6 +307,7 @@ pub unsafe extern "C" fn kemu_rs_gen_stubs(
     info.helper = o.helper;
     info.svc = o.svc;
     info.interp_svc = o.interp_svc;
+    info.step = o.step;
     info.end = o.end;
     info.nranges = o.nranges as u32;
     for (d, s) in info.ranges.iter_mut().zip(o.ranges.iter()) {

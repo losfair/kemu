@@ -206,6 +206,11 @@ fn main() {
                 classes.push(args[i + 1].clone());
                 i += 1;
             }
+            "-i" => {
+                let w = u32::from_str_radix(args[i + 1].trim_start_matches("0x"), 16).unwrap();
+                run_fixed(w, count, batch, seed);
+                return;
+            }
             _ => {}
         }
         i += 1;
@@ -279,6 +284,45 @@ fn main() {
     if mism > 0 {
         std::process::exit(1);
     }
+}
+
+fn run_fixed(word: u32, count: usize, batch: usize, seed: u64) {
+    let mut rng = Rng(seed);
+    let mut total = 0usize;
+    let mut mism = 0usize;
+    let mut done = 0;
+    while done < count {
+        let this = batch.min(count - done);
+        let mut cases = Vec::with_capacity(this);
+        for _ in 0..this {
+            cases.push((gen::random_state(&mut rng), word));
+        }
+        let qout = eval_cases(&cases);
+        for (idx, (a, w)) in cases.iter().enumerate() {
+            let (iout, abn) = run_interp(a, *w);
+            total += 1;
+            match &qout[idx] {
+                QResult::State(qa) => {
+                    if abn.is_some() {
+                        report_mismatch("fixed", *w, a, Some(qa), &iout, "interp trapped, qemu ran");
+                        mism += 1;
+                    } else if let Some(d) = compare(qa, &iout) {
+                        report_mismatch("fixed", *w, a, Some(qa), &iout, &d);
+                        mism += 1;
+                    }
+                }
+                QResult::Trap(sig) => {
+                    if abn.is_none() {
+                        report_mismatch("fixed", *w, a, None, &iout, &format!("qemu trapped {sig}, interp ran"));
+                        mism += 1;
+                    }
+                }
+            }
+        }
+        done += this;
+    }
+    println!("insn {:#010x}: {total} cases, {mism} mismatches", word);
+    if mism > 0 { std::process::exit(1); }
 }
 
 fn compare(q: &Arch, i: &Arch) -> Option<String> {

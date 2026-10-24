@@ -1,0 +1,49 @@
+diff --git a/arch/x86/kernel/cpu/proc.c b/arch/x86/kernel/cpu/proc.c
+index 6571d432c..a562bae4f 100644
+--- a/arch/x86/kernel/cpu/proc.c
++++ b/arch/x86/kernel/cpu/proc.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <linux/smp.h>
++#include <linux/kemu.h>
+ #include <linux/timex.h>
+ #include <linux/string.h>
+ #include <linux/seq_file.h>
+@@ -62,6 +63,8 @@ static void show_cpuinfo_misc(struct seq_file *m, struct cpuinfo_x86 *c)
+ 
+ static int show_cpuinfo(struct seq_file *m, void *v)
+ {
++	if (task_is_kemu(current))
++		return kemu_show_cpuinfo(m, ((struct cpuinfo_x86 *)v)->cpu_index);
+ 	struct cpuinfo_x86 *c = v;
+ 	unsigned int cpu;
+ 	int i;
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index fc35a0543..a39ebde9e 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <linux/pagewalk.h>
++#include <linux/kemu.h>
+ #include <linux/mm_inline.h>
+ #include <linux/hugetlb.h>
+ #include <linux/huge_mm.h>
+@@ -498,6 +499,8 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
+ 
+ static int show_map(struct seq_file *m, void *v)
+ {
++	if (kemu_vma_hidden(v))
++		return 0;
+ 	show_map_vma(m, v);
+ 	return 0;
+ }
+@@ -1357,6 +1360,8 @@ static int show_smap(struct seq_file *m, void *v)
+ 	struct vm_area_struct *vma = v;
+ 	struct mem_size_stats mss = {};
+ 
++	if (kemu_vma_hidden(vma))
++		return 0;
+ 	smap_gather_stats(vma, &mss, 0);
+ 
+ 	show_map_vma(m, vma);

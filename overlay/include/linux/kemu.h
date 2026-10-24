@@ -14,6 +14,8 @@ struct mm_struct;
 struct pt_regs;
 struct kernel_clone_args;
 struct linux_binprm;
+struct vm_area_struct;
+struct seq_file;
 
 #ifdef CONFIG_KEMU
 
@@ -42,6 +44,18 @@ void kemu_exec_release(struct task_struct *tsk, struct mm_struct *old_mm);
 /* Guest view helpers used by generic code. */
 unsigned long kemu_user_sp(struct task_struct *tsk);
 
+/* ptrace */
+struct user_regset_view;
+extern const struct user_regset_view kemu_regset_view;
+long kemu_arch_ptrace(struct task_struct *child, long request,
+		      unsigned long addr, unsigned long data);
+void kemu_user_step(struct task_struct *child, bool on);
+
+/* mm / proc */
+void kemu_unmapped(struct mm_struct *mm, unsigned long start, unsigned long end);
+bool kemu_vma_hidden(struct vm_area_struct *vma);
+int kemu_show_cpuinfo(struct seq_file *m, unsigned int cpu);
+
 #else /* !CONFIG_KEMU */
 
 #define task_is_kemu(t) false
@@ -54,6 +68,9 @@ static inline int kemu_copy_thread(struct task_struct *p,
 				   const struct kernel_clone_args *args) { return 0; }
 static inline void kemu_thread_exit(struct task_struct *tsk) { }
 static inline void kemu_exec_release(struct task_struct *tsk, struct mm_struct *old_mm) { }
+static inline void kemu_unmapped(struct mm_struct *mm, unsigned long start,
+				 unsigned long end) { }
+static inline bool kemu_vma_hidden(struct vm_area_struct *vma) { return false; }
 
 #endif /* CONFIG_KEMU */
 

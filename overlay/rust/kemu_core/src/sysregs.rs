@@ -16,13 +16,13 @@ pub const HWCAP_JSCVT: u64 = 1 << 13;
 pub const HWCAP_LRCPC: u64 = 1 << 15;
 pub const HWCAP_DCPOP: u64 = 1 << 16;
 pub const HWCAP_ASIMDDP: u64 = 1 << 20;
-pub const HWCAP_FLAGM: u64 = 1 << 23;
+pub const HWCAP_FLAGM: u64 = 1 << 27;
 pub const HWCAP_SB: u64 = 1 << 29;
 pub const HWCAP_ILRCPC: u64 = 1 << 26;
 
 pub const HWCAP2_DCPODP: u64 = 1 << 0;
-pub const HWCAP2_FLAGM2: u64 = 1 << 2;
-pub const HWCAP2_FRINT: u64 = 1 << 3;
+pub const HWCAP2_FLAGM2: u64 = 1 << 7;
+pub const HWCAP2_FRINT: u64 = 1 << 8;
 pub const HWCAP2_RNG: u64 = 1 << 16;
 
 pub const HWCAP: u64 = HWCAP_FP

@@ -578,6 +578,32 @@ void kemu_thread_exit(struct task_struct *tsk)
 	kemu_thread_free(tsk->mm ? tsk->mm->kemu : NULL, kt);
 }
 
+/*
+ * An executable mapping was unmapped or lost PROT_EXEC (mmap lock held).
+ * Translations of it are flushed by the thread that did it before it
+ * returns to user mode.
+ */
+void kemu_unmapped(struct mm_struct *mm, unsigned long start, unsigned long end)
+{
+	struct kemu_mm *km = mm->kemu;
+	unsigned long idx = start >> 2;
+
+	if (!km || start >= end)
+		return;
+	if (xa_find(&km->blocks, &idx, (end - 1) >> 2, XA_PRESENT))
+		atomic_set(&km->flush_pending, 1);
+}
+
+/* Hide kemu's private mappings from /proc/<pid>/{maps,smaps}. */
+bool kemu_vma_hidden(struct vm_area_struct *vma)
+{
+	if (!static_branch_unlikely(&kemu_active_key) || !vma->vm_mm || !vma->vm_mm->kemu)
+		return false;
+	return vma_is_special_mapping(vma, &kemu_code_mapping) ||
+	       vma_is_special_mapping(vma, &kemu_table_mapping) ||
+	       vma_is_special_mapping(vma, &kemu_slots_mapping);
+}
+
 unsigned long kemu_user_sp(struct task_struct *tsk)
 {
 	return tsk->kemu ? READ_ONCE(tsk->kemu->cpu->sp) : 0;
@@ -606,7 +632,8 @@ void kemu_exit_to_user(struct pt_regs *regs)
 		return;
 	km = current->mm->kemu;
 	kt->flags &= ~KEMU_TF_REDIRECT;
-	regs->ip = kemu_stub(km, km->stubs.dispatch);
+	regs->ip = kemu_stub(km, (kt->flags & KEMU_TF_STEP) ? km->stubs.step :
+						 km->stubs.dispatch);
 	regs->sp = kt->rstack_top;
 	regs->cx = regs->ip;
 	regs->r11 = regs->flags;

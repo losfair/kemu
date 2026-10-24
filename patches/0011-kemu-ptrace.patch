@@ -1,0 +1,57 @@
+diff --git a/arch/x86/kernel/ptrace.c b/arch/x86/kernel/ptrace.c
+index 3dcadc13f..50f7f640c 100644
+--- a/arch/x86/kernel/ptrace.c
++++ b/arch/x86/kernel/ptrace.c
+@@ -733,6 +733,9 @@ long arch_ptrace(struct task_struct *child, long request,
+ 	int ret;
+ 	unsigned long __user *datap = (unsigned long __user *)data;
+ 
++	if (task_is_kemu(child))
++		return kemu_arch_ptrace(child, request, addr, data);
++
+ #ifdef CONFIG_X86_64
+ 	/* This is native 64-bit ptrace() */
+ 	const struct user_regset_view *regset_view = &user_x86_64_view;
+@@ -1394,6 +1397,8 @@ void __init update_regset_xstate_info(unsigned int size, u64 xstate_mask)
+  */
+ const struct user_regset_view *task_user_regset_view(struct task_struct *task)
+ {
++	if (task_is_kemu(task))
++		return &kemu_regset_view;
+ #ifdef CONFIG_IA32_EMULATION
+ 	if (!user_64bit_mode(task_pt_regs(task)))
+ #endif
+diff --git a/arch/x86/kernel/step.c b/arch/x86/kernel/step.c
+index 3e2952679..92c95264d 100644
+--- a/arch/x86/kernel/step.c
++++ b/arch/x86/kernel/step.c
+@@ -6,6 +6,7 @@
+ #include <linux/sched/task_stack.h>
+ #include <linux/mm.h>
+ #include <linux/ptrace.h>
++#include <linux/kemu.h>
+ 
+ #include <asm/desc.h>
+ #include <asm/debugreg.h>
+@@ -218,6 +219,10 @@ static void enable_step(struct task_struct *child, bool block)
+ 
+ void user_enable_single_step(struct task_struct *child)
+ {
++	if (task_is_kemu(child)) {
++		kemu_user_step(child, true);
++		return;
++	}
+ 	enable_step(child, 0);
+ }
+ 
+@@ -228,6 +233,10 @@ void user_enable_block_step(struct task_struct *child)
+ 
+ void user_disable_single_step(struct task_struct *child)
+ {
++	if (task_is_kemu(child)) {
++		kemu_user_step(child, false);
++		return;
++	}
+ 	/*
+ 	 * Make sure block stepping (BTF) is disabled.
+ 	 */

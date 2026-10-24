@@ -500,6 +500,43 @@ static void kemu_op_helper(struct kemu_thread *kt, struct kemu_mm *km)
 	kemu_redirect(kt);
 }
 
+/* PTRACE_SINGLESTEP: execute one guest instruction, then trap. */
+unsigned long kemu_op_step(struct kemu_thread *kt, struct kemu_mm *km)
+{
+	struct kemu_rs_exit ex;
+
+	kt->shadow = *kt->cpu;
+	kemu_rs_interp(&kt->shadow, 1, &ex);
+	*kt->cpu = kt->shadow;
+	kemu_redirect(kt);
+	switch (ex.kind) {
+	case KEMU_EXIT_SVC:
+		kt->flags |= KEMU_TF_STEP_SVC;
+		kt->flags &= ~KEMU_TF_REDIRECT;
+		return kemu_stub(km, km->stubs.interp_svc);
+	case KEMU_EXIT_BRK:
+		force_sig_fault(SIGTRAP, TRAP_BRKPT, (void __user *)kt->cpu->pc);
+		break;
+	case KEMU_EXIT_UNDEF:
+		force_sig_fault(SIGILL, ILL_ILLOPC, (void __user *)kt->cpu->pc);
+		break;
+	case KEMU_EXIT_FAULT:
+		kemu_force_fault(ex.addr, ex.access, ex.aux);
+		break;
+	case KEMU_EXIT_ICINV:
+		if (kemu_jit_enabled) {
+			mutex_lock(&km->lock);
+			kemu_jit_flush(km);
+			mutex_unlock(&km->lock);
+		}
+		fallthrough;
+	default:
+		force_sig_fault(SIGTRAP, TRAP_TRACE, (void __user *)kt->cpu->pc);
+		break;
+	}
+	return kemu_stub(km, km->stubs.dispatch);
+}
+
 /* Handle a non-svc kemu op in JIT mode; returns the value for %rax. */
 unsigned long kemu_jit_op(struct pt_regs *regs, unsigned long op)
 {
@@ -507,6 +544,8 @@ unsigned long kemu_jit_op(struct pt_regs *regs, unsigned long op)
 	struct kemu_mm *km = current->mm->kemu;
 
 	switch (op) {
+	case KEMU_OP_STEP:
+		return kemu_op_step(kt, km);
 	case KEMU_OP_TRANSLATE:
 		return kemu_op_translate(kt, km, false);
 	case KEMU_OP_CHAIN:

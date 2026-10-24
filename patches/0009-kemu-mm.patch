@@ -1,0 +1,42 @@
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 113b48985..a94b1ab94 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <linux/pagewalk.h>
++#include <linux/kemu.h>
+ #include <linux/hugetlb.h>
+ #include <linux/shm.h>
+ #include <linux/mman.h>
+@@ -763,6 +764,9 @@ mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
+ 	unsigned long charged = 0;
+ 	int error;
+ 
++	if ((oldflags & VM_EXEC) && !(newflags & VM_EXEC))
++		kemu_unmapped(mm, start, end);
++
+ 	if (vma_is_sealed(vma))
+ 		return -EPERM;
+ 
+diff --git a/mm/vma.c b/mm/vma.c
+index abe0da33c..0759131be 100644
+--- a/mm/vma.c
++++ b/mm/vma.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "vma_internal.h"
++#include <linux/kemu.h>
+ #include "vma.h"
+ 
+ struct mmap_state {
+@@ -1266,6 +1267,7 @@ static void vms_complete_munmap_vmas(struct vma_munmap_struct *vms,
+ 	struct mm_struct *mm;
+ 
+ 	mm = current->mm;
++	kemu_unmapped(mm, vms->start, vms->end);
+ 	mm->map_count -= vms->vma_count;
+ 	mm->locked_vm -= vms->locked_vm;
+ 	if (vms->unlock)

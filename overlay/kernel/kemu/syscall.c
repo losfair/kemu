@@ -76,6 +76,10 @@ void kemu_svc(struct pt_regs *regs)
 	kemu_store_syscall_args(regs, cpu);
 	if (nr != -1)
 		regs->ax = kemu_dispatch(regs, nr);
+	if (kemu_debug >= 2)
+		pr_info("kemu: %s[%d] sys %ld(%lx, %lx, %lx, %lx) = %lx pc %llx\n",
+			current->comm, task_pid_nr(current), nr, regs->di, regs->si,
+			regs->dx, regs->r10, regs->ax, cpu->pc);
 
 	/* exec may have replaced (or dropped) the kemu state. */
 	if (current->kemu != kt)
@@ -85,6 +89,19 @@ void kemu_svc(struct pt_regs *regs)
 	/* The guest PC changed (e.g. rt_sigreturn): resume at dispatch. */
 	if (READ_ONCE(cpu->pc) != next_pc)
 		kemu_redirect(kt);
+	if (atomic_read(&current->mm->kemu->flush_pending) &&
+	    atomic_xchg(&current->mm->kemu->flush_pending, 0)) {
+		struct kemu_mm *km = current->mm->kemu;
+
+		mutex_lock(&km->lock);
+		kemu_jit_flush(km);
+		mutex_unlock(&km->lock);
+	}
+	if (kt->flags & KEMU_TF_STEP_SVC) {
+		kt->flags &= ~KEMU_TF_STEP_SVC;
+		force_sig_fault(SIGTRAP, TRAP_TRACE, (void __user *)cpu->pc);
+		kemu_redirect(kt);
+	}
 }
 
 /*
@@ -135,6 +152,10 @@ void kemu_op(struct pt_regs *regs, unsigned long op)
 	struct kemu_mm *km = current->mm->kemu;
 
 	kemu_enter_op(kt);
+	if (op == KEMU_OP_STEP) {
+		regs->ax = kemu_op_step(kt, km);
+		return;
+	}
 	if (kemu_jit_enabled) {
 		regs->ax = kemu_jit_op(regs, op);
 		return;

@@ -150,6 +150,17 @@ void kemu_do_signal(struct pt_regs *regs)
 			current->comm, task_pid_nr(current), current->pending.signal.sig[0],
 			cpu->pc, regs->ip, current->thread.trap_nr, current->thread.cr2,
 			current->thread.error_code, cpu->x[0], cpu->sp, cpu->x[30]);
+	if (kemu_debug) {
+		u64 fp = cpu->x[29], fr[2];
+		int i;
+
+		for (i = 0; i < 10 && fp && !copy_from_user(fr, (void __user *)fp, 16); i++) {
+			pr_info("kemu:   frame %d: ret %llx (fp %llx)\n", i, fr[1], fp);
+			fp = fr[0];
+		}
+		pr_info("kemu:   x1=%llx x2=%llx x19=%llx x20=%llx x21=%llx\n",
+			cpu->x[1], cpu->x[2], cpu->x[19], cpu->x[20], cpu->x[21]);
+	}
 
 	if (syscall) {
 		retval = (long)cpu->x[0];

@@ -4,6 +4,56 @@
 //! Returns `Some(exit_code)` to terminate the process, else `None`.
 
 use kemu_core::state::CpuState;
+use std::cell::RefCell;
+use std::ffi::CString;
+
+thread_local! {
+    static SYSROOT: RefCell<Option<String>> = RefCell::new(std::env::var("KEMU_SYSROOT").ok());
+    // Keep rewritten CStrings alive for the duration of the syscall.
+    static REWRITE_BUF: RefCell<Vec<CString>> = RefCell::new(Vec::new());
+}
+
+/// If `KEMU_SYSROOT` is set and `pathptr` is an absolute path whose
+/// sysroot-prefixed form exists, return a pointer to a rewritten C string;
+/// otherwise return the original pointer. The rewritten string is kept alive
+/// in a thread-local until the next rewrite.
+fn rewrite_path(pathptr: u64) -> u64 {
+    if pathptr == 0 {
+        return pathptr;
+    }
+    let root = match SYSROOT.with(|r| r.borrow().clone()) {
+        Some(r) => r,
+        None => return pathptr,
+    };
+    // Read the guest C string.
+    let cstr = unsafe { std::ffi::CStr::from_ptr(pathptr as *const libc::c_char) };
+    let bytes = cstr.to_bytes();
+    if bytes.first() != Some(&b'/') {
+        return pathptr; // only rewrite absolute paths
+    }
+    // Don't rewrite /proc, /sys, /dev (host runtime interfaces the guest shares).
+    for pfx in [b"/proc".as_slice(), b"/sys", b"/dev"] {
+        if bytes.starts_with(pfx) {
+            return pathptr;
+        }
+    }
+    let joined = format!("{}{}", root.trim_end_matches('/'), String::from_utf8_lossy(bytes));
+    if !std::path::Path::new(&joined).exists() {
+        return pathptr;
+    }
+    match CString::new(joined) {
+        Ok(c) => {
+            let ptr = c.as_ptr() as u64;
+            REWRITE_BUF.with(|b| {
+                let mut v = b.borrow_mut();
+                v.clear();
+                v.push(c);
+            });
+            ptr
+        }
+        Err(_) => pathptr,
+    }
+}
 
 // arm64 (asm-generic) syscall numbers we handle.
 mod nr {
@@ -153,7 +203,7 @@ pub fn dispatch(cpu: &mut CpuState, trace: bool) -> Option<i32> {
         nr::PWRITE64 => unsafe { host(hx::PWRITE64, a) },
         nr::CLOSE => unsafe { host(hx::CLOSE, a) },
         nr::LSEEK => unsafe { host(hx::LSEEK, a) },
-        nr::OPENAT => unsafe { host(hx::OPENAT, a) },
+        nr::OPENAT => { let mut a = a; a[1] = rewrite_path(a[1]); unsafe { host(hx::OPENAT, a) } }
         nr::IOCTL => unsafe { host(hx::IOCTL, a) },
         nr::FCNTL => unsafe { host(hx::FCNTL, a) },
         nr::DUP => unsafe { host(hx::DUP, a) },
@@ -161,9 +211,9 @@ pub fn dispatch(cpu: &mut CpuState, trace: bool) -> Option<i32> {
         nr::PIPE2 => unsafe { host(hx::PIPE2, a) },
         nr::GETCWD => unsafe { host(hx::GETCWD, a) },
         nr::GETDENTS64 => unsafe { host(hx::GETDENTS64, a) },
-        nr::READLINKAT => unsafe { host(hx::READLINKAT, a) },
-        nr::FACCESSAT => unsafe { host(hx::FACCESSAT, a) },
-        nr::FACCESSAT2 => unsafe { host(hx::FACCESSAT2, a) },
+        nr::READLINKAT => { let mut a = a; a[1] = rewrite_path(a[1]); unsafe { host(hx::READLINKAT, a) } }
+        nr::FACCESSAT => { let mut a = a; a[1] = rewrite_path(a[1]); unsafe { host(hx::FACCESSAT, a) } }
+        nr::FACCESSAT2 => { let mut a = a; a[1] = rewrite_path(a[1]); unsafe { host(hx::FACCESSAT2, a) } }
         nr::BRK => unsafe { host(hx::BRK, a) },
         nr::MMAP => unsafe { host(hx::MMAP, a) },
         nr::MUNMAP => unsafe { host(hx::MUNMAP, a) },
@@ -187,7 +237,7 @@ pub fn dispatch(cpu: &mut CpuState, trace: bool) -> Option<i32> {
         nr::CLOCK_GETRES => unsafe { host(hx::CLOCK_GETRES, a) },
         nr::CLOCK_NANOSLEEP => unsafe { host(hx::CLOCK_NANOSLEEP, a) },
         nr::GETRANDOM => unsafe { host(hx::GETRANDOM, a) },
-        nr::STATX => unsafe { host(hx::STATX, a) },
+        nr::STATX => { let mut a = a; a[1] = rewrite_path(a[1]); unsafe { host(hx::STATX, a) } }
         nr::PRLIMIT64 => unsafe { host(hx::PRLIMIT64, a) },
         nr::RSEQ => unsafe { host(hx::RSEQ, a) },
         nr::RT_SIGACTION => unsafe { host(hx::RT_SIGACTION, a) },
@@ -195,7 +245,7 @@ pub fn dispatch(cpu: &mut CpuState, trace: bool) -> Option<i32> {
 
         // Structure-translating syscalls.
         nr::FSTAT => do_fstat(a[0], a[1]),
-        nr::NEWFSTATAT => do_fstatat(a[0], a[1], a[2], a[3]),
+        nr::NEWFSTATAT => do_fstatat(a[0], rewrite_path(a[1]), a[2], a[3]),
 
         // Semantically-emulated.
         nr::UNAME => do_uname(a[0]),

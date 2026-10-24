@@ -1,3 +1,29 @@
+diff --git a/arch/x86/entry/syscall_32.c b/arch/x86/entry/syscall_32.c
+index 2b15ea17b..6e5918081 100644
+--- a/arch/x86/entry/syscall_32.c
++++ b/arch/x86/entry/syscall_32.c
+@@ -5,6 +5,7 @@
+ #include <linux/sys.h>
+ #include <linux/cache.h>
+ #include <linux/syscalls.h>
++#include <linux/kemu.h>
+ #include <linux/entry-common.h>
+ #include <linux/nospec.h>
+ #include <linux/uaccess.h>
+@@ -78,6 +79,13 @@ static __always_inline void do_syscall_32_irqs_on(struct pt_regs *regs, int nr)
+ 	 */
+ 	unsigned int unr = nr;
+ 
++	/* kemu tasks only make guest-ABI syscalls (DESIGN.md §5.4). */
++	if (task_is_kemu(current)) {
++		regs->ax = -ENOSYS;
++		force_sig(SIGSYS);
++		return;
++	}
++
+ 	if (likely(unr < IA32_NR_syscalls)) {
+ 		unr = array_index_nospec(unr, IA32_NR_syscalls);
+ 		regs->ax = ia32_sys_call(regs, unr);
 diff --git a/arch/x86/entry/syscall_64.c b/arch/x86/entry/syscall_64.c
 index b6e68ea98..e852b32d1 100644
 --- a/arch/x86/entry/syscall_64.c
@@ -21,6 +47,22 @@ index b6e68ea98..e852b32d1 100644
  	add_random_kstack_offset();
  	nr = syscall_enter_from_user_mode(regs, nr);
  
+diff --git a/arch/x86/entry/vsyscall/vsyscall_64.c b/arch/x86/entry/vsyscall/vsyscall_64.c
+index 6e6c0a740..3ebc15c7b 100644
+--- a/arch/x86/entry/vsyscall/vsyscall_64.c
++++ b/arch/x86/entry/vsyscall/vsyscall_64.c
+@@ -303,6 +303,11 @@ static struct vm_area_struct gate_vma __ro_after_init = {
+ 
+ struct vm_area_struct *get_gate_vma(struct mm_struct *mm)
+ {
++#ifdef CONFIG_KEMU
++	/* No x86 vsyscall page in AArch64 processes. */
++	if (mm && mm->kemu)
++		return NULL;
++#endif
+ #ifdef CONFIG_COMPAT
+ 	if (!mm || !test_bit(MM_CONTEXT_HAS_VSYSCALL, &mm->context.flags))
+ 		return NULL;
 diff --git a/arch/x86/include/asm/entry-common.h b/arch/x86/include/asm/entry-common.h
 index ce3eb6d5f..cf5217c4c 100644
 --- a/arch/x86/include/asm/entry-common.h

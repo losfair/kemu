@@ -35,6 +35,10 @@ fn three_same(cpu: &mut CpuState, q: bool, _u: bool, size: u8, op: SimdOp, rd: u
         return;
     }
 
+    if is_widen(op) {
+        three_diff(cpu, q, size, op, rd, rn, rm);
+        return;
+    }
     let esize = size;
     let lanes = if scalar { 1 } else { vbytes(q) >> esize };
     let mut out = [0u64; 2];
@@ -93,6 +97,8 @@ fn int_three_lane(op: SimdOp, x: u64, y: u64, d: u64, esize: u8) -> u64 {
         SimdOp::SShl => sshl(x, sy, esize),
         SimdOp::UShl => ushl(x & mask, sy, esize),
         SimdOp::PMul => pmul(x, y, bits),
+        SimdOp::SQDMulh => sqdmulh(sx, sy, esize, false),
+        SimdOp::SQRDMulh => sqdmulh(sx, sy, esize, true),
         _ => 0,
     };
     res & mask
@@ -155,6 +161,18 @@ fn pmul(x: u64, y: u64, bits: u32) -> u64 {
         }
     }
     r
+}
+
+/// SQDMULH / SQRDMULH for element sizes H (1) and S (2).
+fn sqdmulh(a: i64, b: i64, esize: u8, rounding: bool) -> u64 {
+    let bits = 8u32 << esize;
+    let round = if rounding { 1i128 << (bits - 1) } else { 0 };
+    let prod = (a as i128) * (b as i128) * 2 + round;
+    let res = prod >> bits;
+    let max = (1i128 << (bits - 1)) - 1;
+    let min = -(1i128 << (bits - 1));
+    let sat = res.clamp(min, max);
+    (sat as u64) & (if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 })
 }
 
 fn is_fp_op(op: SimdOp) -> bool {
@@ -262,4 +280,121 @@ fn fp_binop(c: &mut sf::FpCtx, f: Fmt, op: SimdOp, a: u64, b: u64) -> u64 {
         SimdOp::FAcGt => bool_lane(sf::compare_op(c, f, sf::abs(f, a), sf::abs(f, b), sf::CmpOp::Gt)),
         _ => 0,
     }
+}
+
+
+fn is_widen(op: SimdOp) -> bool {
+    use SimdOp::*;
+    matches!(op,
+        SAddL|SAddL2|UAddL|UAddL2|SSubL|SSubL2|USubL|USubL2|
+        SAddW|SAddW2|UAddW|UAddW2|SSubW|SSubW2|USubW|USubW2|
+        AddHn|AddHn2|SubHn|SubHn2|RAddHn|RAddHn2|RSubHn|RSubHn2|
+        SMullL|SMullL2|UMullL|UMullL2|SMlaL|SMlaL2|UMlaL|UMlaL2|
+        SMlsL|SMlsL2|UMlsL|UMlsL2|SAbdL|SAbdL2|UAbdL|UAbdL2|
+        SAbaL|SAbaL2|UAbaL|UAbaL2|PMull|PMull2)
+}
+
+/// Three-different (widening / narrowing) integer ops. `size` is the source
+/// (narrower) element size; destination elements are 2x wide.
+fn three_diff(cpu: &mut CpuState, _q: bool, size: u8, op: SimdOp, rd: u32, rn: u32, rm: u32) {
+    use SimdOp::*;
+    let s_es = size;           // source element size (log2 bytes)
+    let d_es = size + 1;       // dest element size
+    let dlanes = 8u32 >> size; // dest lanes (always 128-bit result region)
+    let high = matches!(op,
+        SAddL2|UAddL2|SSubL2|USubL2|SAddW2|UAddW2|SSubW2|USubW2|
+        AddHn2|SubHn2|RAddHn2|RSubHn2|SMullL2|UMullL2|SMlaL2|UMlaL2|
+        SMlsL2|UMlsL2|SAbdL2|UAbdL2|SAbaL2|UAbaL2|PMull2);
+    let lane_off = if high { dlanes } else { 0 };
+    // Narrowing ops (ADDHN/SUBHN/RADDHN/RSUBHN): operands are 2x, result 1x.
+    let narrowing = matches!(op, AddHn|AddHn2|SubHn|SubHn2|RAddHn|RAddHn2|RSubHn|RSubHn2);
+    let widen_signed = matches!(op,
+        SAddL|SAddL2|SSubL|SSubL2|SAddW|SAddW2|SSubW|SSubW2|
+        SMullL|SMullL2|SMlaL|SMlaL2|SMlsL|SMlsL2|SAbdL|SAbdL2|SAbaL|SAbaL2);
+    let bits_d = 8u32 << d_es;
+    let dmask = if bits_d >= 64 { u64::MAX } else { (1u64 << bits_d) - 1 };
+
+    if narrowing {
+        // result element = size, operands = size+1; high selects dst half.
+        let n_es = size;       // narrow result element size
+        let w_es = size + 1;   // wide source element size
+        let nlanes = 8u32 >> size;
+        let wbits = 8u32 << w_es;
+        let shift = 8u32 << n_es; // take the high half
+        let mut out = if high { cpu.vreg(rd) } else { [0u64; 2] };
+        let noff = if high { nlanes } else { 0 };
+        for i in 0..nlanes {
+            let a = get_lane(cpu, rn, w_es, i);
+            let b = get_lane(cpu, rm, w_es, i);
+            let sum = match op {
+                AddHn|AddHn2|RAddHn|RAddHn2 => a.wrapping_add(b),
+                _ => a.wrapping_sub(b),
+            };
+            let round = if matches!(op, RAddHn|RAddHn2|RSubHn|RSubHn2) { 1u64 << (shift - 1) } else { 0 };
+            let sum = sum.wrapping_add(round);
+            let wmask = if wbits >= 64 { u64::MAX } else { (1u64 << wbits) - 1 };
+            let res = (sum & wmask) >> shift;
+            put_lane(&mut out, n_es, noff + i, res);
+        }
+        cpu.set_vreg(rd, out);
+        return;
+    }
+
+    let mut out = [0u64; 2];
+    for i in 0..dlanes {
+        // Widening: Vn source is narrow (from low/high half); Vm likewise,
+        // except the *W ops take Vn as already-wide.
+        let wide_n = matches!(op, SAddW|SAddW2|UAddW|UAddW2|SSubW|SSubW2|USubW|USubW2);
+        let an = if wide_n {
+            get_lane(cpu, rn, d_es, i)
+        } else {
+            ext_lane(cpu, rn, s_es, lane_off + i, widen_signed, d_es)
+        };
+        let bn = ext_lane(cpu, rm, s_es, lane_off + i, widen_signed, d_es);
+        let d = get_lane(cpu, rd, d_es, i);
+        let res = match op {
+            SAddL|SAddL2|UAddL|UAddL2|SAddW|SAddW2|UAddW|UAddW2 => an.wrapping_add(bn),
+            SSubL|SSubL2|USubL|USubL2|SSubW|SSubW2|USubW|USubW2 => an.wrapping_sub(bn),
+            SMullL|SMullL2|UMullL|UMullL2 => an.wrapping_mul(bn),
+            SMlaL|SMlaL2|UMlaL|UMlaL2 => d.wrapping_add(an.wrapping_mul(bn)),
+            SMlsL|SMlsL2|UMlsL|UMlsL2 => d.wrapping_sub(an.wrapping_mul(bn)),
+            SAbdL|SAbdL2|UAbdL|UAbdL2 => abd_wide(cpu, rn, rm, s_es, lane_off + i, widen_signed),
+            SAbaL|SAbaL2|UAbaL|UAbaL2 => d.wrapping_add(abd_wide(cpu, rn, rm, s_es, lane_off + i, widen_signed)),
+            PMull|PMull2 => pmull_lane(get_lane(cpu, rn, s_es, lane_off + i), get_lane(cpu, rm, s_es, lane_off + i), 8u32 << s_es),
+            _ => 0,
+        };
+        put_lane(&mut out, d_es, i, res & dmask);
+    }
+    cpu.set_vreg(rd, out);
+}
+
+fn ext_lane(cpu: &CpuState, r: u32, es: u8, i: u32, signed: bool, _d_es: u8) -> u64 {
+    let v = get_lane(cpu, r, es, i);
+    if signed {
+        sext(v, es) as u64
+    } else {
+        v
+    }
+}
+
+fn abd_wide(cpu: &CpuState, rn: u32, rm: u32, es: u8, i: u32, signed: bool) -> u64 {
+    let a = get_lane(cpu, rn, es, i);
+    let b = get_lane(cpu, rm, es, i);
+    if signed {
+        (sext(a, es) - sext(b, es)).unsigned_abs()
+    } else {
+        let bits = 8u32 << es;
+        let m = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        (a & m).abs_diff(b & m)
+    }
+}
+
+fn pmull_lane(x: u64, y: u64, bits: u32) -> u64 {
+    let mut r = 0u64;
+    for i in 0..bits {
+        if (y >> i) & 1 != 0 {
+            r ^= x << i;
+        }
+    }
+    r
 }

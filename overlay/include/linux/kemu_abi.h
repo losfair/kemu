@@ -48,6 +48,7 @@
 #define KEMU_OP_TRANSLATE	(KEMU_OP_BASE + 1)	/* lookup miss for guest PC in state */
 #define KEMU_OP_HELPER		(KEMU_OP_BASE + 2)	/* interpret one insn at guest PC */
 #define KEMU_OP_CHAIN		(KEMU_OP_BASE + 3)	/* translate + patch exit (EXIT_INFO) */
-#define KEMU_OP_MAX		(KEMU_OP_BASE + 4)
+#define KEMU_OP_STEP		(KEMU_OP_BASE + 4)	/* ptrace single-step one insn */
+#define KEMU_OP_MAX		(KEMU_OP_BASE + 5)
 
 #endif /* _LINUX_KEMU_ABI_H */

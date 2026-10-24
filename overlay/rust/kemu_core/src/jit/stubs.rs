@@ -13,6 +13,7 @@ pub const OP_SVC: u32 = 0x6b65_6d00;
 pub const OP_TRANSLATE: u32 = 0x6b65_6d01;
 pub const OP_HELPER: u32 = 0x6b65_6d02;
 pub const OP_CHAIN: u32 = 0x6b65_6d03;
+pub const OP_STEP: u32 = 0x6b65_6d04;
 
 /// How stubs reach the host runtime.
 #[derive(Clone, Copy, Debug)]
@@ -36,6 +37,7 @@ pub struct StubOffsets {
     pub helper: u32,
     pub svc: u32,
     pub interp_svc: u32,
+    pub step: u32,
     pub end: u32,
     /// Sorted list of (start, end, info) ranges; see `STUB_*`.
     pub ranges: [(u32, u32, u8); 16],
@@ -182,6 +184,12 @@ pub fn gen_stubs(out: &mut [u8], mode: ExitMode, table_base: u64, table_mask8: u
     exit(&mut a, mode, OP_SVC, slot);
     let d = o.dispatch as usize;
     a.jmp(Some(d));
+
+    // step: ptrace single-step; state is in the page.
+    a.align(16);
+    o.step = a.pos as u32;
+    exit(&mut a, mode, OP_STEP, slot);
+    a.jmp_rm(Rm::R(RAX));
 
     a.align(16);
     o.end = a.pos as u32;
