@@ -1214,3 +1214,86 @@ guests.
    but may surprise users at first.
 8. **FP bit-exactness vs speed.** The default (exact) costs a few percent on
    FP-heavy code. Whether `fp=fast` should ever be the default is open.
+
+---
+
+## 18. Implementation status (2026-10-24)
+
+This section tracks the implementation against the plan in §16. It's a snapshot;
+the code and its commit history are authoritative.
+
+**Working.** Phases 0–2 and the shared cache from phase 4:
+
+- In-kernel reference interpreter and T1 JIT. The decoder and interpreter were
+  audited against Arm's machine-readable A64 XML (`tools/isa-audit`): there are 0
+  encoding mismatches over about 340k words and 0 semantic mismatches against qemu
+  on data processing, SIMD and FP.
+- ABI layer: signals, ptrace regsets and single-step, core dumps, `/proc`
+  views, and seccomp/audit as `AUDIT_ARCH_AARCH64`.
+- Real software: a Debian trixie arm64 rootfs is installed by running debootstrap's
+  second stage under kemu (`scripts/mkrootfs.sh`). dpkg, bash, python3 (json,
+  sqlite3, hashlib, zlib), gcc/as/ld, make, perl, git, coreutils, strace and
+  multithreaded xz all run correctly.
+- Shared translation cache (§10.4). See "Deviations" for the keying.
+
+**Performance** (kemu-user `--jit` on the same host, noisy machine):
+
+- intbench is at parity with native overall: sieve ~97%, hash and list ~100%,
+  qsort ~84%.
+- matmul (NEON) is ~65%.
+- Warm `python3 -c pass` is ~60 ms in the VM (~100 ms without the shared cache).
+
+**Deviations from the design as written:**
+
+- **No T2 yet.** The T1 translator carries the optimizations that the design gave
+  to T2:
+  - superblocks across conditional branches;
+  - per-block register remapping (loop promotion);
+  - cross-block flag liveness: direct exit targets are scanned and the flags image
+    is skipped when the target writes NZCV first;
+  - out-of-line flag saves on taken B.cond exits.
+- **Guest V registers live in the state page.** Each NEON/FP operation loads and
+  stores through `%gs`. Block-level xmm allocation needs xmm-aware state recovery
+  in the kernel (reading guest values out of saved FPU state). It's the main
+  remaining performance item (matmul).
+- **Shared-cache keying.** The cache is keyed by (sb, ino, i_generation, file
+  offset) and validated by content. Every guest instruction word a translation
+  read, including flag look-ahead into exit targets, is re-read at the new
+  address and compared. So the key doesn't need `i_version`/mtime, and text that
+  was rewritten in place or patched in memory just misses. Relocatable mode emits
+  guest-PC-derived values as `movabs` imm64 with relocation records. Completeness
+  is tested by translating every block at two guest bases (`KEMU_RELOC_CHECK`).
+  Defaults: `kemu.xcache_mb=128` (LRU, plus a shrinker); `kemu.xcache=0` disables
+  the cache.
+- **Oversized superblocks.** When exit slots or recovery points run out, the
+  translation is retried with half the instruction limit instead of failing.
+
+**Debug knobs:**
+
+- `kemu.jit=0` runs the interpreter only.
+- `kemu.jitoff=<mask>` turns JIT features off for bisecting:
+  - 1: helper for every non-branch instruction;
+  - 2: helper for SIMD/FP;
+  - 4: one-instruction blocks;
+  - 8: no chaining;
+  - 32: no register remapping.
+- `kemu.debug=1` prints per-mm statistics: translations, shared-cache hits,
+  translation time.
+- kemu-user:
+  - `KEMU_JIT_STATS` prints a helper-instruction histogram;
+  - `KEMU_XLAT_BENCH=<span>` measures translator throughput;
+  - `KEMU_RELOC_CHECK=<span>` runs the relocation completeness check;
+  - `KEMU_PERF_MAP` writes a perf map of translated blocks.
+
+**Not done yet:**
+
+- a real vDSO (time calls currently go through syscalls);
+- rseq;
+- perf callchains through translated code;
+- `/proc/<pid>/kemu/stats`;
+- the LSM hook and CET-SS option;
+- the code-cache verifier (§12.2);
+- LTP runs.
+
+Translator speed is about 180 ns per guest instruction; most of it is fixed
+per-block cost (header, entries, exit trampolines, metadata).
