@@ -1,0 +1,13 @@
+diff --git a/fs/open.c b/fs/open.c
+index 3d64372ec..0c6907343 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -1417,7 +1417,7 @@ struct file *file_open_root(const struct path *root,
+ }
+ EXPORT_SYMBOL(file_open_root);
+ 
+-static int do_sys_openat2(int dfd, const char __user *filename,
++int do_sys_openat2(int dfd, const char __user *filename,
+ 			  struct open_how *how)
+ {
+ 	struct open_flags op;

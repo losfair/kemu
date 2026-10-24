@@ -1,0 +1,48 @@
+diff --git a/arch/x86/include/asm/ptrace.h b/arch/x86/include/asm/ptrace.h
+index 50f75467f..8d2142a8e 100644
+--- a/arch/x86/include/asm/ptrace.h
++++ b/arch/x86/include/asm/ptrace.h
+@@ -256,7 +256,12 @@ static inline bool any_64bit_mode(struct pt_regs *regs)
+ }
+ 
+ #ifdef CONFIG_X86_64
++#ifdef CONFIG_KEMU
++unsigned long kemu_current_user_sp(void);
++#define current_user_stack_pointer()	kemu_current_user_sp()
++#else
+ #define current_user_stack_pointer()	current_pt_regs()->sp
++#endif
+ #define compat_user_stack_pointer()	current_pt_regs()->sp
+ 
+ static __always_inline bool ip_within_syscall_gap(struct pt_regs *regs)
+diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+index 4c718f8ad..eb47297f5 100644
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -9,6 +9,7 @@
+ #include <linux/prctl.h>
+ #include <linux/slab.h>
+ #include <linux/sched.h>
++#include <linux/kemu.h>
+ #include <linux/sched/idle.h>
+ #include <linux/sched/debug.h>
+ #include <linux/sched/task.h>
+@@ -136,6 +137,7 @@ void exit_thread(struct task_struct *tsk)
+ 
+ 	shstk_free(tsk);
+ 	fpu__drop(tsk);
++	kemu_thread_exit(tsk);
+ }
+ 
+ static int set_new_tls(struct task_struct *p, unsigned long tls)
+@@ -266,6 +268,10 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+ 	if (clone_flags & CLONE_SETTLS)
+ 		ret = set_new_tls(p, tls);
+ 
++	/* kemu: stack and TLS are guest values; set up the guest thread. */
++	if (!ret && task_is_kemu(current))
++		ret = kemu_copy_thread(p, args);
++
+ 	if (!ret && unlikely(test_tsk_thread_flag(current, TIF_IO_BITMAP)))
+ 		io_bitmap_share(p);
+ 

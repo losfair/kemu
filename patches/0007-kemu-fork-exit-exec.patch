@@ -1,0 +1,93 @@
+diff --git a/fs/exec.c b/fs/exec.c
+index 4298e7e08..40df9dcd9 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -28,6 +28,7 @@
+ #include <linux/file.h>
+ #include <linux/fdtable.h>
+ #include <linux/mm.h>
++#include <linux/kemu.h>
+ #include <linux/stat.h>
+ #include <linux/fcntl.h>
+ #include <linux/swap.h>
+@@ -869,6 +870,7 @@ static int exec_mmap(struct mm_struct *mm)
+ 			return ret;
+ 		}
+ 	}
++	kemu_exec_release(tsk, old_mm);
+ 
+ 	task_lock(tsk);
+ 	membarrier_exec_mmap(mm);
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 9f74e8f1c..3afed9396 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <linux/mm.h>
++#include <linux/kemu.h>
+ #include <linux/slab.h>
+ #include <linux/sched/autogroup.h>
+ #include <linux/sched/mm.h>
+@@ -951,6 +952,7 @@ void __noreturn do_exit(long code)
+ 	 */
+ 	perf_event_exit_task(tsk);
+ 
++	kemu_thread_exit(tsk);
+ 	exit_mm();
+ 
+ 	if (group_dead)
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 3da0f0861..433e17b3b 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -16,6 +16,7 @@
+ #include <linux/slab.h>
+ #include <linux/sched/autogroup.h>
+ #include <linux/sched/mm.h>
++#include <linux/kemu.h>
+ #include <linux/sched/user.h>
+ #include <linux/sched/numa_balancing.h>
+ #include <linux/sched/stat.h>
+@@ -1131,6 +1132,7 @@ static inline void __mmput(struct mm_struct *mm)
+ 	ksm_exit(mm);
+ 	khugepaged_exit(mm); /* must run before exit_mmap */
+ 	exit_mmap(mm);
++	kemu_mm_release(mm);
+ 	mm_put_huge_zero_folio(mm);
+ 	set_mm_exe_file(mm, NULL);
+ 	if (!list_empty(&mm->mmlist)) {
+@@ -1481,6 +1483,9 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
+ 		goto fail_nomem;
+ 
+ 	memcpy(mm, oldmm, sizeof(*mm));
++#ifdef CONFIG_KEMU
++	mm->kemu = NULL;
++#endif
+ 
+ 	if (!mm_init(mm, tsk, mm->user_ns))
+ 		goto fail_nomem;
+@@ -1491,6 +1496,12 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
+ 		goto free_pt;
+ 	uprobe_end_dup_mmap();
+ 
++	err = kemu_dup_mm(oldmm, mm);
++	if (err) {
++		err = 0;
++		goto free_pt;
++	}
++
+ 	mm->hiwater_rss = get_mm_rss(mm);
+ 	mm->hiwater_vm = mm->total_vm;
+ 
+@@ -2012,6 +2023,9 @@ __latent_entropy struct task_struct *copy_process(
+ 	p = dup_task_struct(current, node);
+ 	if (!p)
+ 		goto fork_out;
++#ifdef CONFIG_KEMU
++	p->kemu = NULL;
++#endif
+ 	p->flags &= ~PF_KTHREAD;
+ 	if (args->kthread)
+ 		p->flags |= PF_KTHREAD;

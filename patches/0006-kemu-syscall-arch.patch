@@ -1,0 +1,23 @@
+diff --git a/arch/x86/include/asm/syscall.h b/arch/x86/include/asm/syscall.h
+index c10dbb74c..6df5e99fa 100644
+--- a/arch/x86/include/asm/syscall.h
++++ b/arch/x86/include/asm/syscall.h
+@@ -11,6 +11,7 @@
+ #define _ASM_X86_SYSCALL_H
+ 
+ #include <uapi/linux/audit.h>
++#include <linux/kemu.h>
+ #include <linux/sched.h>
+ #include <linux/err.h>
+ #include <asm/thread_info.h>	/* for TS_COMPAT */
+@@ -111,6 +112,10 @@ static inline void syscall_set_arguments(struct task_struct *task,
+ 
+ static inline int syscall_get_arch(struct task_struct *task)
+ {
++#ifdef CONFIG_KEMU
++	if (task_is_kemu(task))
++		return AUDIT_ARCH_AARCH64;
++#endif
+ 	return AUDIT_ARCH_I386;
+ }
+ 

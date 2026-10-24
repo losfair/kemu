@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0
+config KEMU
+	bool "kemu: run AArch64 Linux binaries (in-kernel emulation)"
+	depends on X86_64 && RUST && GENERIC_ENTRY && BINFMT_ELF
+	help
+	  Transparently run AArch64 (arm64) Linux user-space programs on
+	  x86_64 by translating them in the kernel. AArch64 ELF images are
+	  executed directly by execve(); the guest sees an arm64 kernel ABI.
+
+	  If unsure, say N.

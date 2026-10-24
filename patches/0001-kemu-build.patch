@@ -1,0 +1,36 @@
+diff --git a/arch/x86/Kbuild b/arch/x86/Kbuild
+index 36b985d0e..6325492d9 100644
+--- a/arch/x86/Kbuild
++++ b/arch/x86/Kbuild
+@@ -38,3 +38,6 @@ obj-y += virt/
+ 
+ # for cleaning
+ subdir- += boot tools
++
++# kemu: AArch64 user-mode emulation
++obj-$(CONFIG_KEMU) += kemu/
+diff --git a/fs/Kconfig.binfmt b/fs/Kconfig.binfmt
+index 1949e25c7..303e9c271 100644
+--- a/fs/Kconfig.binfmt
++++ b/fs/Kconfig.binfmt
+@@ -96,6 +96,8 @@ config CORE_DUMP_DEFAULT_ELF_HEADERS
+ 	  This config option changes the default setting of coredump_filter
+ 	  seen at boot time.  If unsure, say Y.
+ 
++source "kernel/kemu/Kconfig"
++
+ config BINFMT_SCRIPT
+ 	tristate "Kernel support for scripts starting with #!"
+ 	default y
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 9fe722305..8882d1088 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -54,6 +54,7 @@ obj-y += rcu/
+ obj-y += livepatch/
+ obj-y += dma/
+ obj-y += entry/
++obj-$(CONFIG_KEMU) += kemu/
+ obj-y += unwind/
+ obj-$(CONFIG_MODULES) += module/
+ 

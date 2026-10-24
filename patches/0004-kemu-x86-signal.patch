@@ -1,0 +1,24 @@
+diff --git a/arch/x86/kernel/signal.c b/arch/x86/kernel/signal.c
+index 240423333..d6b8ddd84 100644
+--- a/arch/x86/kernel/signal.c
++++ b/arch/x86/kernel/signal.c
+@@ -27,6 +27,7 @@
+ #include <linux/context_tracking.h>
+ #include <linux/entry-common.h>
+ #include <linux/syscalls.h>
++#include <linux/kemu.h>
+ #include <linux/rseq.h>
+ 
+ #include <asm/processor.h>
+@@ -334,6 +335,11 @@ void arch_do_signal_or_restart(struct pt_regs *regs)
+ {
+ 	struct ksignal ksig;
+ 
++	if (task_is_kemu(current)) {
++		kemu_do_signal(regs);
++		return;
++	}
++
+ 	if (get_signal(&ksig)) {
+ 		/* Whee! Actually deliver the signal.  */
+ 		handle_signal(&ksig, regs);

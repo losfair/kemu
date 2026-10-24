@@ -1,0 +1,16 @@
+[package]
+name = "kemu_core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0"
+description = "kemu translator core (no_std, no kernel dependencies)"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Enables std-only helpers used by userspace test harnesses.
+std = []
+
+[profile.release]
+debug = true
