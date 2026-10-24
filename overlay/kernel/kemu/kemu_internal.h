@@ -278,6 +278,9 @@ u64 kemu_rs_nzcv_from_image(u64 img);
 u64 kemu_rs_image_from_nzcv(u64 nzcv);
 u32 kemu_rs_mxcsr_from(u32 fpcr, u32 fpsr);
 u32 kemu_rs_fpsr_merge(u32 fpsr, u32 mxcsr);
+void kemu_rs_crc_table(u32 *out);
+
+#define KEMU_CPU_CRC_TABLE	2048	/* offset in the state page (jit/regmap.rs) */
 
 #define KEMU_MXCSR_SLOT	7	/* kemu_cpu.scratch[] index of the MXCSR image */
 u64 kemu_rs_hwcap(void);

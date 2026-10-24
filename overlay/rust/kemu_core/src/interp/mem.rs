@@ -2,7 +2,7 @@
 // Load/store execution for the interpreter.
 
 use super::{Exit, Step};
-use crate::decode::{Index, Insn, RmwOp};
+use crate::decode::{Index, Insn, Order, RmwOp};
 use crate::env::{Access, Env, Fault};
 use crate::state::CpuState;
 
@@ -82,12 +82,21 @@ fn sign_extend(val: u64, from_bytes: u8, to64: bool) -> u64 {
 
 pub(super) fn exec_ldst<E: Env>(cpu: &mut CpuState, env: &mut E, insn: Insn) -> Step {
     match insn {
-        Insn::LdSt { load: ld, fp, size, sign_ext, index, order: _, rt, rn, offset } => {
+        Insn::LdSt { load: ld, fp, size, sign_ext, index, order, rt, rn, offset } => {
             let base = cpu.xsp(rn);
             let addr = match index {
                 Index::Post => base,
                 _ => base.wrapping_add(offset as u64),
             };
+            if order != Order::None {
+                // Load-acquire/store-release (incl. RCpc): an unaligned access
+                // faults if it is not within one 16-byte aligned block
+                // (AArch64.UnalignedAccessFaults with SCTLR_ELx.nAA == 0).
+                let bytes = 1u64 << size;
+                if addr & (bytes - 1) != 0 && (addr & 15) + bytes > 16 {
+                    return Step::Exit(Exit::Fault(Fault { addr, access: if ld { Access::Read } else { Access::Write }, align: true }));
+                }
+            }
             if let Err(f) = do_single(cpu, env, ld, fp, size, sign_ext, rt, addr) {
                 return Step::Exit(Exit::Fault(f));
             }
@@ -250,7 +259,16 @@ pub(super) fn exec_excl<E: Env>(cpu: &mut CpuState, env: &mut E, insn: Insn) -> 
         }
         if load {
             // LDXR/LDXP: load and set the monitor.
-            if pair {
+            if pair && size == 2 {
+                // LDXP Wt, Wt2: one 64-bit single-copy-atomic access.
+                let v = match load_mem(env, addr, 3) {
+                    Ok(v) => v,
+                    Err(f) => return Step::Exit(Exit::Fault(f)),
+                };
+                cpu.set_xr(rt, v & 0xffff_ffff);
+                cpu.set_xr(rt2, v >> 32);
+                cpu.excl_val = [v, 0];
+            } else if pair {
                 let v1 = match load_mem(env, addr, size) {
                     Ok(v) => v,
                     Err(f) => return Step::Exit(Exit::Fault(f)),
@@ -277,7 +295,9 @@ pub(super) fn exec_excl<E: Env>(cpu: &mut CpuState, env: &mut E, insn: Insn) -> 
             // STXR/STXP: succeed iff the monitor still holds.
             let success = cpu.excl_addr == addr && cpu.excl_size == total;
             let result = if success {
-                let new = if pair {
+                let new = if pair && size == 2 {
+                    [(cpu.xr(rt) & 0xffff_ffff) | (cpu.xr(rt2) << 32), 0]
+                } else if pair {
                     [cpu.xr(rt), cpu.xr(rt2)]
                 } else {
                     [cpu.xr(rt), 0]
@@ -319,6 +339,9 @@ fn normalize(v: [u64; 2], total: u64) -> [u64; 2] {
 pub(super) fn exec_atomic<E: Env>(cpu: &mut CpuState, env: &mut E, insn: Insn) -> Step {
     if let Insn::Atomic { op, size, acquire: _, release: _, rs, rt, rn } = insn {
         let addr = cpu.xsp(rn);
+        if addr & ((1u64 << size) - 1) != 0 {
+            return Step::Exit(Exit::Fault(Fault { addr, access: Access::Write, align: true }));
+        }
         let operand = cpu.xr(rs);
         // Read-modify-write via a cmpxchg loop on `size` bytes.
         loop {
@@ -356,17 +379,35 @@ pub(super) fn exec_atomic<E: Env>(cpu: &mut CpuState, env: &mut E, insn: Insn) -
 pub(super) fn exec_cas<E: Env>(cpu: &mut CpuState, env: &mut E, insn: Insn) -> Step {
     if let Insn::Cas { pair, size, acquire: _, release: _, rs, rt, rn } = insn {
         let addr = cpu.xsp(rn);
+        let total = (1u64 << size) << pair as u32;
+        if addr & (total - 1) != 0 {
+            return Step::Exit(Exit::Fault(Fault { addr, access: Access::Write, align: true }));
+        }
         if pair {
-            let esz = 1u64 << size;
-            let expected = [cpu.xr(rs), cpu.xr(rs.wrapping_add(1) & 31)];
-            let new = [cpu.xr(rt), cpu.xr(rt.wrapping_add(1) & 31)];
-            let total = esz * 2;
-            match env.cmpxchg(addr, total as u32, expected, new) {
-                Ok(old) => {
-                    cpu.set_xr(rs, old[0]);
-                    cpu.set_xr(rs.wrapping_add(1) & 31, old[1]);
+            let (rs1, rt1) = ((rs + 1) & 31, (rt + 1) & 31);
+            if size == 2 {
+                // CASP Ws, W(s+1), Wt, W(t+1): one 64-bit access, first
+                // register at the lower address.
+                let pack = |a: u64, b: u64| (a & 0xffff_ffff) | (b << 32);
+                let expected = [pack(cpu.xr(rs), cpu.xr(rs1)), 0];
+                let new = [pack(cpu.xr(rt), cpu.xr(rt1)), 0];
+                match env.cmpxchg(addr, 8, expected, new) {
+                    Ok(old) => {
+                        cpu.set_xr(rs, old[0] & 0xffff_ffff);
+                        cpu.set_xr(rs1, old[0] >> 32);
+                    }
+                    Err(f) => return Step::Exit(Exit::Fault(f)),
                 }
-                Err(f) => return Step::Exit(Exit::Fault(f)),
+            } else {
+                let expected = [cpu.xr(rs), cpu.xr(rs1)];
+                let new = [cpu.xr(rt), cpu.xr(rt1)];
+                match env.cmpxchg(addr, 16, expected, new) {
+                    Ok(old) => {
+                        cpu.set_xr(rs, old[0]);
+                        cpu.set_xr(rs1, old[1]);
+                    }
+                    Err(f) => return Step::Exit(Exit::Fault(f)),
+                }
             }
         } else {
             let expected = truncsz(cpu.xr(rs), size);

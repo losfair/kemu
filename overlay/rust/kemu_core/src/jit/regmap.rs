@@ -92,6 +92,27 @@ pub const OFF_EXIT_INFO: i32 = 408;
 pub const OFF_FLAGS_X86: i32 = 416;
 /// MXCSR image (scratch slot 7), saved/restored by the stubs.
 pub const OFF_MXCSR: i32 = 400;
+/// Scratch slot used by multi-instruction sequences.
+pub const OFF_SCRATCH0: i32 = 344;
+/// CRC-32 (IEEE, reflected) byte table: 256 x u32 in the state page.
+pub const OFF_CRC_TABLE: i32 = 2048;
+
+/// The table stored at OFF_CRC_TABLE (filled in by the host runtime).
+pub fn crc32_table() -> [u32; 256] {
+    let mut t = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+            k += 1;
+        }
+        t[i] = c;
+        i += 1;
+    }
+    t
+}
 pub const OFF_V: i32 = 512;
 
 /// Spill all pinned registers (and MXCSR) to the state page.

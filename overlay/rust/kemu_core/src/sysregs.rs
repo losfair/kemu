@@ -58,11 +58,7 @@ pub const CTR_EL0: u64 = {
     idc | dic | cwg | erg | dmin | l1ip | imin
 };
 
-/// DCZID_EL0: DZP=1 (DC ZVA prohibited at EL0), BS=4. Reporting DZP=1 steers
-/// glibc's memset/memmove ifunc selection to the generic path instead of the
-/// DC-ZVA variant, matching how the reference (QEMU) is exercised and avoiding
-/// reliance on DC ZVA block-size assumptions. DC ZVA itself is still emulated
-/// (64-byte block) if a guest uses it directly.
+/// DCZID_EL0: DZP=0 (DC ZVA permitted at EL0), BS=4 (64-byte blocks).
 pub const DCZID_EL0: u64 = 4; // DC ZVA allowed, 64-byte blocks
 
 pub const MIDR_EL1: u64 = 0x0000_0000; // implementer 0 (software)
@@ -92,11 +88,13 @@ pub const ID_AA64ISAR0_EL1: u64 = {
     aes | sha1 | sha2 | crc | atomic | rdm | dp | ts | rndr
 };
 pub const ID_AA64ISAR1_EL1: u64 = {
-    // DPB=2 (DCPODP), JSCVT=1, LRCPC=2 (ILRCPC)
+    // DPB=2 (DCPODP), JSCVT=1, LRCPC=2 (ILRCPC), FRINTTS=1, SB=1
     let dpb = 2u64 << 0;
     let jscvt = 1u64 << 12;
     let lrcpc = 2u64 << 20;
-    dpb | jscvt | lrcpc
+    let frintts = 1u64 << 32;
+    let sb = 1u64 << 36;
+    dpb | jscvt | lrcpc | frintts | sb
 };
 pub const ID_AA64ISAR2_EL1: u64 = 0;
 pub const ID_AA64MMFR0_EL1: u64 = {

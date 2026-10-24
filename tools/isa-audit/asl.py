@@ -260,7 +260,13 @@ class Interp:
                 if execute:
                     for n in names:
                         self.env[n] = v
-                self.expect_op(";")
+                if self.isop(";"):
+                    self.take()
+                else:
+                    self.skip_to_semi()
+                    if execute:
+                        for n in names:
+                            self.env[n] = UNKNOWN
             else:
                 self.take()
                 for n in names:
@@ -302,6 +308,34 @@ class Interp:
                 v = UNKNOWN
             if execute:
                 self.env[name] = v
+            return
+        # generic `lhs = rhs;` (e.g. tuple assignment): evaluate rhs for
+        # its decode-time side effects (DecodeBitMasks UNDEF checks).
+        j = self.i
+        depth = 0
+        eq = None
+        while True:
+            t2 = self.t[j]
+            if t2[0] == "eof":
+                break
+            if t2[0] == "op" and t2[1] in "([{":
+                depth += 1
+            elif t2[0] == "op" and t2[1] in ")]}":
+                depth -= 1
+            elif t2 == ("op", ";") and depth <= 0:
+                break
+            elif t2 == ("op", "=") and depth == 0 and eq is None:
+                eq = j
+            j += 1
+        if eq is not None and execute:
+            self.i = eq + 1
+            try:
+                self.expr()
+            except SyntaxError:
+                pass
+            self.i = j
+            if self.isop(";"):
+                self.take()
             return
         self.skip_to_semi()
 
@@ -361,6 +395,23 @@ class Interp:
 
     def e_cmp(self):
         a = self.e_cat()
+        if self.isid("as"):
+            self.take()
+            # skip a type: identifier, integer{...} or bits(...)
+            self.take()
+            if self.isop("{") or self.isop("("):
+                close = "}" if self.isop("{") else ")"
+                depth = 0
+                while True:
+                    t2 = self.take()
+                    if t2[0] == "op" and t2[1] in "({":
+                        depth += 1
+                    elif t2[0] == "op" and t2[1] in ")}":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    elif t2[0] == "eof":
+                        break
         while True:
             if self.isop("==") or self.isop("!="):
                 op = self.take()[1]
@@ -411,11 +462,11 @@ class Interp:
 
     def e_add(self):
         a = self.e_mul()
-        while self.isop("+") or self.isop("-") or self.isid("OR") or self.isid("EOR"):
+        while self.isop("+") or self.isop("-") or self.isid("OR") or self.isid("EOR") or self.isid("XOR"):
             op = self.take()[1]
             b = self.e_mul()
             x, y = self.num(a), self.num(b)
-            if op in ("OR", "EOR") and isinstance(a, Bits) and isinstance(b, Bits):
+            if op in ("OR", "EOR", "XOR") and isinstance(a, Bits) and isinstance(b, Bits):
                 a = Bits(a.v | b.v if op == "OR" else a.v ^ b.v, a.w)
             elif x is UNKNOWN or y is UNKNOWN or not isinstance(a, int) or not isinstance(b, int):
                 a = UNKNOWN
@@ -503,6 +554,8 @@ class Interp:
             out.append(self.expr())
             if self.isop(","):
                 self.take()
+            elif not self.isop(")"):
+                raise SyntaxError("bad argument list")
         self.expect_op(")")
         return out
 
@@ -536,6 +589,21 @@ class Interp:
                 elif t2[0] == "eof":
                     break
             return UNKNOWN
+        if tk == ("id", "if"):
+            c = self.truth(self.expr())
+            self.expect_id("then")
+            a = self.expr()
+            res = a if c is True else (UNKNOWN if c is UNKNOWN else None)
+            while self.isid("elsif"):
+                self.take()
+                c2 = self.truth(self.expr())
+                self.expect_id("then")
+                b = self.expr()
+                if res is None:
+                    res = b if c2 is True else (UNKNOWN if c2 is UNKNOWN else None)
+            self.expect_id("else")
+            e = self.expr()
+            return e if res is None else res
         if tk[0] == "id":
             name = tk[1]
             if name == "TRUE":
@@ -564,6 +632,16 @@ class Interp:
         raise SyntaxError("unexpected %r" % (tk,))
 
     def call(self, name, a):
+        if name == "DecodeBitMasks" and len(a) >= 4 and all(isinstance(v, Bits) for v in a[:3]):
+            immn, imms, immr = a[0], a[1], a[2]
+            comb = (immn.v << 6) | (~imms.v & 0x3F)
+            ln = comb.bit_length() - 1
+            if ln < 1:
+                raise EndDecode("Decode_UNDEF")
+            levels = (1 << ln) - 1
+            if a[3] is True and (imms.v & levels) == levels:
+                raise EndDecode("Decode_UNDEF")
+            return UNKNOWN
         if name == "IsFeatureImplemented":
             return UNKNOWN if not a or a[0] is UNKNOWN else a[0]
         if name == "UInt":

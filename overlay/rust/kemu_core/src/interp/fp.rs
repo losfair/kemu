@@ -191,7 +191,7 @@ fn exec_fp1(cpu: &mut CpuState, ftype: u8, op: Fp1Op, to: u8, rd: u32, rn: u32, 
         Fp1Op::Rint64Z => sf::round_int_n(&mut c, f, a, Rounding::Zero, 64),
         Fp1Op::Rint64X => sf::round_int_n(&mut c, f, a, rnd, 64),
         Fp1Op::Recpx => sf::recpx(&mut c, f, a),
-        Fp1Op::Cvt => unreachable!(),
+        Fp1Op::Cvt => a,
     };
     commit(cpu, c);
     writef(cpu, rd, f, r);
@@ -199,6 +199,17 @@ fn exec_fp1(cpu: &mut CpuState, ftype: u8, op: Fp1Op, to: u8, rd: u32, rn: u32, 
 }
 
 fn exec_cvt(cpu: &mut CpuState, ftype: u8, sf64: bool, op: FcvtOp, rd: u32, rn: u32, word: u32) -> Step {
+    if let FcvtOp::Fmov { to_fp: true, top: true } = op {
+        // FMOV Vd.D[1], Xn: only the top 64 bits change.
+        let mut v = cpu.vreg(rd);
+        v[1] = cpu.xr(rn);
+        cpu.set_vreg(rd, v);
+        return Step::Next;
+    }
+    if let FcvtOp::Fmov { to_fp: false, top: true } = op {
+        cpu.set_xr(rd, cpu.vreg(rn)[1]);
+        return Step::Next;
+    }
     let f = match ftype_fmt(ftype) {
         Some(f) => f,
         None => {

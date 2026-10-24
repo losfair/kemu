@@ -626,8 +626,9 @@ pub fn sqrt(c: &mut FpCtx, f: Fmt, xa: u64) -> u64 {
                 m <<= 1;
                 e -= 1;
             }
-            // m < 2^55; shift by an even amount to ~120 bits.
-            let k = 64u32;
+            // Normalise (by an even amount) so the radicand has ~125
+            // significant bits; denormal inputs need the larger shift.
+            let k = (m.leading_zeros() - 2) & !1;
             let (r, inexact) = isqrt(m << k);
             let sig = (r << 1) | inexact as u128;
             let rnd = c.rmode();
@@ -1090,6 +1091,28 @@ const RSQRT_TABLE: [u16; 384] = {
     }
     t
 };
+
+/// UnsignedRecipEstimate (URECPE) on a 32-bit element.
+pub fn unsigned_recip_estimate(x: u32) -> u32 {
+    if x >> 31 == 0 {
+        return u32::MAX;
+    }
+    let est = recip_estimate((x >> 23) as u64);
+    ((est & 0x1ff) as u32) << 23
+}
+
+/// UnsignedRSqrtEstimate (URSQRTE) on a 32-bit element.
+pub fn unsigned_rsqrt_estimate(x: u32) -> u32 {
+    if x >> 30 == 0 {
+        return u32::MAX;
+    }
+    let a = (x >> 23) as usize; // 128..511
+    let est = match RSQRT_TABLE.get(a.wrapping_sub(128)) {
+        Some(v) => *v as u32,
+        None => 256,
+    };
+    (est & 0x1ff) << 23
+}
 
 /// FPRecipEstimate (FRECPE) for S and D.
 pub fn recip_estimate_fp(c: &mut FpCtx, f: Fmt, x: u64) -> u64 {

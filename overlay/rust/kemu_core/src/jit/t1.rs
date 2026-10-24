@@ -157,7 +157,11 @@ impl<'s, 'b> Gen<'s, 'b> {
     }
 
     fn flags_loc(&self) -> u8 {
-        if self.fl.host {
+        // Prefer the image: host EFLAGS may be clobbered later in the
+        // instruction while the image stays valid.
+        if self.fl.mem {
+            FLAGS_MEM
+        } else if self.fl.host {
             if self.fl.inv {
                 FLAGS_HOST_INV
             } else {
@@ -1131,6 +1135,22 @@ impl<'s, 'b> Gen<'s, 'b> {
                     self.a.bind8(j);
                 }
             }
+            Dp2Op::Crc32 => {
+                // Byte-wise table CRC (IEEE polynomial); x86 crc32 is CRC32C.
+                self.clobber();
+                let m = self.get(rm, false, RDX);
+                self.a.store(Sz::Q, Mem::gs(OFF_SCRATCH0), m);
+                self.get_into(rn, false, Sz::D, RAX);
+                for i in 0..(1 << crc_sz.min(3)) {
+                    self.a.movzx(Sz::B, RDX, Rm::M(Mem::gs(OFF_SCRATCH0 + i)));
+                    self.a.alu_rr(Alu::Xor, Sz::B, RDX, RAX);
+                    self.a.movzx(Sz::B, RDX, Rm::R(RDX));
+                    self.a.shift_ri(Shift::Shr, Sz::D, RAX, 8);
+                    let mut t = Mem::isd(RDX, 2, OFF_CRC_TABLE);
+                    t.gs = true;
+                    self.a.alu_rm(Alu::Xor, Sz::D, RAX, Rm::M(t));
+                }
+            }
             Dp2Op::Crc32c => {
                 self.get_into(rn, false, Sz::D, RAX);
                 let m = self.rm(rm, false, RDX);
@@ -1142,7 +1162,6 @@ impl<'s, 'b> Gen<'s, 'b> {
                 };
                 self.a.crc32(msz, RAX, m);
             }
-            _ => return false,
         }
         self.put(rd, false, RAX);
         true
@@ -1348,6 +1367,14 @@ impl<'s, 'b> Gen<'s, 'b> {
             Index::Pre => (Mem::bd(base, offset as i32), Some(offset)),
             Index::Post => (Mem::b(base), Some(offset)),
         };
+        // Acquire/release accesses must be naturally aligned (no LSE2).
+        let mut done_align = None;
+        if order != Order::None && size > 0 {
+            self.flags_to_mem();
+            self.clobber();
+            self.a.lea(Sz::Q, RAX, m);
+            done_align = self.align_check(RAX, size);
+        }
         let release = order == Order::AcqRel && !load;
         if fp {
             if load {
@@ -1362,6 +1389,10 @@ impl<'s, 'b> Gen<'s, 'b> {
         }
         if let Some(off) = wb {
             self.writeback(rn, base, off);
+        }
+        if let Some(d) = done_align {
+            self.a.bind32(d);
+            self.point(kind::DONE, FLAGS_MEM, 0);
         }
         true
     }
@@ -1525,6 +1556,7 @@ impl<'s, 'b> Gen<'s, 'b> {
         }
         if let Some(d) = done {
             self.a.bind32(d);
+            self.point(kind::DONE, FLAGS_MEM, 0);
         }
         true
     }
@@ -1599,6 +1631,61 @@ impl<'s, 'b> Gen<'s, 'b> {
         }
         if let Some(d) = done {
             self.a.bind32(d);
+            self.point(kind::DONE, FLAGS_MEM, 0);
+        }
+        true
+    }
+
+    /// LDXR / STXR (single register). The monitor lives in the state page
+    /// with the same layout the interpreter uses.
+    fn excl(&mut self, load: bool, size: u8, rs: u32, rt: u32, rn: u32) -> bool {
+        let sz = [Sz::B, Sz::W, Sz::D, Sz::Q][(size & 3) as usize];
+        if !matches!(self.gp(rn, true), Gp::R(_)) {
+            return false;
+        }
+        self.flags_to_mem();
+        self.clobber();
+        let base = self.base(rn);
+        let done_align = self.align_check(base, size);
+        if load {
+            match size {
+                0 => self.a.movzx(Sz::B, RAX, Rm::M(Mem::b(base))),
+                1 => self.a.movzx(Sz::W, RAX, Rm::M(Mem::b(base))),
+                2 => self.a.load(Sz::D, RAX, Mem::b(base)),
+                _ => self.a.load(Sz::Q, RAX, Mem::b(base)),
+            }
+            self.a.store(Sz::Q, Mem::gs(OFF_EXCL_VAL), RAX);
+            self.a.store_imm(Sz::Q, Mem::gs(OFF_EXCL_VAL + 8), 0);
+            self.a.store_imm(Sz::Q, Mem::gs(OFF_EXCL_SIZE), 1 << size);
+            self.a.store(Sz::Q, Mem::gs(OFF_EXCL_ADDR), base);
+            self.put(rt, false, RAX);
+        } else {
+            self.a.alu_rm(Alu::Cmp, Sz::Q, base, Rm::M(Mem::gs(OFF_EXCL_ADDR)));
+            let f1 = self.a.jcc(Cc::Ne, None);
+            self.a.alu_ri(Alu::Cmp, Sz::Q, Rm::M(Mem::gs(OFF_EXCL_SIZE)), 1 << size);
+            let f2 = self.a.jcc(Cc::Ne, None);
+            self.a.load(Sz::Q, RAX, Mem::gs(OFF_EXCL_VAL));
+            let data = self.get(rt, false, RDX);
+            self.a.lock_cmpxchg(sz, Mem::b(base), data);
+            self.point(kind::ROLL_STATUS, rs as u8, 0);
+            self.a.setcc(Cc::Ne, RAX);
+            self.a.movzx(Sz::B, RAX, Rm::R(RAX));
+            self.put(rs, false, RAX);
+            self.point(kind::DONE, FLAGS_MEM, 0);
+            let done = self.a.jmp(None);
+            self.a.bind32(f1);
+            self.a.bind32(f2);
+            self.point(kind::INSN, FLAGS_MEM, 0);
+            self.a.mov_ri32(RAX, 1);
+            self.put(rs, false, RAX);
+            self.a.bind32(done);
+            // Status written on both paths: the instruction is complete.
+            self.point(kind::DONE, FLAGS_MEM, 0);
+            self.a.store_imm(Sz::Q, Mem::gs(OFF_EXCL_ADDR), -1);
+        }
+        if let Some(d) = done_align {
+            self.a.bind32(d);
+            self.point(kind::DONE, FLAGS_MEM, 0);
         }
         true
     }
@@ -1841,11 +1928,9 @@ fn is_native(i: &Insn) -> bool {
             | Insn::Hlt { .. }
             | Insn::Brk { .. }
             | Insn::IcIvau { .. }
-            | Insn::LdStExcl { .. }
             | Insn::FpCCmp { .. }
             | Insn::SimdAcross { .. }
             | Insn::SimdSmov { .. }
-            | Insn::SimdPermute { .. }
             | Insn::SimdTbl { .. }
             | Insn::SimdIndexed { .. }
             | Insn::SimdScalarCopy { .. }
@@ -2121,6 +2206,7 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
             }
             Insn::Atomic { op, size, acquire: _, release: _, rs, rt, rn } => g.atomic(op, size, rs, rt, rn),
             Insn::Cas { pair: false, size, acquire: _, release: _, rs, rt, rn } => g.cas(size, rs, rt, rn),
+            Insn::LdStExcl { load, pair: false, size, order: _, rs, rt, rt2: _, rn } => g.excl(load, size, rs, rt, rn),
             Insn::DcZva { rt } => g.dc_zva(rt),
             Insn::Mrs { rt, enc } => g.mrs(rt, enc),
             Insn::FpImm { ftype, rd, imm8 } => g.fp_imm_insn(ftype, rd, imm8),
@@ -2139,9 +2225,13 @@ pub fn translate<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mu
             Insn::SimdUmov { q: _, imm5, rd, rn } => g.simd_umov(imm5, rd, rn),
             Insn::SimdInsGpr { imm5, rd, rn } => g.simd_ins_gpr(imm5, rd, rn),
             Insn::SimdInsElt { imm5, imm4, rd, rn } => g.simd_ins_elt(imm5, imm4, rd, rn),
+            Insn::SimdLdSt { load: true, q, size, opcode: _, rt, rn, rm, single: true, index: _, replicate: true, selem: 1, post } => {
+                g.simd_ld1r(q, size, rt, rn, rm, post)
+            }
             Insn::SimdLdSt { load, q, size: _, opcode, rt, rn, rm, single, index: _, replicate: _, selem: _, post } => {
                 g.simd_ldst(load, q, opcode, rt, rn, rm, single, post)
             }
+            Insn::SimdPermute { q, size, opcode, rd, rn, rm } => g.simd_permute(q, size, opcode, rd, rn, rm),
             Insn::MsrReg { rt, enc } => g.msr(rt, enc),
 
             // ---- branches ----

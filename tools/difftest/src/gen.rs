@@ -69,6 +69,9 @@ pub fn random_state(r: &mut Rng) -> Arch {
     if r.bits(2) == 0 {
         fpcr |= 1 << 25; // DN
     }
+    if r.bits(3) == 0 {
+        fpcr |= 1 << 26; // AHP
+    }
     a.fpcr = fpcr;
     a.fpsr = 0;
     for v in a.v.iter_mut() {

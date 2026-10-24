@@ -1,124 +1,164 @@
 // SPDX-License-Identifier: GPL-2.0
-// SIMD two-register-misc execution. Included by simd.rs.
+// SIMD two-register-miscellaneous execution. Included by simd.rs.
 
 #[allow(clippy::too_many_arguments)]
 fn two_misc(cpu: &mut CpuState, q: bool, _u: bool, size: u8, op: Simd2Op, rd: u32, rn: u32, scalar: bool) {
+    use Simd2Op::*;
     let esize = size;
-    let lanes = if scalar { 1 } else { vbytes(q) >> esize };
-    let mut out = [0u64; 2];
-    let mut c = sf::FpCtx::new(cpu.fpcr, cpu.fpsr);
     let bits = 8u32 << esize;
-    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let m = lmask(bits);
+    let src = cpu.vreg(rn);
+    let lanes = if scalar { 1 } else { vbytes(q) >> esize };
+    let mut c = sf::FpCtx::new(cpu.fpcr, cpu.fpsr);
+    let mut qc = false;
+    let mut out = [0u64; 2];
 
-    // REV16/32/64 reverse elements within containers spanning lanes.
-    if let Simd2Op::Rev16 | Simd2Op::Rev32 | Simd2Op::Rev64 = op {
-        let cont = match op {
-            Simd2Op::Rev16 => 1,
-            Simd2Op::Rev32 => 2,
-            _ => 3,
-        };
-        let v = cpu.vreg(rn);
-        let r0 = rev_in(v[0], esize, cont);
-        let r1 = if q { rev_in(v[1], esize, cont) } else { 0 };
-        cpu.set_vreg(rd, [r0, r1]);
-        return;
-    }
-
-    // Narrowing ops write the lower/upper half.
     match op {
-        Simd2Op::Xtn | Simd2Op::Xtn2 | Simd2Op::SqXtn | Simd2Op::SqXtn2 | Simd2Op::UqXtn
-        | Simd2Op::UqXtn2 | Simd2Op::SqXtun | Simd2Op::SqXtun2 => {
-            let src_es = esize + 1;
-            let src_lanes = 8u32 >> esize; // result is 64-bit (or upper 64)
-            let top = matches!(
-                op,
-                Simd2Op::Xtn2 | Simd2Op::SqXtn2 | Simd2Op::UqXtn2 | Simd2Op::SqXtun2
-            );
-            let base = if top { cpu.vreg(rd) } else { [0u64; 2] };
-            out = base;
-            let lane_off = if top { src_lanes } else { 0 };
-            for i in 0..src_lanes {
-                let v = get_lane(cpu, rn, src_es, i);
-                let r = match op {
-                    Simd2Op::Xtn | Simd2Op::Xtn2 => v & mask,
-                    Simd2Op::SqXtn | Simd2Op::SqXtn2 => sat_signed(sext(v, src_es), esize) as u64 & mask,
-                    Simd2Op::UqXtn | Simd2Op::UqXtn2 => sat_unsigned(v as i128, esize),
-                    _ => sat_unsigned(sext(v, src_es) as i128, esize),
-                };
-                put_lane(&mut out, esize, lane_off + i, r);
+        Rev16 | Rev32 | Rev64 => {
+            let cont: u32 = match op {
+                Rev16 => 16,
+                Rev32 => 32,
+                _ => 64,
+            };
+            let per = cont / bits; // elements per container
+            if per == 0 {
+                return;
             }
-            cpu.set_vreg(rd, out);
+            for i in 0..lanes {
+                let base = i - i % per;
+                let j = base + (per - 1 - i % per);
+                put_lane(&mut out, esize, i, lane(&src, esize, j));
+            }
+            write_vec(cpu, rd, q, out);
             return;
         }
-        Simd2Op::FcvtN | Simd2Op::FcvtN2 => {
-            // Narrow F32->F16 or F64->F32.
-            let from = if esize == 2 { Fmt::D } else { Fmt::S };
-            let to = if esize == 2 { Fmt::S } else { Fmt::H };
-            let top = matches!(op, Simd2Op::FcvtN2);
-            out = if top { cpu.vreg(rd) } else { [0u64; 2] };
-            let src_lanes = 8u32 >> esize;
-            let off = if top { src_lanes } else { 0 };
-            let rnd = c.rmode();
-            for i in 0..src_lanes {
-                let v = get_lane(cpu, rn, esize + 1, i);
-                let r = sf::convert(&mut c, from, to, v, rnd);
-                put_lane(&mut out, esize, off + i, r);
+        Xtn | Xtn2 | SqXtn | SqXtn2 | UqXtn | UqXtn2 | SqXtun | SqXtun2 => {
+            // Source elements are 2*esize; result is 64 bits (or one element).
+            let n = if scalar { 1 } else { 8u32 >> esize };
+            let mut half = [0u64; 2];
+            for i in 0..n {
+                let v = lane(&src, esize + 1, i);
+                let r = match op {
+                    Xtn | Xtn2 => v & m,
+                    SqXtn | SqXtn2 => sat_s(ival(v, esize + 1, true), bits, &mut qc),
+                    UqXtn | UqXtn2 => sat_u(ival(v, esize + 1, false), bits, &mut qc),
+                    _ => sat_u(ival(v, esize + 1, true), bits, &mut qc),
+                };
+                put_lane(&mut half, esize, i, r);
+            }
+            set_qc(cpu, qc);
+            if scalar {
+                cpu.set_vreg(rd, half);
+            } else {
+                write_part(cpu, rd, q, half[0]);
+            }
+            return;
+        }
+        FcvtN | FcvtN2 | FcvtXn | FcvtXn2 => {
+            // Narrow: size is the destination element size (H = 1, S = 2).
+            let (from, to) = if esize == 2 { (Fmt::D, Fmt::S) } else { (Fmt::S, Fmt::H) };
+            let rnd = if matches!(op, FcvtXn | FcvtXn2) { sf::Rounding::Odd } else { c.rmode() };
+            let n = if scalar { 1 } else { 64 / bits };
+            let mut half = [0u64; 2];
+            for i in 0..n {
+                let r = sf::convert(&mut c, from, to, lane(&src, esize + 1, i), rnd);
+                put_lane(&mut half, esize, i, r);
             }
             cpu.fpsr = c.fpsr & sf::FPSR_MASK;
-            cpu.set_vreg(rd, out);
+            if scalar {
+                cpu.set_vreg(rd, half);
+            } else {
+                write_part(cpu, rd, q, half[0]);
+            }
             return;
         }
-        Simd2Op::FcvtL | Simd2Op::FcvtL2 => {
-            let from = if esize == 2 { Fmt::S } else { Fmt::H };
-            let to = if esize == 2 { Fmt::D } else { Fmt::S };
-            let top = matches!(op, Simd2Op::FcvtL2);
-            let src_lanes = 8u32 >> esize;
-            let off = if top { src_lanes } else { 0 };
+        FcvtL | FcvtL2 => {
+            // Widen: size is the source element size (H = 1, S = 2).
+            let (from, to) = if esize == 2 { (Fmt::S, Fmt::D) } else { (Fmt::H, Fmt::S) };
+            let n = 64 / bits;
+            let off = if q { n } else { 0 };
             let rnd = c.rmode();
-            for i in 0..src_lanes {
-                let v = get_lane(cpu, rn, esize, off + i);
-                let r = sf::convert(&mut c, from, to, v, rnd);
+            for i in 0..n {
+                let r = sf::convert(&mut c, from, to, lane(&src, esize, off + i), rnd);
                 put_lane(&mut out, esize + 1, i, r);
             }
             cpu.fpsr = c.fpsr & sf::FPSR_MASK;
             cpu.set_vreg(rd, out);
             return;
         }
+        Shll | Shll2 => {
+            let n = 8u32 >> esize;
+            let off = if q { n } else { 0 };
+            for i in 0..n {
+                put_lane(&mut out, esize + 1, i, lane(&src, esize, off + i) << bits);
+            }
+            cpu.set_vreg(rd, out);
+            return;
+        }
+        SaddLp | UaddLp | SadaLp | UadaLp => {
+            let signed = matches!(op, SaddLp | SadaLp);
+            let acc = matches!(op, SadaLp | UadaLp);
+            let d0 = cpu.vreg(rd);
+            for i in 0..lanes / 2 {
+                let s = ival(lane(&src, esize, 2 * i), esize, signed) + ival(lane(&src, esize, 2 * i + 1), esize, signed);
+                let mut r = s as u64;
+                if acc {
+                    r = r.wrapping_add(lane(&d0, esize + 1, i));
+                }
+                put_lane(&mut out, esize + 1, i, r);
+            }
+            write_vec(cpu, rd, q, out);
+            return;
+        }
+        Urecpe | Ursqrte => {
+            for i in 0..lanes {
+                let v = lane(&src, 2, i) as u32;
+                let r = if op == Urecpe { sf::unsigned_recip_estimate(v) } else { sf::unsigned_rsqrt_estimate(v) };
+                put_lane(&mut out, 2, i, r as u64);
+            }
+            write_vec(cpu, rd, q, out);
+            return;
+        }
         _ => {}
     }
 
     let fp = is_fp_misc(op);
+    let d0 = cpu.vreg(rd);
     for i in 0..lanes {
-        let v = get_lane(cpu, rn, esize, i);
+        let v = lane(&src, esize, i);
         let r = if fp {
             fp_misc_lane(&mut c, fmt_of(esize), op, v)
         } else {
-            int_misc_lane(op, v, esize, mask)
+            match op {
+                SuqAdd => sat_s(ival(lane(&d0, esize, i), esize, true) + ival(v, esize, false), bits, &mut qc),
+                UsqAdd => sat_u(ival(lane(&d0, esize, i), esize, false) + ival(v, esize, true), bits, &mut qc),
+                SqAbs => sat_s(ival(v, esize, true).abs(), bits, &mut qc),
+                SqNeg => sat_s(-ival(v, esize, true), bits, &mut qc),
+                _ => int_misc_lane(op, v, esize, m),
+            }
         };
         put_lane(&mut out, esize, i, r);
     }
     cpu.fpsr = c.fpsr & sf::FPSR_MASK;
-    cpu.set_vreg(rd, out);
+    set_qc(cpu, qc);
+    write_vec(cpu, rd, q && !scalar, out);
 }
 
 fn int_misc_lane(op: Simd2Op, v: u64, esize: u8, mask: u64) -> u64 {
     let bits = 8u32 << esize;
+    let v = v & mask;
     (match op {
         Simd2Op::Not => !v,
         Simd2Op::Rbit => v.reverse_bits() >> (64 - bits),
-        Simd2Op::Cnt => (v & mask).count_ones() as u64,
-        Simd2Op::Clz => ((v & mask) << (64 - bits)).leading_zeros() as u64,
+        Simd2Op::Cnt => v.count_ones() as u64,
+        Simd2Op::Clz => (v << (64 - bits)).leading_zeros().min(bits) as u64,
         Simd2Op::Cls => {
-            let s = sext(v, esize);
-            let x = if s < 0 { !(v & mask) } else { v & mask };
-            (((x << (64 - bits)) as u64).leading_zeros().saturating_sub(1)) as u64
+            let x = if sext(v, esize) < 0 { !v & mask } else { v };
+            ((x << (64 - bits)).leading_zeros().min(bits) - 1) as u64
         }
-        Simd2Op::Neg => (v & mask).wrapping_neg(),
+        Simd2Op::Neg => v.wrapping_neg(),
         Simd2Op::Abs => sext(v, esize).unsigned_abs(),
-        Simd2Op::Rev16 => rev_in(v, esize, 1),
-        Simd2Op::Rev32 => rev_in(v, esize, 2),
-        Simd2Op::Rev64 => rev_in(v, esize, 3),
-        Simd2Op::CmEq0 => bool_lane(v & mask == 0),
+        Simd2Op::CmEq0 => bool_lane(v == 0),
         Simd2Op::CmGe0 => bool_lane(sext(v, esize) >= 0),
         Simd2Op::CmGt0 => bool_lane(sext(v, esize) > 0),
         Simd2Op::CmLe0 => bool_lane(sext(v, esize) <= 0),
@@ -127,34 +167,13 @@ fn int_misc_lane(op: Simd2Op, v: u64, esize: u8, mask: u64) -> u64 {
     }) & mask
 }
 
-/// Reverse elements of size `in_es` within containers of size `cont_es`.
-fn rev_in(v: u64, in_es: u8, cont_es: u8) -> u64 {
-    let esz = 8u32 << in_es;
-    let csz = 8u32 << cont_es;
-    if csz > 64 || esz >= csz {
-        return v;
-    }
-    let per = csz / esz;
-    let mut out = 0u64;
-    let mut base = 0;
-    while base < 64 {
-        for i in 0..per {
-            let e = (v >> (base + i * esz)) & ((1u64 << esz) - 1);
-            out |= e << (base + (per - 1 - i) * esz);
-        }
-        base += csz;
-    }
-    out
-}
-
 fn is_fp_misc(op: Simd2Op) -> bool {
     use Simd2Op::*;
     matches!(
         op,
-        Fabs | Fneg | Fsqrt | FrintN | FrintP | FrintM | FrintZ | FrintA | FrintX | FrintI
-            | Frint32Z | Frint32X | Frint64Z | Frint64X | Fcvtns | Fcvtnu | Fcvtps | Fcvtpu
-            | Fcvtms | Fcvtmu | Fcvtzs | Fcvtzu | Fcvtas | Fcvtau | Scvtf | Ucvtf | Frecpe
-            | Frsqrte | Frecpx | FCmEq0 | FCmGe0 | FCmGt0 | FCmLe0 | FCmLt0
+        Fabs | Fneg | Fsqrt | FrintN | FrintP | FrintM | FrintZ | FrintA | FrintX | FrintI | Frint32Z | Frint32X
+            | Frint64Z | Frint64X | Fcvtns | Fcvtnu | Fcvtps | Fcvtpu | Fcvtms | Fcvtmu | Fcvtzs | Fcvtzu | Fcvtas
+            | Fcvtau | Scvtf | Ucvtf | Frecpe | Frsqrte | Frecpx | FCmEq0 | FCmGe0 | FCmGt0 | FCmLe0 | FCmLt0
     )
 }
 
@@ -162,6 +181,7 @@ fn fp_misc_lane(c: &mut sf::FpCtx, f: Fmt, op: Simd2Op, v: u64) -> u64 {
     use crate::softfloat::Rounding as R;
     let rnd = c.rmode();
     let isize = f.nbits();
+    let z = sf::zero(f, false);
     match op {
         Simd2Op::Fabs => sf::abs(f, v),
         Simd2Op::Fneg => sf::neg(f, v),
@@ -192,11 +212,11 @@ fn fp_misc_lane(c: &mut sf::FpCtx, f: Fmt, op: Simd2Op, v: u64) -> u64 {
         Simd2Op::Frecpe => sf::recip_estimate_fp(c, f, v),
         Simd2Op::Frsqrte => sf::rsqrt_estimate_fp(c, f, v),
         Simd2Op::Frecpx => sf::recpx(c, f, v),
-        Simd2Op::FCmEq0 => bool_lane(sf::compare_op(c, f, v, sf::zero(f, false), sf::CmpOp::Eq)),
-        Simd2Op::FCmGe0 => bool_lane(sf::compare_op(c, f, v, sf::zero(f, false), sf::CmpOp::Ge)),
-        Simd2Op::FCmGt0 => bool_lane(sf::compare_op(c, f, v, sf::zero(f, false), sf::CmpOp::Gt)),
-        Simd2Op::FCmLe0 => bool_lane(sf::compare_op(c, f, sf::zero(f, false), v, sf::CmpOp::Ge)),
-        Simd2Op::FCmLt0 => bool_lane(sf::compare_op(c, f, sf::zero(f, false), v, sf::CmpOp::Gt)),
+        Simd2Op::FCmEq0 => bool_lane(sf::compare_op(c, f, v, z, sf::CmpOp::Eq)),
+        Simd2Op::FCmGe0 => bool_lane(sf::compare_op(c, f, v, z, sf::CmpOp::Ge)),
+        Simd2Op::FCmGt0 => bool_lane(sf::compare_op(c, f, v, z, sf::CmpOp::Gt)),
+        Simd2Op::FCmLe0 => bool_lane(sf::compare_op(c, f, z, v, sf::CmpOp::Ge)),
+        Simd2Op::FCmLt0 => bool_lane(sf::compare_op(c, f, z, v, sf::CmpOp::Gt)),
         _ => 0,
     }
 }

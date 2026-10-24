@@ -154,8 +154,18 @@ fn addc(a: u64, b: u64, carry: bool, sf64: bool) -> (u64, bool, bool, bool, bool
 fn step<E: Env>(cpu: &mut CpuState, env: &mut E, insn: Insn, word: u32) -> Step {
     match insn {
         Insn::Undefined | Insn::Hlt { .. } => Step::Exit(Exit::Undefined(word)),
-        Insn::Nop | Insn::CacheNop | Insn::Prfm | Insn::Dmb | Insn::Dsb | Insn::Isb
-        | Insn::Sb | Insn::MsrImm { .. } => Step::Next,
+        Insn::Nop | Insn::CacheNop | Insn::Prfm | Insn::Dmb | Insn::Dsb | Insn::Isb | Insn::Sb => Step::Next,
+        Insn::MsrImm { op, .. } => {
+            // FLAGM: CFINV (0), XAFLAG (1), AXFLAG (2).
+            let (n, z, c, v) = get_nzcv(cpu);
+            match op {
+                0 => set_nzcv(cpu, n, z, !c, v),
+                1 => set_nzcv(cpu, !c && !z, z && c, c || z, !c && z),
+                2 => set_nzcv(cpu, false, z || v, c && !v, false),
+                _ => return Step::Exit(Exit::Undefined(word)),
+            }
+            Step::Next
+        }
         Insn::Clrex => {
             cpu.excl_addr = u64::MAX;
             Step::Next
@@ -274,30 +284,15 @@ fn step<E: Env>(cpu: &mut CpuState, env: &mut E, insn: Insn, word: u32) -> Step 
             Step::Next
         }
         Insn::SetfFlags { sz, rn } => {
+            // SETF8/SETF16: N = reg<size-1>, Z = (reg<size-1:0> == 0),
+            // V = reg<size> XOR reg<size-1>, C unchanged.
             let v = cpu.xr(rn);
             let bits = if sz == 0 { 8 } else { 16 };
-            let val = v & ((1u64 << bits) - 1);
-            let n = (val >> (bits - 1)) & 1 != 0;
-            let z = val == 0;
-            // V = (sign-extended value) overflowed the N-bit range? SETF sets
-            // N,Z from the low bits and V from bit N vs bit N-1 difference.
-            let sext = ((val << (64 - bits)) as i64) >> (64 - bits);
-            let (_, c, _) = (0, get_nzcv(cpu).2, 0);
-            let v_flag = sext != (val as i64 & ((1i64 << bits) - 1));
-            let _ = v_flag;
-            // Per spec: V = value<N> != value<N-1> after sign handling; use the
-            // simpler definition: overflow if the sign-extension changed bits.
-            let overflow = {
-                let top = (val >> (bits - 1)) & 1;
-                let above = val >> bits; // always 0 since masked
-                let _ = above;
-                // V indicates the Nth bit differs from sign of the N-bit value
-                // vs the full register; for SETF the input is only N bits, so
-                // use bit N (which is 0) xor bit N-1.
-                top != 0 && false
-            };
-            let _ = overflow;
-            set_nzcv(cpu, n, z, c, sext < -(1i64 << (bits - 1)) || sext >= (1i64 << (bits - 1)));
+            let n = (v >> (bits - 1)) & 1 != 0;
+            let z = v & ((1u64 << bits) - 1) == 0;
+            let vf = ((v >> bits) ^ (v >> (bits - 1))) & 1 != 0;
+            let c = get_nzcv(cpu).2;
+            set_nzcv(cpu, n, z, c, vf);
             Step::Next
         }
         Insn::CondCmp { sf, sub, reg, rn, imm_or_rm, nzcv, cond } => {
@@ -751,7 +746,6 @@ fn read_sysreg<E: Env>(cpu: &CpuState, env: &mut E, enc: u32) -> Option<u64> {
         _ if enc == e(3, 3, 4, 4, 1) => cpu.fpsr as u64,
         _ if enc == e(3, 3, 14, 0, 2) => env.cntvct(), // CNTVCT_EL0
         _ if enc == e(3, 3, 14, 0, 0) => env.cntfrq(),  // CNTFRQ_EL0
-        _ if enc == e(3, 3, 14, 0, 1) => 0,             // CNTPCT handled as 0? use vct
         _ if enc == e(3, 3, 14, 0, 5) => env.cntvct(),  // CNTVCTSS_EL0
         _ if enc == e(3, 3, 0, 0, 1) => sysregs::CTR_EL0,
         _ if enc == e(3, 3, 0, 0, 7) => sysregs::DCZID_EL0,
@@ -771,6 +765,9 @@ fn read_sysreg<E: Env>(cpu: &CpuState, env: &mut E, enc: u32) -> Option<u64> {
         _ if enc == e(3, 0, 0, 7, 0) => sysregs::ID_AA64MMFR0_EL1,
         _ if enc == e(3, 0, 0, 7, 1) => sysregs::ID_AA64MMFR1_EL1,
         _ if enc == e(3, 0, 0, 7, 2) => sysregs::ID_AA64MMFR2_EL1,
+        // Linux emulates every other ID register in op0=3, op1=0, CRn=0,
+        // CRm=2..7 as RAZ (reserved, untracked or AArch32 ID registers).
+        _ if enc >> 7 == (3 << 7) && (2..=7).contains(&((enc >> 3) & 15)) => 0,
         // RNDR / RNDRRS: op0=3,op1=3,crn=2,crm=4,op2=0/1
         _ if enc == e(3, 3, 2, 4, 0) || enc == e(3, 3, 2, 4, 1) => {
             // handled specially by caller for NZCV; here return value or 0.

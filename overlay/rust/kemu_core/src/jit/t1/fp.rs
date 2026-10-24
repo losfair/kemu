@@ -90,6 +90,8 @@ impl<'s, 'b> Gen<'s, 'b> {
 
     /// Emit `jmp done; slow: <helper>; done:` given slow-path branches.
     fn slow_paths(&mut self, slow: &[usize]) {
+        // The fast path has committed: from here on the instruction is done.
+        self.point(kind::DONE, FLAGS_MEM, 0);
         let done = self.a.jmp(None);
         for s in slow {
             self.a.bind32(*s);
@@ -100,6 +102,7 @@ impl<'s, 'b> Gen<'s, 'b> {
         self.helper();
         self.a.bind32(done);
         self.fl = Flags { host: false, inv: false, mem: true };
+        self.point(kind::DONE, FLAGS_MEM, 0);
     }
 
     /// Ensure the guest flags are in memory before an FP fast path whose
@@ -542,6 +545,89 @@ impl<'s, 'b> Gen<'s, 'b> {
                 self.st_vec(q, X14, rd);
                 true
             }
+            SimdOp::Mul | SimdOp::Mla | SimdOp::Mls if size == 1 || size == 2 => {
+                self.ld_vec(X14, rn);
+                if size == 1 {
+                    self.a.vex(1, PP_66, false, false, 0xd5, X14, X14, Rm::M(Mem::gs(voff(rm)))); // vpmullw
+                } else {
+                    self.a.vex(2, PP_66, false, false, 0x40, X14, X14, Rm::M(Mem::gs(voff(rm)))); // vpmulld
+                }
+                if op != SimdOp::Mul {
+                    self.ld_vec(X15, rd);
+                    let (add, sub) = if size == 1 { (0xfd, 0xf9) } else { (0xfe, 0xfa) };
+                    self.a.vex(1, PP_66, false, false, if op == SimdOp::Mla { add } else { sub }, X15, X15, Rm::R(X14));
+                    self.st_vec(q, X15, rd);
+                } else {
+                    self.st_vec(q, X14, rd);
+                }
+                true
+            }
+            SimdOp::AddP if size >= 1 => {
+                self.ld_vec(X14, rn);
+                self.ld_vec(X15, rm);
+                match (size, q) {
+                    (3, true) => {
+                        // [n0+n1, m0+m1]
+                        self.a.vex(1, PP_66, false, false, 0x6c, X13, X14, Rm::R(X15)); // (n0, m0)
+                        self.a.vex(1, PP_66, false, false, 0x6d, X14, X14, Rm::R(X15)); // (n1, m1)
+                        self.a.vex(1, PP_66, false, false, 0xd4, X14, X14, Rm::R(X13));
+                    }
+                    (3, false) => return false,
+                    (_, true) => {
+                        let o = if size == 1 { 0x01 } else { 0x02 }; // vphaddw / vphaddd
+                        self.a.vex(2, PP_66, false, false, o, X14, X14, Rm::R(X15));
+                    }
+                    (_, false) => {
+                        let o = if size == 1 { 0x01 } else { 0x02 };
+                        self.a.vex(1, PP_66, false, false, 0x6c, X14, X14, Rm::R(X15)); // n_lo : m_lo
+                        self.a.vex(2, PP_66, false, false, o, X14, X14, Rm::R(X14));
+                    }
+                }
+                self.st_vec(q, X14, rd);
+                true
+            }
+            SimdOp::SAddW | SimdOp::SAddW2 | SimdOp::UAddW | SimdOp::UAddW2 | SimdOp::SSubW | SimdOp::SSubW2
+            | SimdOp::USubW | SimdOp::USubW2
+                if size <= 2 =>
+            {
+                let signed = matches!(op, SimdOp::SAddW | SimdOp::SAddW2 | SimdOp::SSubW | SimdOp::SSubW2);
+                let hi = matches!(op, SimdOp::SAddW2 | SimdOp::UAddW2 | SimdOp::SSubW2 | SimdOp::USubW2);
+                let sub = matches!(op, SimdOp::SSubW | SimdOp::SSubW2 | SimdOp::USubW | SimdOp::USubW2);
+                self.widen(X15, rm, size, signed, hi);
+                self.ld_vec(X14, rn);
+                let o = if sub { [0xf9u8, 0xfa, 0xfb][size as usize] } else { [0xfdu8, 0xfe, 0xd4][size as usize] };
+                self.a.vex(1, PP_66, false, false, o, X14, X14, Rm::R(X15));
+                self.st_vec(true, X14, rd);
+                true
+            }
+            SimdOp::SMullL | SimdOp::SMullL2 | SimdOp::UMullL | SimdOp::UMullL2 | SimdOp::SMlaL | SimdOp::SMlaL2
+            | SimdOp::UMlaL | SimdOp::UMlaL2
+                if size <= 2 =>
+            {
+                let signed = matches!(op, SimdOp::SMullL | SimdOp::SMullL2 | SimdOp::SMlaL | SimdOp::SMlaL2);
+                let hi = matches!(op, SimdOp::SMullL2 | SimdOp::UMullL2 | SimdOp::SMlaL2 | SimdOp::UMlaL2);
+                let acc = matches!(op, SimdOp::SMlaL | SimdOp::SMlaL2 | SimdOp::UMlaL | SimdOp::UMlaL2);
+                self.widen(X14, rn, size, signed, hi);
+                self.widen(X15, rm, size, signed, hi);
+                match size {
+                    0 => self.a.vex(1, PP_66, false, false, 0xd5, X14, X14, Rm::R(X15)), // vpmullw
+                    1 => self.a.vex(2, PP_66, false, false, 0x40, X14, X14, Rm::R(X15)), // vpmulld
+                    _ => {
+                        if signed {
+                            self.a.vex(2, PP_66, false, false, 0x28, X14, X14, Rm::R(X15)) // vpmuldq
+                        } else {
+                            self.a.vex(1, PP_66, false, false, 0xf4, X14, X14, Rm::R(X15)) // vpmuludq
+                        }
+                    }
+                }
+                if acc {
+                    self.ld_vec(X15, rd);
+                    let o = [0xfdu8, 0xfe, 0xd4][size as usize];
+                    self.a.vex(1, PP_66, false, false, o, X14, X14, Rm::R(X15));
+                }
+                self.st_vec(true, X14, rd);
+                true
+            }
             SimdOp::FAdd | SimdOp::FSub | SimdOp::FMul | SimdOp::FDiv if size >= 2 => {
                 let double = size == 3;
                 if double && !q {
@@ -584,6 +670,34 @@ impl<'s, 'b> Gen<'s, 'b> {
             }
             _ => false,
         }
+    }
+
+    /// x = sign/zero-extended lower (or upper) half of V[n] to double width.
+    fn widen(&mut self, x: u8, n: u32, size: u8, signed: bool, hi: bool) {
+        let m = Mem::gs(voff(n) + if hi { 8 } else { 0 });
+        // vpmovsx{bw,wd,dq} 0F38 20/23/25 ; vpmovzx 30/33/35 (64-bit memory operand)
+        let o = [0x20u8, 0x23, 0x25][(size & 3).min(2) as usize] + if signed { 0 } else { 0x10 };
+        self.a.vex(2, PP_66, false, false, o, x, 0, Rm::M(m));
+    }
+
+    pub(super) fn simd_permute(&mut self, q: bool, size: u8, opcode: u8, rd: u32, rn: u32, rm: u32) -> bool {
+        self.ld_vec(X14, rn);
+        self.ld_vec(X15, rm);
+        let op = opcode & 7;
+        match (size, q, op) {
+            // UZP1/UZP2 .4S
+            (2, true, 0b001) => self.a.vex_ib(1, PP_NONE, false, false, 0xc6, X14, X14, Rm::R(X15), 0x88),
+            (2, true, 0b101) => self.a.vex_ib(1, PP_NONE, false, false, 0xc6, X14, X14, Rm::R(X15), 0xdd),
+            // ZIP1/ZIP2 .4S, ZIP1 .2S
+            (2, _, 0b011) => self.a.vex(1, PP_66, false, false, 0x62, X14, X14, Rm::R(X15)),
+            (2, true, 0b111) => self.a.vex(1, PP_66, false, false, 0x6a, X14, X14, Rm::R(X15)),
+            // .2D: UZP1 = ZIP1 = (n0, m0); UZP2 = ZIP2 = (n1, m1)
+            (3, true, 0b001) | (3, true, 0b011) => self.a.vex(1, PP_66, false, false, 0x6c, X14, X14, Rm::R(X15)),
+            (3, true, 0b101) | (3, true, 0b111) => self.a.vex(1, PP_66, false, false, 0x6d, X14, X14, Rm::R(X15)),
+            _ => return false,
+        }
+        self.st_vec(q, X14, rd);
+        true
     }
 
     /// x = pairwise op of adjacent bytes as 16-bit words (low byte), using
@@ -819,6 +933,43 @@ impl<'s, 'b> Gen<'s, 'b> {
         if single {
             return false;
         }
+        self.simd_ldst_multi(load, q, opcode, rt, rn, rm, post)
+    }
+
+    /// LD1R (replicate one element to all lanes).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn simd_ld1r(&mut self, q: bool, size: u8, rt: u32, rn: u32, rm: u32, post: bool) -> bool {
+        if size > 3 {
+            return false;
+        }
+        let base = self.base(rn);
+        let opc = [0x78u8, 0x79, 0x58, 0x59][size as usize];
+        self.a.vex(2, PP_66, false, false, opc, X14, 0, Rm::M(Mem::b(base)));
+        self.st_vec(q, X14, rt);
+        if post {
+            self.post_index(rn, base, rm, 1i64 << size);
+        }
+        true
+    }
+
+    fn post_index(&mut self, rn: u32, base: Reg, rm: u32, imm: i64) {
+        if rm == 31 {
+            self.writeback(rn, base, imm);
+        } else {
+            let m = self.get(rm, false, RAX);
+            match self.gp(rn, true) {
+                Gp::R(r) => self.a.lea(Sz::Q, r, Mem::bisd(r, m, 0, 0)),
+                Gp::M(o) => {
+                    self.a.lea(Sz::Q, base, Mem::bisd(base, m, 0, 0));
+                    self.a.store(Sz::Q, Mem::gs(o), base);
+                }
+                Gp::Zero => {}
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn simd_ldst_multi(&mut self, load: bool, q: bool, opcode: u8, rt: u32, rn: u32, rm: u32, post: bool) -> bool {
         let nregs = match opcode {
             0b0111 => 1,
             0b1010 => 2,

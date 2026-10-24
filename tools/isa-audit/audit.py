@@ -224,6 +224,9 @@ def main():
         d = dec[w]
         is_undef = d == "Undefined"
         stats[st] += 1
+        if st == "OK" and any((w & encs[i]["sbmask"]) != encs[i]["sbvalue"] for i in ms):
+            st = "SBO"  # should-be-one/zero violated: CONSTRAINED UNPREDICTABLE
+            stats["SBO"] += 1
         if st == "OK":
             names = ",".join(sorted({encs[i]["name"] for i in ms}))
             for i in ms:
@@ -237,9 +240,11 @@ def main():
                 names = ",".join(sorted({encs[i]["name"] for i in ms})) or "<unallocated>"
                 mism[names].append((w, "spec %s, kemu decodes" % st, d))
         elif st == "NOP":
-            if d != "Nop":
+            if d not in ("Nop", "Prfm"):
                 names = ",".join(sorted({encs[i]["name"] for i in ms}))
                 mism[names].append((w, "spec NOP, kemu", d))
+        elif st == "SBO":
+            pass
         elif st == "SYSTEM":
             sysw.append((w, encs[sp]["name"], d))
         else:

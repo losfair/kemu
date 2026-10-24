@@ -104,9 +104,11 @@ def main():
             continue
         # Operation (execute) pseudocode for the whole file.
         execute = ""
+        postdecode = ""
         for ps in root.iter("ps"):
             if ps.get("secttype") == "Operation":
                 execute += pstext(ps, "Execute") + "\n"
+            postdecode += pstext(ps, "Postdecode") + "\n"
         for ic in root.iter("iclass"):
             diag = ic.find("regdiagram")
             if diag is None or diag.get("form") != "32":
@@ -121,6 +123,7 @@ def main():
             decode = ""
             for ps in ic.iter("ps"):
                 decode += pstext(ps, "Decode") + "\n"
+            decode += postdecode
             for enc in ic.findall("encoding"):
                 m, v = m0, v0
                 em, ev, _, _, efields, econs = parse_boxes(enc)

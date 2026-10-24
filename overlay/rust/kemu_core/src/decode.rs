@@ -489,6 +489,13 @@ pub enum AcrossOp {
     FMinV,
     FMaxNmV,
     FMinNmV,
+    /// Scalar pairwise ops (two elements of Vn; `size` is the element size).
+    AddP,
+    FAddP,
+    FMaxP,
+    FMinP,
+    FMaxNmP,
+    FMinNmP,
 }
 
 /// The decoded instruction.
@@ -809,7 +816,7 @@ pub fn adv_simd_expand_imm(op: u8, cmode: u8, imm8: u64) -> (u64, bool) {
                     let cdefgh = imm8 & 0x3f;
                     let mut v = a << 31;
                     v |= notb << 30;
-                    v |= (if b == 1 { 0u64 } else { 0x1f }) << 25;
+                    v |= (if b == 1 { 0x1fu64 } else { 0 }) << 25;
                     v |= cdefgh << 19;
                     (rep(v, 32), true)
                 }
@@ -833,7 +840,7 @@ pub fn adv_simd_expand_imm(op: u8, cmode: u8, imm8: u64) -> (u64, bool) {
                     let cdefgh = imm8 & 0x3f;
                     let mut v = a << 63;
                     v |= notb << 62;
-                    v |= (if b == 1 { 0u64 } else { 0x1ff }) << 54;
+                    v |= (if b == 1 { 0xffu64 } else { 0 }) << 54;
                     v |= cdefgh << 48;
                     (v, true)
                 }
@@ -946,7 +953,7 @@ fn decode_dp_imm(x: u32) -> Insn {
             let n = bits(x, 22, 22);
             let immr = bits(x, 21, 16);
             let imms = bits(x, 15, 10);
-            if n != (sf as u32) || opc == 3 {
+            if n != (sf as u32) || opc == 3 || (!sf && (immr | imms) & 0x20 != 0) {
                 return Insn::Undefined;
             }
             let op = match opc {
@@ -1027,90 +1034,80 @@ fn decode_sys(x: u32) -> Insn {
     if bits(x, 31, 24) == 0b1101_0100 {
         let opc = bits(x, 23, 21);
         let imm16 = bits(x, 20, 5) as u16;
-        let op2 = bits(x, 4, 2);
-        let ll = bits(x, 1, 0);
-        if op2 != 0 {
+        if bits(x, 4, 2) != 0 {
             return Insn::Undefined;
         }
-        return match (opc, ll) {
+        return match (opc, bits(x, 1, 0)) {
             (0b000, 0b01) => Insn::Svc { imm: imm16 },
-            (0b000, 0b10) => Insn::Undefined, // HVC
-            (0b000, 0b11) => Insn::Undefined, // SMC
             (0b001, 0b00) => Insn::Brk { imm: imm16 },
             (0b010, 0b00) => Insn::Hlt { imm: imm16 },
+            // HVC, SMC, DCPS1-3 are UNDEFINED at EL0.
             _ => Insn::Undefined,
         };
     }
-    // System / hints / barriers (op0=110 1010 0100... )
+    // System instructions: 1101 0101 00 L op0 op1 CRn CRm op2 Rt. (Bit 22
+    // set is the 128-bit SYSP/MRRS/MSRR space, FEAT_SYSREG128.)
+    if bits(x, 31, 22) != 0b1101_0101_00 {
+        return Insn::Undefined;
+    }
     let l = bit(x, 21);
-    let op0f = bits(x, 20, 19);
-    let op1f = bits(x, 18, 16);
+    let op0 = bits(x, 20, 19);
+    let op1 = bits(x, 18, 16);
     let crn = bits(x, 15, 12);
     let crm = bits(x, 11, 8);
-    let op2f = bits(x, 7, 5);
+    let op2 = bits(x, 7, 5);
     let rt = bits(x, 4, 0);
-    // MSR (immediate) to PSTATE
-    if !l && op0f == 0b00 && op1f & 0b100 == 0 && crn == 0b0100 {
-        // op1 is actually 3 bits here combined; treat as PSTATE write (NOP-ish)
-        return Insn::MsrImm { op: op2f, crm };
-    }
-    if bits(x, 31, 12) == 0b1101_0101_0000_0011_0010 {
-        // HINT / barriers region: crn==0011 handled; here crn==0010 hints
-    }
-    // Hints: 1101 0101 0000 0011 0010 CRm op2 11111
-    if bits(x, 31, 22) == 0b1101_0101_00 && crn == 0b0010 && rt == 0b11111 && !l && op0f == 0 && op1f == 0b011 {
-        // NOP, YIELD, WFE, WFI, SEV, SEVL, ESB, CSDB, and hint space (pac/bti)
-        return Insn::Nop;
-    }
-    // Barriers: crn==0011
-    if crn == 0b0011 && op0f == 0 && op1f == 0b011 && rt == 0b11111 && !l {
-        return match op2f {
-            0b010 => Insn::Clrex,
-            0b100 => Insn::Dsb,
-            0b101 => Insn::Dmb,
-            0b110 => Insn::Isb,
-            0b111 => Insn::Sb,
-            0b001 => Insn::Nop, // SSBB/PSSBB (DSB variants)
-            0b000 => Insn::Nop,
-            _ => Insn::Nop,
-        };
-    }
-    // DC/IC (sys with L==0) and MRS/MSR register
-    // System instructions: op0f (bits 20:19) == 01 -> SYS/SYSL
-    let sysop0 = bits(x, 20, 19);
-    if sysop0 == 0b01 {
-        // SYS / SYSL
-        let op1 = bits(x, 18, 16);
-        if !l {
-            // SYS: DC/IC
-            if crn == 0b0111 {
-                // DC: crm/op2 select the operation
-                if op1 == 0b011 && crm == 0b0100 && op2f == 0b001 {
-                    return Insn::DcZva { rt };
+    match (l, op0) {
+        (false, 0b00) => {
+            if crn == 0b0100 {
+                // MSR (immediate). At EL0 (SCTLR_EL1.UMA == 0, no DIT/SSBS/
+                // MTE/SME) only the FLAGM forms CFINV/XAFLAG/AXFLAG execute.
+                if rt == 0b11111 && op1 == 0 && crm == 0 && op2 <= 2 {
+                    return Insn::MsrImm { op: op2, crm };
                 }
-                if crn == 0b0111 && crm == 0b0101 && op2f == 0b001 {
-                    return Insn::IcIvau { rt };
-                }
-                // Other DC/IC: NOP for us (clean/invalidate to PoC etc.)
-                return Insn::CacheNop;
+                return Insn::Undefined;
             }
-            return Insn::CacheNop;
-        } else {
-            // SYSL -> read; treat unsupported as Undefined
-            return Insn::Undefined;
+            if op1 != 0b011 || rt != 0b11111 {
+                return Insn::Undefined; // includes WFET/WFIT (FEAT_WFxT)
+            }
+            match crn {
+                // HINT space: NOP, YIELD, WFE, WFI, SEV(L), PAC*/AUT*/BTI
+                // (not implemented: NOP), ESB, CSDB, ...
+                0b0010 => Insn::Nop,
+                0b0011 => match op2 {
+                    0b010 => Insn::Clrex,
+                    0b100 => Insn::Dsb, // includes SSBB / PSSBB
+                    0b101 => Insn::Dmb,
+                    0b110 => Insn::Isb,
+                    0b111 if crm == 0 => Insn::Sb,
+                    _ => Insn::Undefined, // DSB nXS (FEAT_XS), TME
+                },
+                _ => Insn::Undefined,
+            }
         }
-    }
-    // MRS/MSR (register): op0f bits 20:19 == 10 or 11
-    if sysop0 == 0b10 || sysop0 == 0b11 {
-        let o0 = if sysop0 == 0b11 { 3 } else { 2 };
-        let enc = (o0 << 14) | (op1f << 11) | (crn << 7) | (crm << 3) | op2f;
-        if l {
-            return Insn::Mrs { rt, enc };
-        } else {
-            return Insn::MsrReg { rt, enc };
+        (false, 0b01) => {
+            // SYS: only the cache maintenance operations Linux allows at EL0.
+            if op1 != 0b011 || crn != 0b0111 || op2 != 0b001 {
+                return Insn::Undefined;
+            }
+            match crm {
+                0b0100 => Insn::DcZva { rt },
+                0b0101 => Insn::IcIvau { rt },
+                // DC CVAC, CVAU, CVAP (DPB), CVADP (DPB2), CIVAC
+                0b1010 | 0b1011 | 0b1100 | 0b1101 | 0b1110 => Insn::CacheNop,
+                _ => Insn::Undefined,
+            }
         }
+        (_, 0b10) | (_, 0b11) => {
+            let enc = (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2;
+            if l {
+                Insn::Mrs { rt, enc }
+            } else {
+                Insn::MsrReg { rt, enc }
+            }
+        }
+        _ => Insn::Undefined, // SYSL, and L=1 op0=00
     }
-    Insn::Undefined
 }
 
 fn decode_br_reg(x: u32) -> Insn {
@@ -1187,5 +1184,42 @@ mod tests {
         assert_eq!(decode(0xd503201f), Insn::Nop);
         assert_eq!(decode(0xd4000001), Insn::Svc { imm: 0 });
         assert_eq!(decode(0xd65f03c0), Insn::Ret { rn: 30 });
+    }
+
+    #[test]
+    fn spec_audit_regressions() {
+        // Encodings that must be UNDEFINED for the advertised CPU (found by
+        // the tools/isa-audit sweep against the Arm A64 ISA XML).
+        let undef: [u32; 14] = [
+            0xf82007c3, // LDRAA (PAuth): used to decode as LDADD
+            0x88c04c6e, // LDLAR (FEAT_LOR)
+            0x0821fc61, // CASP with odd Rs
+            0xd50340df, // MSR DAIFSet, #0 at EL0 (UMA == 0)
+            0xd508871f, // TLBI (SYS) at EL0
+            0x1ee22820, // FADD Hd, Hn, Hm (FEAT_FP16)
+            0x13200400, // SBFM (32-bit) with immr<5> == 1
+            0x9ac04800, // CRC32W with sf == 1
+            0x1ac05c00, // CRC32CX with sf == 0
+            0x1b200000, // SMADDL with sf == 0
+            0x0ee08400, // ADD .1D (size:Q == 110)
+            0x4ee09c00, // MUL .2D
+            0x2ea05800, // RBIT with size == 10
+            0xd5032005, // HINT space with Rt != 31
+        ];
+        for w in undef {
+            assert_eq!(decode(w), Insn::Undefined, "{:08x}", w);
+        }
+        // Encodings that must decode.
+        assert!(matches!(decode(0x1e2e1000), Insn::FpImm { ftype: 0, imm8: 0x70, .. }));
+        assert!(matches!(decode(0x4ea18820), Insn::SimdMisc { op: Simd2Op::FrintP, size: 2, .. }));
+        assert!(matches!(decode(0x5ef1b9ef), Insn::SimdAcross { op: AcrossOp::AddP, .. }));
+        assert!(matches!(decode(0x7f580798), Insn::SimdShift { .. })); // USHR d24, d28, #40
+        assert!(matches!(decode(0xba020422), Insn::Rmif { rn: 1, lsb: 4, mask: 2 }));
+        assert!(matches!(decode(0x3a00082d), Insn::SetfFlags { sz: 0, rn: 1 }));
+        assert!(matches!(decode(0xd500401f), Insn::MsrImm { op: 0, .. })); // CFINV
+        assert!(matches!(decode(0x9eae0020), Insn::FpCvt { op: FcvtOp::Fmov { to_fp: false, top: true }, .. }));
+        assert!(matches!(decode(0x19404041), Insn::LdSt { load: true, order: Order::AcqPc, .. })); // LDAPURB
+        assert!(matches!(decode(0xd503233f), Insn::Nop)); // PACIASP
+        assert!(matches!(decode(0xd50b7a20), Insn::CacheNop)); // DC CVAC
     }
 }

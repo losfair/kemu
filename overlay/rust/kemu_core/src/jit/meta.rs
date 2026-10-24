@@ -53,6 +53,9 @@ pub mod kind {
     /// candidates in the state page, 2 remapped (candidates in the victims'
     /// host registers, victims in the page).
     pub const REMAP: u8 = 7;
+    /// STXR performed its compare-exchange: finish by writing the status
+    /// (ZF ? 0 : 1) to guest register `a`; continue at the next insn.
+    pub const ROLL_STATUS: u8 = 8;
 }
 
 /// Flag locations for `kind::INSN` points.
@@ -362,6 +365,15 @@ pub fn recover(blk: &[u8], host_off: u32, h: &HostRegs, st: &mut CpuState) -> bo
         kind::DONE => {
             st.pc = pc_of(p.idx.wrapping_add(1));
             flags_from(st, p.a);
+        }
+        kind::ROLL_STATUS => {
+            let zf = (h.rflags >> 6) & 1 != 0;
+            if p.a != 31 {
+                set_guest(st, p.a as u32, if zf { 0 } else { 1 });
+            }
+            st.excl_addr = u64::MAX;
+            st.pc = pc_of(p.idx.wrapping_add(1));
+            st.nzcv = regmap::nzcv_from_image(st.flags_x86);
         }
         kind::EXIT_RAX => {
             st.pc = h.gpr[0];

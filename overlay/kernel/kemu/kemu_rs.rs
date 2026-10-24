@@ -500,3 +500,15 @@ pub extern "C" fn kemu_rs_mxcsr_from(fpcr: u32, fpsr: u32) -> u32 {
 pub extern "C" fn kemu_rs_fpsr_merge(fpsr: u32, mxcsr: u32) -> u32 {
     regmap::fpsr_merge(fpsr, mxcsr)
 }
+
+/// Fill the CRC-32 table used by translated CRC32* instructions.
+///
+/// # Safety
+/// `out` must point to 256 writable u32.
+#[no_mangle]
+pub unsafe extern "C" fn kemu_rs_crc_table(out: *mut u32) {
+    let t = regmap::crc32_table();
+    // SAFETY: guaranteed by the caller.
+    let o = unsafe { core::slice::from_raw_parts_mut(out, 256) };
+    o.copy_from_slice(&t);
+}

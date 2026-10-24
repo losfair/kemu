@@ -27,11 +27,16 @@ pub struct Arch {
     pub fpcr: u32,
     pub fpsr: u32,
     pub v: [[u64; 2]; 32],
+    /// First MEMCMP bytes of the scratch buffer after the instruction.
+    pub mem: [u8; MEMCMP],
 }
+
+/// Bytes of scratch memory compared after each case (x2 = scratch + 64).
+const MEMCMP: usize = 512;
 
 impl Arch {
     fn zeroed() -> Self {
-        Arch { x: [0; 31], sp: 0, nzcv: 0, fpcr: 0, fpsr: 0, v: [[0; 2]; 32] }
+        Arch { x: [0; 31], sp: 0, nzcv: 0, fpcr: 0, fpsr: 0, v: [[0; 2]; 32], mem: [0; MEMCMP] }
     }
 }
 
@@ -85,8 +90,19 @@ impl Env for Mem {
         self.data[i..i + 8].copy_from_slice(&v.to_le_bytes());
         Ok(())
     }
-    fn cmpxchg(&mut self, _a: u64, _s: u32, _e: [u64; 2], _n: [u64; 2]) -> Result<[u64; 2], Fault> {
-        Ok([0, 0])
+    fn cmpxchg(&mut self, a: u64, s: u32, e: [u64; 2], n: [u64; 2]) -> Result<[u64; 2], Fault> {
+        let i = self.off(a).ok_or(fault(a, Access::Write))?;
+        let s = s as usize;
+        let mut cur = [0u8; 16];
+        cur[..s].copy_from_slice(&self.data[i..i + s]);
+        let old = [u64::from_le_bytes(cur[..8].try_into().unwrap()), u64::from_le_bytes(cur[8..].try_into().unwrap())];
+        if old == e {
+            let mut nb = [0u8; 16];
+            nb[..8].copy_from_slice(&n[0].to_le_bytes());
+            nb[8..].copy_from_slice(&n[1].to_le_bytes());
+            self.data[i..i + s].copy_from_slice(&nb[..s]);
+        }
+        Ok(old)
     }
     fn cntvct(&mut self) -> u64 {
         0
@@ -169,6 +185,8 @@ fn run_interp(a: &Arch, word: u32) -> (Arch, Option<Exit>) {
     }
     let mut env = One { word, mem: Mem { base: SCRATCH, data: memdata } };
     let (exit, _n) = interp::run(&mut cpu, &mut env, 1);
+    let mut memout = [0u8; MEMCMP];
+    memout.copy_from_slice(&env.mem.data[..MEMCMP]);
     let out = Arch {
         x: cpu.x,
         sp: cpu.sp,
@@ -176,6 +194,7 @@ fn run_interp(a: &Arch, word: u32) -> (Arch, Option<Exit>) {
         fpcr: cpu.fpcr,
         fpsr: cpu.fpsr,
         v: cpu.v,
+        mem: memout,
     };
     let abn = match exit {
         Exit::Undefined(_) | Exit::Fault(_) | Exit::Brk(_) => Some(exit),
@@ -383,8 +402,12 @@ fn compare(q: &Arch, i: &Arch) -> Option<String> {
     if q.nzcv & 0xf000_0000 != i.nzcv & 0xf000_0000 {
         return Some(format!("nzcv: qemu={:#x} interp={:#x}", q.nzcv, i.nzcv));
     }
-    if q.fpsr & 0x9f != i.fpsr & 0x9f {
-        return Some(format!("fpsr: qemu={:#x} interp={:#x}", q.fpsr & 0x9f, i.fpsr & 0x9f));
+    if q.fpsr & 0x0800_009f != i.fpsr & 0x0800_009f {
+        return Some(format!("fpsr: qemu={:#x} interp={:#x}", q.fpsr & 0x0800_009f, i.fpsr & 0x0800_009f));
+    }
+    if q.mem != i.mem {
+        let k = (0..MEMCMP).find(|&k| q.mem[k] != i.mem[k]).unwrap_or(0);
+        return Some(format!("mem[scratch+{k}]: qemu={:#04x} interp={:#04x}", q.mem[k], i.mem[k]));
     }
     for r in 0..32 {
         if q.v[r] != i.v[r] {
@@ -451,7 +474,7 @@ fn run_qemu_raw(cases: &[(Arch, u32)]) -> Result<(Vec<u8>, Option<i32>), String>
     std::fs::write(&asm_path, asm).map_err(|e| e.to_string())?;
 
     let st = Command::new("aarch64-linux-gnu-gcc")
-        .args(["-nostdlib", "-static", "-o"])
+        .args(["-nostdlib", "-static", "-Wl,-Tbss=0x40000000", "-o"])
         .arg(&bin_path)
         .arg(&asm_path)
         .output()
@@ -469,7 +492,7 @@ fn run_qemu_raw(cases: &[(Arch, u32)]) -> Result<(Vec<u8>, Option<i32>), String>
     Ok((out.stdout, sig))
 }
 
-const REC_BYTES: usize = (31 + 1 + 1 + 1) * 8 + 32 * 16 + 8; // x0..30,sp,nzcv,fpsr + V + marker
+const REC_BYTES: usize = (31 + 1 + 1 + 1) * 8 + 32 * 16 + 8 + MEMCMP; // x0..30,sp,nzcv,fpsr + V + marker + mem
 
 fn parse_dump(bytes: &[u8], n: usize) -> Result<Vec<QResult>, String> {
     let mut out = Vec::with_capacity(n);
@@ -495,6 +518,7 @@ fn parse_dump(bytes: &[u8], n: usize) -> Result<Vec<QResult>, String> {
         for r in 0..32 {
             a.v[r] = [g(34 + r * 2), g(34 + r * 2 + 1)];
         }
+        a.mem.copy_from_slice(&rec[792..792 + MEMCMP]);
         out.push(QResult::State(a));
     }
     Ok(out)
@@ -514,6 +538,10 @@ fn emit_asm(cases: &[(Arch, u32)]) -> String {
     s.push_str("  adrp x10, scratch_init\n  add x10, x10, :lo12:scratch_init\n");
     s.push_str("  mov x11, #0\n1:\n  ldr x12, [x10, x11]\n  str x12, [x9, x11]\n  add x11, x11, #8\n  cmp x11, #4096\n  b.lo 1b\n");
     for (idx, (_, w)) in cases.iter().enumerate() {
+        // --- reset scratch memory (each case starts from the same image) ---
+        s.push_str("  adrp x9, scratch\n  add x9, x9, :lo12:scratch\n");
+        s.push_str("  adrp x10, scratch_init\n  add x10, x10, :lo12:scratch_init\n");
+        s.push_str(&format!("  mov x11, #0\nrs_{idx}:\n  ldr x12, [x10, x11]\n  str x12, [x9, x11]\n  add x11, x11, #8\n  cmp x11, #4096\n  b.lo rs_{idx}\n"));
         // --- load state ---
         s.push_str(&format!("  adrp x0, in_{idx}\n  add x0, x0, :lo12:in_{idx}\n"));
         s.push_str("  ldr x1, [x0, #256]\n  msr nzcv, x1\n");
@@ -546,6 +574,9 @@ fn emit_asm(cases: &[(Arch, u32)]) -> String {
             s.push_str(&format!("  str q{r}, [x1, #{}]\n", 272 + r * 16));
         }
         s.push_str(&format!("  str xzr, [x1, #{}]\n", 272 + 32 * 16));
+        // copy the first MEMCMP bytes of scratch into the record
+        s.push_str("  adrp x9, scratch\n  add x9, x9, :lo12:scratch\n  add x10, x1, #792\n");
+        s.push_str(&format!("  mov x11, #0\nmd_{idx}:\n  ldr x12, [x9, x11]\n  str x12, [x10, x11]\n  add x11, x11, #8\n  cmp x11, #{MEMCMP}\n  b.lo md_{idx}\n"));
         // write(1, outbuf, REC_BYTES)
         s.push_str("  mov x0, #1\n");
         s.push_str(&format!("  movz x2, #{}\n", REC_BYTES));

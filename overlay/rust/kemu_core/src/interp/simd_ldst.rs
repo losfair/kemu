@@ -2,7 +2,7 @@
 // Advanced SIMD structure loads/stores (LD1-4/ST1-4). Included by simd.rs.
 
 fn ldst_struct<E: Env>(cpu: &mut CpuState, env: &mut E, insn: Insn) -> Step {
-    if let Insn::SimdLdSt { load, q, size, opcode: _, rt, rn, rm, single, index, replicate, selem, post } = insn {
+    if let Insn::SimdLdSt { load, q, size, opcode, rt, rn, rm, single, index, replicate, selem, post } = insn {
         let base = cpu.xsp(rn);
         let mut addr = base;
         let esize = size;
@@ -12,9 +12,18 @@ fn ldst_struct<E: Env>(cpu: &mut CpuState, env: &mut E, insn: Insn) -> Step {
         if !single {
             // Multiple structures: `selem` consecutive registers, full vectors.
             let lanes = vbytes(q) >> esize;
+            // LD1/ST1 with 2-4 registers: rpt registers, one element each
+            // (no interleave); LD2-4/ST2-4: rpt=1, selem interleaved.
+            let (rpt, selem) = match opcode {
+                0b0010 => (4u32, 1u32),
+                0b0110 => (3, 1),
+                0b1010 => (2, 1),
+                _ => (1, selem as u32),
+            };
+            for r in 0..rpt {
             for i in 0..lanes {
-                for s in 0..selem as u32 {
-                    let reg = (rt + s) & 31;
+                for s in 0..selem {
+                    let reg = (rt + r + s) & 31;
                     if load {
                         let v = match load_elem(env, addr, esize) {
                             Ok(v) => v,
@@ -35,6 +44,7 @@ fn ldst_struct<E: Env>(cpu: &mut CpuState, env: &mut E, insn: Insn) -> Step {
                     addr = addr.wrapping_add(ebytes);
                     total += ebytes;
                 }
+            }
             }
         } else if replicate {
             // LD1R/LD2R..: load one element and replicate across all lanes.

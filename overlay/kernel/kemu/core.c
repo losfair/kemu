@@ -250,6 +250,7 @@ static struct kemu_thread *kemu_thread_new(struct kemu_mm *km, int slot,
 	/* Leave headroom: barriers touch [rsp] even when the stack is empty. */
 	kt->rstack_top = kemu_slot_base(km, slot) + KEMU_SLOT_RSTACK_TOP_PG * PAGE_SIZE - 64;
 	kt->cpu->host_rsp_top = kt->rstack_top;
+	kemu_rs_crc_table((u32 *)((u8 *)kt->cpu + KEMU_CPU_CRC_TABLE));
 	/* Return-stack underflow sentinels: "return" into dispatch_rax. */
 	{
 		struct kemu_slot *s = xa_load(&km->slots, slot);

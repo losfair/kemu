@@ -238,6 +238,7 @@ pub struct Ret {
     stop: u64,
 }
 
+static HELP: std::sync::Mutex<std::collections::BTreeMap<String, u64>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 static IN_RUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static IN_OP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static INTERRUPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -346,6 +347,13 @@ fn jt_handle_op_inner(op: u32) -> Ret {
         },
         OP_HELPER => {
             h().helpers += 1;
+            if std::env::var("HELPSTAT").is_ok() {
+                let w = unsafe { (st.pc as *const u32).read() };
+                let name = format!("{:?}", decode(w));
+                let key = name.split(|c: char| c == ' ' || c == '{').next().unwrap_or("").to_string();
+                let key = if key == "Dp1" || key == "Dp2" || key == "Mul" { name.split(", rd").next().unwrap_or("").to_string() } else { key };
+                *HELP.lock().unwrap().entry(key).or_insert(0) += 1;
+            }
             st.nzcv = nzcv_from_image(st.flags_x86);
             st.fpsr = fpsr_merge(st.fpsr, st.scratch[7] as u32);
             let pc = st.pc;
@@ -510,6 +518,8 @@ fn gen_mem(r: &mut Rng) -> u32 {
             Insn::LdSt { fp: true, .. } | Insn::LdStPair { fp: true, .. } => true,
             Insn::Atomic { rs, rt, rn, .. } => rs != rn && rt != rn,
             Insn::Cas { pair: false, rs, rt, rn, .. } => rs != rn && rt != rn,
+            Insn::LdStExcl { pair: false, rs, rt, rn, load, .. } => rt != rn && (load || (rs != rn && rs != rt)),
+            Insn::SimdLdSt { single, replicate, rm, .. } => (!single || replicate) && (rm == 31 || rm == 23),
             _ => false,
         };
         if ok {
@@ -525,6 +535,9 @@ fn gen_mem(r: &mut Rng) -> u32 {
                 Insn::LdStPair { load: true, rt, rt2, fp: false, .. } => [rt, rt2].iter().any(|x| *x == 20 || *x == 22 || *x == 23),
                 Insn::Atomic { rt, .. } => rt == 20 || rt == 22 || rt == 23,
                 Insn::Cas { rs, .. } => rs == 20 || rs == 22 || rs == 23,
+                Insn::LdStExcl { load, rt, rs, .. } => {
+                    (load && (rt == 20 || rt == 22 || rt == 23)) || (!load && (rs == 20 || rs == 22 || rs == 23))
+                }
                 _ => false,
             };
             if !writes_base {
@@ -607,7 +620,7 @@ fn gen_loop(r: &mut Rng) -> Vec<u32> {
             let touches24 = [w & 31, (w >> 10) & 31, (w >> 16) & 31].contains(&24);
             if !bad_rd && !(writes_rt && rd == 24) && !touches24 {
                 // memory ops with writeback walk the base; keep them in bounds
-                let wb = matches!(i, Insn::LdSt { index: kemu_core::decode::Index::Pre | kemu_core::decode::Index::Post, .. } | Insn::LdStPair { index: kemu_core::decode::Index::Pre | kemu_core::decode::Index::Post, .. });
+                let wb = matches!(i, Insn::LdSt { index: kemu_core::decode::Index::Pre | kemu_core::decode::Index::Post, .. } | Insn::LdStPair { index: kemu_core::decode::Index::Pre | kemu_core::decode::Index::Post, .. } | Insn::SimdLdSt { post: true, .. });
                 if !wb {
                     break w;
                 }
@@ -689,6 +702,7 @@ fn is_fp(i: &Insn) -> bool {
             | Insn::SimdUmov { .. }
             | Insn::SimdInsGpr { .. }
             | Insn::SimdInsElt { .. }
+            | Insn::SimdPermute { .. }
     )
 }
 
@@ -749,6 +763,10 @@ fn main() {
     map_fixed(DATA, DATA_SIZE, 3);
     unsafe {
         assert_eq!(arch_prctl(0x1001 /* ARCH_SET_GS */, STATE), 0);
+    }
+    let t = kemu_core::jit::regmap::crc32_table();
+    for (i, v) in t.iter().enumerate() {
+        unsafe { ((STATE + 2048 + 4 * i as u64) as *mut u32).write(*v) };
     }
     let stub_buf = unsafe { std::slice::from_raw_parts_mut(REGION as *mut u8, 4096) };
     let so = stubs::gen_stubs(stub_buf, ExitMode::Call(jt_harness_entry as u64), TABLE, ((TABLE_ENTRIES - 1) << 3) as u32).unwrap();
@@ -866,6 +884,11 @@ fn main() {
     cv.sort_by(|a, b| b.1.cmp(&a.1));
     println!("classes in failing cases: {:?}", cv);
     println!("fpsr differences (not counted as failures): {fpsr_diffs}");
+    if std::env::var("HELPSTAT").is_ok() {
+        let mut v: Vec<_> = HELP.lock().unwrap().clone().into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        println!("helper instructions: {:?}", &v[..v.len().min(15)]);
+    }
     println!("async interruptions recovered: {}", INTERRUPTS.load(std::sync::atomic::Ordering::SeqCst));
     let hh = h();
     println!(

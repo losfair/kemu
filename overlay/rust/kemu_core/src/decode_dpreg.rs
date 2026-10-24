@@ -54,25 +54,20 @@ fn decode_addsub_carry(x: u32) -> Insn {
 }
 
 fn decode_rmif(x: u32) -> Insn {
-    // RMIF: sf=1, S=0, imm6 in 20:15, Rn in 9:5, mask in 3:0
-    if !bit(x, 31) || bit(x, 29) {
+    // RMIF: sf=1 op=0 S=1, imm6 in 20:15, 14:10 = 00001, o2 (bit 4) = 0.
+    if bits(x, 31, 29) != 0b101 || bit(x, 4) {
         return Insn::Undefined;
     }
-    let lsb = bits(x, 20, 15);
-    let rn = bits(x, 9, 5);
-    let mask = bits(x, 3, 0);
-    Insn::Rmif { rn, lsb, mask }
+    Insn::Rmif { rn: bits(x, 9, 5), lsb: bits(x, 20, 15), mask: bits(x, 3, 0) }
 }
 
 fn decode_setf(x: u32) -> Insn {
-    // SETF8/SETF16: sz = bit 14
-    if !bit(x, 31) == false { /* sf must be 0 */ }
-    if bit(x, 31) || bit(x, 29) {
+    // SETF8/SETF16: sf=0 op=0 S=1, opcode2 (20:15) = 0, sz = bit 14,
+    // 13:10 = 0010, o3 = 0, mask (3:0) = 1101.
+    if bits(x, 31, 29) != 0b001 || bits(x, 20, 15) != 0 || bits(x, 4, 0) != 0b01101 {
         return Insn::Undefined;
     }
-    let sz = bit(x, 14) as u8; // 0 => 8-bit, 1 => 16-bit
-    let rn = bits(x, 9, 5);
-    Insn::SetfFlags { sz, rn }
+    Insn::SetfFlags { sz: bit(x, 14) as u8, rn: bits(x, 9, 5) }
 }
 
 fn decode_cond_cmp(x: u32) -> Insn {
@@ -84,8 +79,8 @@ fn decode_cond_cmp(x: u32) -> Insn {
     let cond = bits(x, 15, 12);
     let rn = bits(x, 9, 5);
     let nzcv = bits(x, 3, 0);
-    if bit(x, 10) || bit(x, 4) {
-        return Insn::Undefined;
+    if bit(x, 10) || bit(x, 4) || !bit(x, 29) {
+        return Insn::Undefined; // o2, o3 must be 0; S must be 1
     }
     let imm_or_rm = bits(x, 20, 16);
     let _ = reg;
@@ -227,7 +222,10 @@ fn decode_dp2(x: u32) -> Insn {
         0b010111 => (Dp2Op::Crc32c, 3),
         _ => return Insn::Undefined,
     };
-    // CRC32X (size 3) requires sf==1; CRC32 w-variants require sf==0 except X.
+    // CRC32X/CRC32CX (sz == 11) require sf == 1; the B/H/W forms sf == 0.
+    if matches!(op, Dp2Op::Crc32 | Dp2Op::Crc32c) && (crc_sz == 3) != sf {
+        return Insn::Undefined;
+    }
     Insn::Dp2 { sf, op, rd, rn, rm, crc_sz }
 }
 
@@ -254,6 +252,10 @@ fn decode_dp3(x: u32) -> Insn {
         (0b110, false) => MulOp::Umulh,
         _ => return Insn::Undefined,
     };
-    // SMULH/UMULH require sf==1 and ra==31.
+    // The long and high forms exist only with sf == 1 (Ra of SMULH/UMULH
+    // is should-be-one).
+    if !_sf && !matches!(op, MulOp::Madd | MulOp::Msub) {
+        return Insn::Undefined;
+    }
     Insn::Mul { op, rd, rn, rm, ra }
 }
