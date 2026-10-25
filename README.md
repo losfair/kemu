@@ -116,12 +116,15 @@ The native implementation lives in `overlay/arch/x86/`; other x86_64 kernel
 ports supply their own architecture code and select `HAVE_KEMU`.
 
 To enable the vector register cache, a port defines `KEMU_ARCH_VECTOR_CACHE`
-as 1 and provides `kemu_arch_read_xmm(u64 xmm[8][2])` in `asm/kemu.h`. It must
-capture the interrupted task's user XMM0..7, synchronizing live FPU state
+as 1 and provides `u32 kemu_arch_read_fpu(u64 xmm[8][2])` in `asm/kemu.h`. It must
+capture the interrupted task's user XMM0..7 and return MXCSR, synchronizing live FPU state
 first, and work in task context with IRQs either enabled or disabled. Without
 this opt-in, vectors remain in the state page. The native implementation
 handles lazy FPU state and XSAVE's init-state optimization. Userspace callers
 opt in with `Cfg::vector_cache` and supply `HostRegs::xmm` during recovery.
+Recovery must also merge live MXCSR exception flags into FPSR; in page-state
+stub ranges, use the saved MXCSR image instead (live state may precede a reload
+or signal return).
 
 Host atomic access, the virtual counter and random-number generation use
 the `kemu_arch_*` services declared in `include/linux/kemu.h`. The common
@@ -183,6 +186,8 @@ INTR=50 RELOC=1 tools/jit-test/target/release/jit-test 50000   # async interrupt
 INTR=50 RELOC=1 tools/jit-test/target/release/jit-test 20000 1 6 # SHA256, with no interpreter fallback
 INTR=50 RELOC=1 tools/jit-test/target/release/jit-test 20000 1 7 # AES, PMULL, SHA1
 NO_AES=1 NO_PCLMUL=1 tools/jit-test/target/release/jit-test 20000 1 7 # optional-feature fallback
+INTR=20 RELOC=1 tools/jit-test/target/release/jit-test 10000 1 9 # FP min/max and indexed multiply/FMA
+INTR=20 RELOC=1 tools/jit-test/target/release/jit-test 10000 1 10 # TBL/TBX and byte/halfword ZIP/UZP
 scripts/vm-smoke.sh                                            # in-kernel ABI suite etc.
 ```
 
@@ -203,6 +208,33 @@ KERNEL=/path/to/bzImage KEMU_CPU=host,-aes,-pclmulqdq scripts/run-vm.sh 'build/c
 The benchmark warms translations before timing, reports time per crypto
 instruction including loop/operand overhead, and prints deterministic
 checksums. It is not a complete cipher or hash throughput test.
+
+`tests/bench/fp.c` exercises SAXPY, a double dot product, 48×48 matrix
+multiplication, clamping, range counting, and Mandelbrot. `tests/bench/zlib.c`
+measures compression (level 6), decompression, Adler-32, and CRC-32 over
+deterministic mixed text/random data, and verifies the compression round trip.
+Both accept a case name (or `all`) and iteration count; zlib also accepts the
+buffer size in bytes (up to its 1 MiB default).
+
+```sh
+aarch64-linux-gnu-gcc -O3 -static tests/bench/fp.c -lm -o build/fp.arm64
+# ZLIB_ARM64 is an extracted arm64 zlib development package or sysroot.
+aarch64-linux-gnu-gcc -O3 -static tests/bench/zlib.c -I$ZLIB_ARM64/usr/include \
+  $ZLIB_ARM64/usr/lib/aarch64-linux-gnu/libz.a -o build/zlib.arm64
+qemu-aarch64 build/fp.arm64 all 20
+qemu-aarch64 build/zlib.arm64 all 2 131072
+tools/kemu-user/target/release/kemu-user --jit build/fp.arm64 all 20
+tools/kemu-user/target/release/kemu-user --jit build/zlib.arm64 all 2 131072
+```
+
+Use the same binaries on baseline and patched kernels and compare checksums
+against QEMU. For a native comparison, compile the same sources with host GCC
+and the same optimization level, linking the same zlib version, and run them
+in the same VM. Compiler vectorization can differ across architectures.
+Run helper profiling separately with `KEMU_JIT_STATS=1`; its per-helper
+formatting and counters distort timings. FP min/max and indexed multiply/FMA
+retain softfloat fallbacks for NaNs and FPCR.FZ, preserving their exact results
+and exception flags.
 
 `tests/jit-workloads/run.sh` runs JIT-heavy programs for Java, Node, LuaJIT,
 PyPy and Ruby inside an arm64 userland, each with the guest's JIT on and off,

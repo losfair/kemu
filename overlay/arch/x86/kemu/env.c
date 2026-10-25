@@ -11,7 +11,7 @@
 #include <asm/fpu/sched.h>
 #include <asm/kemu.h>
 
-void kemu_arch_read_xmm(u64 xmm[8][2])
+u32 kemu_arch_read_fpu(u64 xmm[8][2])
 {
 	struct fpu *fpu = x86_task_fpu(current);
 	const void *src;
@@ -36,6 +36,7 @@ void kemu_arch_read_xmm(u64 xmm[8][2])
 		memcpy(xmm, src, 8 * 16);
 	else
 		memset(xmm, 0, 8 * 16);
+	return src ? fpu->fpstate->regs.fxsave.mxcsr : 0x1f80;
 }
 
 static int kemu_cmpxchg128(u64 addr, const u64 *exp, const u64 *new, u64 *old)

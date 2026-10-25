@@ -274,10 +274,15 @@ extern "C" fn on_alarm(_sig: i32, _info: *mut libc::siginfo_t, ucv: *mut libc::c
     }
     let st = state();
     let hh = h();
+    let mxcsr;
     if rip >= REGION && rip < REGION + 4096 {
         let info = hh.stubs.info((rip - REGION) as u32);
+        mxcsr = if matches!(info, stubs::STUB_PAGE_STATE | stubs::STUB_PAGE_STATE_SVC) {
+            st.scratch[7] as u32
+        } else { fp.mxcsr };
         stubs::recover(info, &hregs, st);
     } else if let Some(&(b, sz)) = hh.blocks.iter().find(|(b, sz)| rip >= *b && rip < *b + *sz as u64) {
+        mxcsr = fp.mxcsr;
         let blk = unsafe { std::slice::from_raw_parts(b as *const u8, sz) };
         if !meta::recover(blk, (rip - b) as u32, &hregs, st) {
             let msg = b"recover failed\n";
@@ -288,6 +293,8 @@ extern "C" fn on_alarm(_sig: i32, _info: *mut libc::siginfo_t, ucv: *mut libc::c
         return;
     }
     st.flags_x86 = image_from_nzcv(st.nzcv);
+    st.fpsr = fpsr_merge(st.fpsr, mxcsr);
+    st.scratch[7] = mxcsr_from(st.fpcr, st.fpsr) as u64;
     INTERRUPTS.fetch_add(1, SeqCst);
     g[libc::REG_RIP as usize] = (REGION + hh.stubs.dispatch as u64) as i64;
     g[libc::REG_RSP as usize] = (RSTACK_TOP - 64) as i64;
@@ -636,6 +643,9 @@ fn gen_loop(r: &mut Rng) -> Vec<u32> {
 }
 
 fn gen_case(r: &mut Rng, mode: u32) -> Vec<u32> {
+    if mode == 9 {
+        return gen_fp_hot(r);
+    }
     if mode == 8 {
         return gen_vectors(r);
     }
@@ -647,7 +657,7 @@ fn gen_case(r: &mut Rng, mode: u32) -> Vec<u32> {
     }
     let n = 1 + r.below(unsafe { MAXLEN }) as usize;
     let mut v = Vec::new();
-    if matches!(mode, 6 | 7) {
+    if matches!(mode, 6 | 7 | 10) {
         v.push(0xeb01_001f); // cmp x0, x1: keep live host flags across crypto
     }
     for k in 0..n {
@@ -657,6 +667,7 @@ fn gen_case(r: &mut Rng, mode: u32) -> Vec<u32> {
             3 => gen_fp(r),
             6 => gen_sha256(r),
             7 => gen_crypto(r),
+            10 => gen_shuffle(r),
             _ => {
                 // mixed with forward branches
                 match r.below(6) {
@@ -687,7 +698,7 @@ fn gen_case(r: &mut Rng, mode: u32) -> Vec<u32> {
         };
         v.push(w);
     }
-    if matches!(mode, 6 | 7) {
+    if matches!(mode, 6 | 7 | 10) {
         v.push(0x9a88_00e6 | ((r.below(14) as u32) << 12)); // csel x6,x7,x8,cond
     }
     v.push(0xd420_0000); // brk #0
@@ -749,6 +760,7 @@ fn is_fp(i: &Insn) -> bool {
             | Insn::FpCSel { .. }
             | Insn::FpCvt { .. }
             | Insn::SimdThree { .. }
+            | Insn::SimdIndexed { .. }
             | Insn::SimdMisc { .. }
             | Insn::SimdDup { .. }
             | Insn::SimdModImm { .. }
@@ -769,6 +781,82 @@ fn gen_fp(r: &mut Rng) -> u32 {
             return w;
         }
     }
+}
+
+/// Compiler hot paths: scalar/vector min/max and indexed multiply/FMA.
+/// Use one precision per block so the caller can fill every lane with
+/// finite values for the no-fallback performance regression check.
+fn gen_fp_hot(r: &mut Rng) -> Vec<u32> {
+    let double = r.below(2) as u32;
+    let mut v = vec![0xeb01_001f]; // cmp x0,x1: preserve flags across FP
+    const OPS: &[u32] = &[
+        0x1e205800, 0x1e204800, 0x1e207800, 0x1e206800,
+        0x4ea0f400, 0x4e20f400, 0x4ea0c400, 0x4e20c400,
+        0x4f809000, 0x4f801000, 0x4f805000,
+    ];
+    for _ in 0..1 + r.below(unsafe { MAXLEN }) {
+        let k = r.below(OPS.len() as u64) as usize;
+        let mut w = OPS[k] | (double << 22);
+        if k >= 8 {
+            w |= (r.below(2) as u32) << 11; // high index bit
+            if double == 0 { w |= (r.below(2) as u32) << 21; }
+            if r.below(3) == 0 { w |= 1 << 28; } // scalar
+        }
+        if k >= 4 && double == 0 && w & (1 << 28) == 0 && r.below(2) == 0 {
+            w &= !(1 << 30); // .2S, with dirty inactive lanes
+        }
+        let rd = r.below(32) as u32;
+        let rn = if r.below(3) == 0 { rd } else { r.below(32) as u32 };
+        let rm = if r.below(3) == 0 { rd } else { r.below(32) as u32 };
+        v.push(w | rd | (rn << 5) | (rm << 16));
+    }
+    v.push(0x9a88_00e6 | ((r.below(14) as u32) << 12)); // csel x6,x7,x8,cond
+    v.push(0xd420_0000);
+    v
+}
+
+/// TBL/TBX register lists (including V31 wraparound and aliases) and the
+/// byte/halfword shuffles used by zlib's sliding hash tables.
+fn gen_shuffle(r: &mut Rng) -> u32 {
+    let rd = r.below(32) as u32;
+    let rn = if r.below(3) == 0 { rd } else { r.below(32) as u32 };
+    let rm = if r.below(3) == 0 { rd } else { r.below(32) as u32 };
+    let regs = rd | (rn << 5) | (rm << 16) | ((r.below(2) as u32) << 30);
+    if r.below(2) == 0 {
+        0x0e00_0000 | regs | ((r.below(4) as u32) << 13) | ((r.below(2) as u32) << 12)
+    } else {
+        let opcode = [1, 3, 5, 7][r.below(4) as usize];
+        0x0e00_0800 | regs | ((r.below(2) as u32) << 22) | (opcode << 12)
+    }
+}
+
+fn init_fp_hot(r: &mut Rng, st: &mut CpuState, code: &[u32], edges: bool) {
+    let double = code[1] & (1 << 22) != 0;
+    const D: &[u64] = &[
+        0, 0x8000000000000000, 0x3ff0000000000000, 0xbff0000000000000,
+        0x7ff0000000000000, 0xfff0000000000000, 0x7ff8000000000123,
+        0xfff8000000000456, 0x7ff0000000000789, 1, 0x8000000000000001,
+    ];
+    const S: &[u64] = &[
+        0, 0x80000000, 0x3f800000, 0xbf800000, 0x7f800000, 0xff800000,
+        0x7fc00123, 0xffc00456, 0x7f800789, 1, 0x80000001,
+    ];
+    for v in &mut st.v {
+        *v = [0; 2];
+        for lane in 0..if double { 2 } else { 4 } {
+            let bits = if edges {
+                let vals = if double { D } else { S };
+                vals[r.below(vals.len() as u64) as usize]
+            } else {
+                let x = (r.below(17) as i32 - 8) as f64 / 8.0;
+                if double { x.to_bits() } else { (x as f32).to_bits() as u64 }
+            };
+            if double { v[lane] = bits; } else { v[lane / 2] |= bits << (32 * (lane % 2)); }
+        }
+    }
+    st.fpcr |= (r.below(2) as u32) << 25; // default NaN mode
+    if edges { st.fpcr |= (r.below(2) as u32) << 24; } // FZ slow path
+    st.fpsr = r.next() as u32 & 0x0800_009f;
 }
 
 /// SHA256H/H2/SU0/SU1 and vector byte-order reversal, including aliased
@@ -935,11 +1023,26 @@ fn main() {
         let mode = only_mode.unwrap_or((it % 3) as u32);
         let code = gen_case(&mut rng, mode);
         let mut init = init_state(&mut rng);
-        if matches!(mode, 6 | 7) {
+        if mode == 9 {
+            init_fp_hot(&mut rng, &mut init, &code, it & 1 != 0);
+        }
+        if matches!(mode, 6 | 7 | 10) {
             for v in &mut init.v {
                 *v = [rng.val(), rng.val()];
             }
             init.fpsr = rng.next() as u32 & 0x0800_009f;
+        }
+        if mode == 10 {
+            const IDX: &[u8] = &[0, 15, 16, 31, 32, 47, 48, 63, 64, 127, 128, 255];
+            for v in &mut init.v {
+                for word in v {
+                    *word = 0;
+                    for byte in 0..8 {
+                        let x = if rng.below(2) == 0 { rng.below(64) as u8 } else { IDX[rng.below(IDX.len() as u64) as usize] };
+                        *word |= (x as u64) << (8 * byte);
+                    }
+                }
+            }
         }
         for b in data_init.iter_mut() {
             *b = rng.next() as u8;
@@ -970,7 +1073,10 @@ fn main() {
         }
 
         let mut bad = Vec::new();
-        if matches!(mode, 6 | 7) {
+        if mode == 9 && it & 1 == 0 && h().helpers - helpers_before != 1 {
+            bad.push(format!("finite FP fallback: {} helpers, expected only BRK", h().helpers - helpers_before));
+        }
+        if matches!(mode, 6 | 7 | 10) {
             // BRK plus only the instructions whose optional host feature
             // is unavailable. Unexpected fallbacks are performance bugs.
             let expected = 1 + code.iter().filter(|&&w| crypto_fallback(decode(w))).count();
@@ -1009,12 +1115,12 @@ fn main() {
         }
         if ref_st.fpsr != jit_st.fpsr {
             fpsr_diffs += 1;
-            if matches!(mode, 6 | 7) {
-                bad.push(format!("crypto changed FPSR: ref {:#x} jit {:#x}", ref_st.fpsr, jit_st.fpsr));
+            if matches!(mode, 6 | 7 | 9 | 10) {
+                bad.push(format!("FPSR: ref {:#x} jit {:#x}", ref_st.fpsr, jit_st.fpsr));
             }
         }
-        if matches!(mode, 6 | 7) && ref_st.fpcr != jit_st.fpcr {
-            bad.push(format!("crypto changed FPCR: ref {:#x} jit {:#x}", ref_st.fpcr, jit_st.fpcr));
+        if matches!(mode, 6 | 7 | 9 | 10) && ref_st.fpcr != jit_st.fpcr {
+            bad.push(format!("FPCR: ref {:#x} jit {:#x}", ref_st.fpcr, jit_st.fpcr));
         }
         if !bad.is_empty() {
             for w in &code {

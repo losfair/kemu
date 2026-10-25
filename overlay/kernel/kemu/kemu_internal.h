@@ -93,6 +93,7 @@ struct kemu_stubs {
 };
 
 #define KEMU_STUB_PAGE_STATE		0
+#define KEMU_STUB_PAGE_STATE_SVC		4
 
 struct kemu_mm {
 	struct mutex lock;		/* translation, chunks, block map */

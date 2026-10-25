@@ -115,6 +115,14 @@ impl<'s, 'b> Gen<'s, 'b> {
         self.flags_to_mem();
     }
 
+    /// ARM's FZ input-denormal/underflow status differs from x86 DAZ/FTZ.
+    /// Keep those cases on softfloat until their flags can be reproduced.
+    fn fp_fz_guard(&mut self) -> usize {
+        self.clobber();
+        self.a.test_ri(Sz::D, Rm::M(Mem::gs(OFF_FPCR)), 1 << 24);
+        self.a.jcc(Cc::Ne, None)
+    }
+
     pub(super) fn fp_imm_insn(&mut self, ftype: u8, rd: u32, imm8: u8) -> bool {
         let double = match ftype {
             0 => false,
@@ -134,12 +142,15 @@ impl<'s, 'b> Gen<'s, 'b> {
             1 => true,
             _ => return false,
         };
+        if matches!(op, Fp2Op::Min | Fp2Op::Max | Fp2Op::MinNm | Fp2Op::MaxNm) {
+            return self.fp_minmax(double, true, false, matches!(op, Fp2Op::Min | Fp2Op::MinNm), rd, rn, rm);
+        }
         let opc = match op {
             Fp2Op::Add => 0x58,
             Fp2Op::Mul | Fp2Op::Nmul => 0x59,
             Fp2Op::Sub => 0x5c,
             Fp2Op::Div => 0x5e,
-            _ => return false, // min/max family: exact semantics via helper
+            _ => return false,
         };
         self.fp_prologue();
         let pp = if double { PP_F2 } else { PP_F3 };
@@ -156,6 +167,51 @@ impl<'s, 'b> Gen<'s, 'b> {
         }
         self.st_scalar(double, X14, rd);
         self.slow_paths(&[s]);
+        true
+    }
+
+    /// MIN/MAX choose the second operand on x86 when both operands are
+    /// zero. Combine both operand orders to give ARM's -0 for MIN and +0
+    /// for MAX. All NaNs go to softfloat, including the numeric variants
+    /// (whose signaling-NaN and operand-priority rules differ from x86).
+    fn fp_minmax(&mut self, double: bool, scalar: bool, q: bool, min: bool, rd: u32, rn: u32, rm: u32) -> bool {
+        self.fp_prologue();
+        let fz = self.fp_fz_guard();
+        if scalar {
+            self.ld_scalar(double, X14, rn);
+            self.ld_scalar(double, X15, rm);
+        } else if !q {
+            self.ld_scalar(true, X14, rn);
+            self.ld_scalar(true, X15, rm);
+        } else {
+            self.ld_vec(X14, rn);
+            self.ld_vec(X15, rm);
+        }
+        self.clobber();
+        let slow = if scalar {
+            self.a.vex(1, if double { PP_66 } else { PP_NONE }, false, false, 0x2e, X14, 0, Rm::R(X15));
+            self.a.jcc(Cc::P, None)
+        } else {
+            self.a.vex_ib(1, if double { PP_66 } else { PP_NONE }, false, false, 0xc2, X13, X14, Rm::R(X15), 3);
+            self.a.vex(2, PP_66, false, false, 0x17, X13, 0, Rm::R(X13));
+            self.a.jcc(Cc::Ne, None)
+        };
+        let pp = match (scalar, double) {
+            (true, true) => PP_F2,
+            (true, false) => PP_F3,
+            (false, true) => PP_66,
+            (false, false) => PP_NONE,
+        };
+        let opc = if min { 0x5d } else { 0x5f };
+        self.a.vex(1, pp, false, false, opc, 12, X14, Rm::R(X15));
+        self.a.vex(1, pp, false, false, opc, X14, X15, Rm::R(X14));
+        self.a.vex(1, PP_66, false, false, if min { 0xeb } else { 0xdb }, X14, X14, Rm::R(12));
+        if scalar {
+            self.st_scalar(double, X14, rd);
+        } else {
+            self.st_vec(q, X14, rd);
+        }
+        self.slow_paths(&[fz, slow]);
         true
     }
 
@@ -427,6 +483,51 @@ impl<'s, 'b> Gen<'s, 'b> {
 
     // ---- Advanced SIMD ----
 
+    /// FMUL/FMLA/FMLS by an indexed S/D element. Broadcast before touching
+    /// the accumulator, so all source/destination aliases are safe.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn simd_indexed(&mut self, q: bool, u: bool, size: u8, opcode: u8, rd: u32, rn: u32, rm: u32, index: u32, scalar: bool) -> bool {
+        if u || !matches!(size, 2 | 3) || !matches!(opcode, 1 | 5 | 9) || (size == 3 && !q && !scalar) {
+            return false;
+        }
+        let double = size == 3;
+        self.fp_prologue();
+        let fz = self.fp_fz_guard();
+        let elem = self.vector_slice(rm, (index << size) as u8, 12);
+        self.a.vex(2, PP_66, false, false, if double { 0x59 } else { 0x58 }, 12, 0, elem);
+        if scalar {
+            self.ld_scalar(double, X15, rn);
+        } else if !q {
+            self.ld_scalar(true, X15, rn);
+            // Inactive lanes must not raise exceptions (e.g. 0 * infinity).
+            self.a.vex(1, PP_F3, false, false, 0x7e, 12, 0, Rm::R(12));
+        } else {
+            self.ld_vec(X15, rn);
+        }
+        if opcode == 9 {
+            let pp = if scalar { if double { PP_F2 } else { PP_F3 } } else if double { PP_66 } else { PP_NONE };
+            self.a.vex(1, pp, false, false, 0x59, X14, X15, Rm::R(12));
+        } else {
+            if scalar {
+                self.ld_scalar(double, X14, rd);
+            } else if !q {
+                self.ld_scalar(true, X14, rd);
+            } else {
+                self.ld_vec(X14, rd);
+            }
+            let opc = (if opcode == 1 { 0xb8 } else { 0xbc }) + scalar as u8;
+            self.a.vex(2, PP_66, double, false, opc, X14, X15, Rm::R(12));
+        }
+        let slow = if scalar { self.nan_guard_scalar(double, X14) } else { self.nan_guard_vec(double, X14) };
+        if scalar {
+            self.st_scalar(double, X14, rd);
+        } else {
+            self.st_vec(q, X14, rd);
+        }
+        self.slow_paths(&[fz, slow]);
+        true
+    }
+
     /// Splat a 32-bit constant into xmm `x`.
     fn splat32(&mut self, x: u8, v: u32) {
         self.a.mov_ri32(RAX, v);
@@ -462,6 +563,9 @@ impl<'s, 'b> Gen<'s, 'b> {
             return true;
         }
         match op {
+            SimdOp::FMin | SimdOp::FMax | SimdOp::FMinNm | SimdOp::FMaxNm if size >= 2 && (q || size == 2) => {
+                self.fp_minmax(size == 3, false, q, matches!(op, SimdOp::FMin | SimdOp::FMinNm), rd, rn, rm)
+            }
             SimdOp::PMull | SimdOp::PMull2 => self.pmull(size, op == SimdOp::PMull2, rd, rn, rm),
             SimdOp::And | SimdOp::Orr | SimdOp::Eor | SimdOp::Bic => {
                 self.ld_vec(X14, rn);
@@ -690,6 +794,34 @@ impl<'s, 'b> Gen<'s, 'b> {
         self.ld_vec(X15, rm);
         let op = opcode & 7;
         match (size, q, op) {
+            // Byte/halfword ZIP1/ZIP2. The high half of a 64-bit input
+            // starts at byte 4, unlike PUNPCKH's byte 8.
+            (0 | 1, _, 0b011 | 0b111) => {
+                let high = op == 0b111;
+                if high && !q {
+                    self.a.vex_ib(1, PP_66, false, false, 0x73, 3, X14, Rm::R(X14), 4);
+                    self.a.vex_ib(1, PP_66, false, false, 0x73, 3, X15, Rm::R(X15), 4);
+                }
+                let opc = (if high && q { 0x68 } else { 0x60 }) + size;
+                self.a.vex(1, PP_66, false, false, opc, X14, X14, Rm::R(X15));
+            }
+            (0 | 1, _, 0b001 | 0b101) => {
+                // Gather even/odd elements to each source's low half,
+                // then concatenate. PSHUFB's high bit zeroes unused bytes.
+                let bytes = if q { 8 } else { 4 };
+                let mut mask = [0x80u8; 16];
+                for i in 0..bytes {
+                    mask[i] = (((i >> size) * 2 + (op >> 2) as usize) << size
+                        | (i & ((1 << size) - 1))) as u8;
+                }
+                self.mov_imm(RAX, u64::from_le_bytes(mask[..8].try_into().unwrap()));
+                self.a.vmov_from_gpr(Sz::Q, X13, RAX);
+                self.mov_imm(RAX, u64::from_le_bytes(mask[8..].try_into().unwrap()));
+                self.a.vex_ib(3, PP_66, true, false, 0x22, X13, X13, Rm::R(RAX), 1); // vpinsrq
+                self.a.vex(2, PP_66, false, false, 0x00, X14, X14, Rm::R(X13));
+                self.a.vex(2, PP_66, false, false, 0x00, X15, X15, Rm::R(X13));
+                self.a.vex(1, PP_66, false, false, if q { 0x6c } else { 0x62 }, X14, X14, Rm::R(X15));
+            }
             // UZP1/UZP2 .4S
             (2, true, 0b001) => self.a.vex_ib(1, PP_NONE, false, false, 0xc6, X14, X14, Rm::R(X15), 0x88),
             (2, true, 0b101) => self.a.vex_ib(1, PP_NONE, false, false, 0xc6, X14, X14, Rm::R(X15), 0xdd),
@@ -700,6 +832,36 @@ impl<'s, 'b> Gen<'s, 'b> {
             (3, true, 0b001) | (3, true, 0b011) => self.a.vex(1, PP_66, false, false, 0x6c, X14, X14, Rm::R(X15)),
             (3, true, 0b101) | (3, true, 0b111) => self.a.vex(1, PP_66, false, false, 0x6d, X14, X14, Rm::R(X15)),
             _ => return false,
+        }
+        self.st_vec(q, X14, rd);
+        true
+    }
+
+    /// TBL/TBX over 1..4 registers. PSHUFB only checks index bit 7;
+    /// saturating-add 0x70 to each table-relative index so every index
+    /// outside 0..15 is zeroed instead of wrapping modulo 16.
+    pub(super) fn simd_tbl(&mut self, q: bool, len: u8, tbx: bool, rd: u32, rn: u32, rm: u32) -> bool {
+        self.ld_vec(X15, rm);
+        self.splat32(12, 0x7070_7070);
+        if len != 0 { self.splat32(10, 0x1010_1010); }
+        for k in 0..=len {
+            self.a.vex(1, PP_66, false, false, 0xdc, X13, X15, Rm::R(12)); // vpaddusb
+            self.ld_vec(11, (rn + k as u32) & 31);
+            self.a.vex(2, PP_66, false, false, 0x00, if k == 0 { X14 } else { 11 }, 11, Rm::R(X13));
+            if k != 0 {
+                self.a.vex(1, PP_66, false, false, 0xeb, X14, X14, Rm::R(11));
+            }
+            if k != len {
+                self.a.vex(1, PP_66, false, false, 0xf8, X15, X15, Rm::R(10)); // vpsubb
+            }
+        }
+        if tbx {
+            self.ld_vec(X15, rm);
+            self.splat32(12, ((len as u32 + 1) * 16 - 1) * 0x0101_0101);
+            self.a.vex(1, PP_66, false, false, 0xda, X13, X15, Rm::R(12)); // vpminub
+            self.a.vex(1, PP_66, false, false, 0x74, X13, X13, Rm::R(X15)); // valid indices
+            self.a.vex(1, PP_66, false, false, 0xdf, X13, X13, self.v_rm(rd));
+            self.a.vex(1, PP_66, false, false, 0xeb, X14, X14, Rm::R(X13));
         }
         self.st_vec(q, X14, rd);
         true

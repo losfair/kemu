@@ -30,7 +30,9 @@ jobs:
           key: cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('overlay/rust/kemu_core/src/**', 'tools/*/src/**', 'tools/*/Cargo.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
       - name: kemu_core unit tests
-        run: cargo test --manifest-path overlay/rust/kemu_core/Cargo.toml --features std
+        run: |
+          cargo test --manifest-path overlay/rust/kemu_core/Cargo.toml --features std
+          cargo test --manifest-path tools/kemu-user/Cargo.toml
       - name: Build tools
         run: |
           for t in kemu-user jit-test difftest isa-audit; do
@@ -51,6 +53,10 @@ jobs:
           INTR=20 RELOC=1 $j 10000 10 8
           NO_VCACHE=1 INTR=20 RELOC=1 $j 10000 10 8
           INTR=20 RELOC=1 $j 10000 32 3
+          INTR=20 RELOC=1 $j 10000 11 9
+          NO_VCACHE=1 INTR=20 RELOC=1 $j 10000 11 9
+          INTR=20 RELOC=1 $j 10000 12 10
+          NO_VCACHE=1 INTR=20 RELOC=1 $j 10000 12 10
       - name: kemu-user smoke test
         run: |
           u=tools/kemu-user/target/release/kemu-user

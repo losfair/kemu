@@ -2232,8 +2232,6 @@ fn is_native(i: &Insn) -> bool {
             | Insn::FpCCmp { .. }
             | Insn::SimdAcross { .. }
             | Insn::SimdSmov { .. }
-            | Insn::SimdTbl { .. }
-            | Insn::SimdIndexed { .. }
             | Insn::Rmif { .. }
             | Insn::SetfFlags { .. }
             | Insn::MsrImm { .. }
@@ -2430,6 +2428,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
                 | Insn::FpCSel { .. }
                 | Insn::FpCvt { .. }
                 | Insn::SimdThree { .. }
+                | Insn::SimdIndexed { .. }
                 | Insn::SimdMisc { .. }
                 | Insn::SimdDup { .. }
                 | Insn::SimdScalarCopy { .. }
@@ -2441,6 +2440,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
                 | Insn::SimdInsElt { .. }
                 | Insn::SimdLdSt { .. }
                 | Insn::SimdPermute { .. }
+                | Insn::SimdTbl { .. }
                 | Insn::Sha256 { .. }
                 | Insn::Sha1 { .. }
                 | Insn::Aese { .. }
@@ -2605,6 +2605,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
             Insn::FpCSel { ftype, rd, rn, rm, cond } => g.fp_csel(ftype, rd, rn, rm, cond),
             Insn::FpCvt { ftype, sf, op, rd, rn } => g.fp_cvt(ftype, sf, op, rd, rn),
             Insn::SimdThree { q, u, size, op, rd, rn, rm, scalar } => g.simd_three(q, u, size, op, rd, rn, rm, scalar),
+            Insn::SimdIndexed { q, u, size, opcode, rd, rn, rm, index, scalar } => g.simd_indexed(q, u, size, opcode, rd, rn, rm, index, scalar),
             Insn::SimdMisc { q, u, size, op, rd, rn, scalar } => g.simd_misc(q, u, size, op, rd, rn, scalar),
             Insn::SimdDup { q, imm5, rd, rn, from_gpr } => g.simd_dup(q, imm5, rd, rn, from_gpr),
             Insn::SimdScalarCopy { imm5, rd, rn } => g.simd_scalar_copy(imm5, rd, rn),
@@ -2621,6 +2622,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
                 g.simd_ldst(load, q, opcode, rt, rn, rm, single, post)
             }
             Insn::SimdPermute { q, size, opcode, rd, rn, rm } => g.simd_permute(q, size, opcode, rd, rn, rm),
+            Insn::SimdTbl { q, len, tbx, rd, rn, rm } => g.simd_tbl(q, len, tbx, rd, rn, rm),
             Insn::Sha256 { op, rd, rn, rm } => g.sha256(op, rd, rn, rm),
             Insn::Sha1 { op, rd, rn, rm } => g.sha1(op, rd, rn, rm),
             Insn::Aese { rd, rn } => g.aes(false, rd, rn),
