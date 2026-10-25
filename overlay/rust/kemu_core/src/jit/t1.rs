@@ -24,6 +24,7 @@ use crate::decode::{
 use crate::env::{Env, Fault};
 
 mod crypto;
+pub use crypto::HostCrypto;
 mod fp;
 
 pub const MAX_INSNS: usize = 64;
@@ -183,6 +184,9 @@ impl Default for Scratch {
 #[derive(Clone, Copy, Debug)]
 pub struct Cfg {
     pub stubs: StubAddrs,
+    /// Optional host instructions, beyond the AVX2 baseline. These must
+    /// be available on every CPU that can execute the translated code.
+    pub crypto: HostCrypto,
     /// User address corresponding to `out[0]`.
     pub code_uaddr: u64,
     /// Relocatable mode for the shared translation cache (see xcache):
@@ -2203,11 +2207,6 @@ fn is_native(i: &Insn) -> bool {
             | Insn::SimdTbl { .. }
             | Insn::SimdIndexed { .. }
             | Insn::SimdScalarCopy { .. }
-            | Insn::Aese { .. }
-            | Insn::Aesd { .. }
-            | Insn::Aesmc { .. }
-            | Insn::Aesimc { .. }
-            | Insn::Sha1 { .. }
             | Insn::Rmif { .. }
             | Insn::SetfFlags { .. }
             | Insn::MsrImm { .. }
@@ -2411,6 +2410,11 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
                 | Insn::SimdLdSt { .. }
                 | Insn::SimdPermute { .. }
                 | Insn::Sha256 { .. }
+                | Insn::Sha1 { .. }
+                | Insn::Aese { .. }
+                | Insn::Aesd { .. }
+                | Insn::Aesmc { .. }
+                | Insn::Aesimc { .. }
         );
         let ok = if (off & 1 != 0 && !branch) || (off & 2 != 0 && simdfp) {
             false
@@ -2585,6 +2589,11 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
             }
             Insn::SimdPermute { q, size, opcode, rd, rn, rm } => g.simd_permute(q, size, opcode, rd, rn, rm),
             Insn::Sha256 { op, rd, rn, rm } => g.sha256(op, rd, rn, rm),
+            Insn::Sha1 { op, rd, rn, rm } => g.sha1(op, rd, rn, rm),
+            Insn::Aese { rd, rn } => g.aes(false, rd, rn),
+            Insn::Aesd { rd, rn } => g.aes(true, rd, rn),
+            Insn::Aesmc { rd, rn } => g.aes_mix(false, rd, rn),
+            Insn::Aesimc { rd, rn } => g.aes_mix(true, rd, rn),
             Insn::MsrReg { rt, enc } => g.msr(rt, enc),
 
             // ---- branches ----

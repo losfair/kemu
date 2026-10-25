@@ -6,7 +6,7 @@
 //! the result against the reference interpreter for random instruction
 //! sequences. Stubs reach the harness with `call` instead of `syscall`.
 
-use kemu_core::decode::{decode, Insn};
+use kemu_core::decode::{decode, Insn, SimdOp};
 use kemu_core::env::{Access, Env, Fault};
 use kemu_core::interp::{self, Exit};
 use kemu_core::jit::regmap::{fpsr_merge, image_from_nzcv, mxcsr_from, nzcv_from_image};
@@ -208,7 +208,7 @@ fn lookup_or_translate(pc: u64) -> Result<u64, Fault> {
     }
     let base = REGION + hh.code_used as u64;
     let out = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, CODE_SIZE - hh.code_used) };
-    let cfg = Cfg { stubs: hh.stubs.addrs(REGION), code_uaddr: base, reloc: std::env::var("RELOC").is_ok(), tbi: std::env::var("TBI").is_ok() };
+    let cfg = Cfg { stubs: hh.stubs.addrs(REGION), code_uaddr: base, reloc: std::env::var("RELOC").is_ok(), tbi: std::env::var("TBI").is_ok(), crypto: host_crypto() };
     match t1::translate(&mut UEnv, pc, out, &cfg, &mut hh.scratch) {
         Ok(r) => {
             hh.blocks.push((base, r.size));
@@ -644,8 +644,8 @@ fn gen_case(r: &mut Rng, mode: u32) -> Vec<u32> {
     }
     let n = 1 + r.below(unsafe { MAXLEN }) as usize;
     let mut v = Vec::new();
-    if mode == 6 {
-        v.push(0xeb01_001f); // cmp x0, x1: keep live host flags across SHA256
+    if matches!(mode, 6 | 7) {
+        v.push(0xeb01_001f); // cmp x0, x1: keep live host flags across crypto
     }
     for k in 0..n {
         let w = match mode {
@@ -653,6 +653,7 @@ fn gen_case(r: &mut Rng, mode: u32) -> Vec<u32> {
             1 => gen_mem(r),
             3 => gen_fp(r),
             6 => gen_sha256(r),
+            7 => gen_crypto(r),
             _ => {
                 // mixed with forward branches
                 match r.below(6) {
@@ -683,7 +684,7 @@ fn gen_case(r: &mut Rng, mode: u32) -> Vec<u32> {
         };
         v.push(w);
     }
-    if mode == 6 {
+    if matches!(mode, 6 | 7) {
         v.push(0x9a88_00e6 | ((r.below(14) as u32) << 12)); // csel x6,x7,x8,cond
     }
     v.push(0xd420_0000); // brk #0
@@ -742,6 +743,52 @@ fn gen_sha256(r: &mut Rng) -> u32 {
             let base = [0x0e20_0800, 0x0e60_0800, 0x0ea0_0800,
                         0x2e20_0800, 0x2e60_0800, 0x0e20_1800][(i - 4) as usize];
             base | ((r.below(2) as u32) << 30) | (rn << 5) | rd
+        }
+    }
+}
+
+fn host_crypto() -> t1::HostCrypto {
+    let mut features = t1::HostCrypto {
+        aes: std::is_x86_feature_detected!("aes"),
+        pclmul: std::is_x86_feature_detected!("pclmulqdq"),
+    };
+    features.aes &= std::env::var("NO_AES").is_err();
+    features.pclmul &= std::env::var("NO_PCLMUL").is_err();
+    features
+}
+
+fn crypto_fallback(i: Insn) -> bool {
+    let features = host_crypto();
+    match i {
+        Insn::Aese { .. } | Insn::Aesd { .. } | Insn::Aesmc { .. } | Insn::Aesimc { .. } => !features.aes,
+        Insn::SimdThree { size: 3, op: SimdOp::PMull | SimdOp::PMull2, .. } => !features.pclmul,
+        _ => false,
+    }
+}
+
+/// Every AES/SHA1 instruction and both PMULL lane widths/halves. Explicit
+/// alias patterns cover Rd=Rm as well as Rd=Rn and all three equal.
+fn gen_crypto(r: &mut Rng) -> u32 {
+    let rd = r.below(32) as u32;
+    let mut rn = r.below(32) as u32;
+    let mut rm = r.below(32) as u32;
+    match r.below(5) {
+        0 => rn = rd,
+        1 => rm = rd,
+        2 => rm = rn,
+        3 => { rn = rd; rm = rd; }
+        _ => {}
+    }
+    let regs = (rn << 5) | rd;
+    match r.below(14) {
+        i @ 0..=3 => 0x4e28_4800 | ((i as u32) << 12) | regs,
+        i @ 4..=7 => 0x5e00_0000 | (((i - 4) as u32) << 12) | (rm << 16) | regs,
+        8 => 0x5e28_0800 | regs, // SHA1H
+        9 => 0x5e28_1800 | regs, // SHA1SU1
+        i => {
+            let high = ((i - 10) & 1) as u32;
+            let size = if i >= 12 { 3 } else { 0 };
+            0x0e20_e000 | (high << 30) | (size << 22) | (rm << 16) | regs
         }
     }
 }
@@ -830,7 +877,13 @@ fn main() {
     for it in 0..iters {
         let mode = only_mode.unwrap_or((it % 3) as u32);
         let code = gen_case(&mut rng, mode);
-        let init = init_state(&mut rng);
+        let mut init = init_state(&mut rng);
+        if matches!(mode, 6 | 7) {
+            for v in &mut init.v {
+                *v = [rng.val(), rng.val()];
+            }
+            init.fpsr = rng.next() as u32 & 0x0800_009f;
+        }
         for b in data_init.iter_mut() {
             *b = rng.next() as u8;
         }
@@ -860,9 +913,13 @@ fn main() {
         }
 
         let mut bad = Vec::new();
-        if mode == 6 && h().helpers - helpers_before != 1 {
-            // The terminating BRK is the only expected helper.
-            bad.push(format!("SHA256 fallback: {} helper calls", h().helpers - helpers_before));
+        if matches!(mode, 6 | 7) {
+            // BRK plus only the instructions whose optional host feature
+            // is unavailable. Unexpected fallbacks are performance bugs.
+            let expected = 1 + code.iter().filter(|&&w| crypto_fallback(decode(w))).count();
+            if h().helpers - helpers_before != expected {
+                bad.push(format!("crypto fallback: {} helper calls, expected {expected}", h().helpers - helpers_before));
+            }
         }
         for i in 0..31 {
             if ref_st.x[i] != jit_st.x[i] {
@@ -895,12 +952,12 @@ fn main() {
         }
         if ref_st.fpsr != jit_st.fpsr {
             fpsr_diffs += 1;
-            if mode == 6 {
-                bad.push(format!("SHA256 changed FPSR: ref {:#x} jit {:#x}", ref_st.fpsr, jit_st.fpsr));
+            if matches!(mode, 6 | 7) {
+                bad.push(format!("crypto changed FPSR: ref {:#x} jit {:#x}", ref_st.fpsr, jit_st.fpsr));
             }
         }
-        if mode == 6 && ref_st.fpcr != jit_st.fpcr {
-            bad.push(format!("SHA256 changed FPCR: ref {:#x} jit {:#x}", ref_st.fpcr, jit_st.fpcr));
+        if matches!(mode, 6 | 7) && ref_st.fpcr != jit_st.fpcr {
+            bad.push(format!("crypto changed FPCR: ref {:#x} jit {:#x}", ref_st.fpcr, jit_st.fpcr));
         }
         if !bad.is_empty() {
             for w in &code {

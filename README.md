@@ -29,6 +29,10 @@ Working:
 - SHA-256 rounds, message schedules and vector byte reversal translated to
   AVX2, without kernel entries per instruction or a requirement for host
   SHA extensions.
+- SHA-1 and byte-wise PMULL/PMULL2 translated to AVX2. AES instructions
+  use AES-NI and 64-bit PMULL/PMULL2 use PCLMULQDQ when the host provides
+  them; otherwise those instructions use the interpreter. Optional host
+  features are detected without changing the x86-64-v3 minimum.
 - A shared translation cache for file-backed code. Library code translated by
   one process is reused by the next one after re-validating it against the
   bytes in memory.
@@ -165,8 +169,28 @@ cargo test --manifest-path overlay/rust/kemu_core/Cargo.toml --features std
 cargo run --release --manifest-path tools/jit-test/Cargo.toml -- 100000
 INTR=50 RELOC=1 tools/jit-test/target/release/jit-test 50000   # async interrupts + relocation
 INTR=50 RELOC=1 tools/jit-test/target/release/jit-test 20000 1 6 # SHA256, with no interpreter fallback
+INTR=50 RELOC=1 tools/jit-test/target/release/jit-test 20000 1 7 # AES, PMULL, SHA1
+NO_AES=1 NO_PCLMUL=1 tools/jit-test/target/release/jit-test 20000 1 7 # optional-feature fallback
 scripts/vm-smoke.sh                                            # in-kernel ABI suite etc.
 ```
+
+`tests/bench/crypto.c` and `crypto.S` provide crypto instruction
+microbenchmarks (including both PMULL widths and all SHA-1 operations).
+Build and run the same binary on baseline and patched kernels, checking
+its checksums against QEMU:
+
+```sh
+mkdir -p build
+aarch64-linux-gnu-gcc -O2 -static -o build/crypto-bench tests/bench/crypto.c tests/bench/crypto.S
+qemu-aarch64 build/crypto-bench 200000 1
+KERNEL=/path/to/bzImage scripts/run-vm.sh 'build/crypto-bench 200000 3'
+# Check fallback when optional host instructions are hidden from the VM:
+KERNEL=/path/to/bzImage KEMU_CPU=host,-aes,-pclmulqdq scripts/run-vm.sh 'build/crypto-bench 1000 1'
+```
+
+The benchmark warms translations before timing, reports time per crypto
+instruction including loop/operand overhead, and prints deterministic
+checksums. It is not a complete cipher or hash throughput test.
 
 `tests/jit-workloads/run.sh` runs JIT-heavy programs for Java, Node, LuaJIT,
 PyPy and Ruby inside an arm64 userland, each with the guest's JIT on and off,

@@ -8,7 +8,7 @@ initrd=$here/build/initramfs.cpio.gz
 [ -f "$initrd" ] || "$here/scripts/mkinitramfs.sh" "$initrd" >/dev/null
 append="console=ttyS0 panic=-1 oops=panic quiet loglevel=4 ${KEMU_APPEND:-}"
 if [ $# -gt 0 ]; then printf '%s\n' "$*" > "$here/build/vmcmd.sh"; append="$append kemu_test=1"; fi
-exec timeout ${KEMU_TIMEOUT:-300} qemu-system-x86_64 -enable-kvm -cpu host -smp ${KEMU_SMP:-4} -m ${KEMU_MEM:-2048} \
+exec timeout ${KEMU_TIMEOUT:-300} qemu-system-x86_64 -enable-kvm -cpu "${KEMU_CPU:-host}" -smp ${KEMU_SMP:-4} -m ${KEMU_MEM:-2048} \
   -kernel "$kernel" -initrd "$initrd" -append "$append" \
   -nographic -no-reboot \
   -fsdev local,id=fs0,path="$here",security_model=none -device virtio-9p-pci,fsdev=fs0,mount_tag=kemu \
