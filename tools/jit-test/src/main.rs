@@ -208,7 +208,7 @@ fn lookup_or_translate(pc: u64) -> Result<u64, Fault> {
     }
     let base = REGION + hh.code_used as u64;
     let out = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, CODE_SIZE - hh.code_used) };
-    let cfg = Cfg { stubs: hh.stubs.addrs(REGION), code_uaddr: base, reloc: std::env::var("RELOC").is_ok() };
+    let cfg = Cfg { stubs: hh.stubs.addrs(REGION), code_uaddr: base, reloc: std::env::var("RELOC").is_ok(), tbi: std::env::var("TBI").is_ok() };
     match t1::translate(&mut UEnv, pc, out, &cfg, &mut hh.scratch) {
         Ok(r) => {
             hh.blocks.push((base, r.size));
@@ -740,6 +740,11 @@ fn init_state(r: &mut Rng) -> CpuState {
     s.x[22] = DATA + 0x8000 + 8 * r.below(16);
     s.x[23] = 8 * r.below(8);
     s.sp = DATA + 0x8000;
+    if std::env::var("TBI").is_ok() {
+        // Tagged base pointers (top byte ignored by data accesses).
+        s.x[20] |= r.below(256) << 56;
+        s.x[22] |= r.below(256) << 56;
+    }
     s.nzcv = (r.below(16)) << 28;
     for i in 0..32 {
         s.v[i] = [fpval(r), fpval(r)];

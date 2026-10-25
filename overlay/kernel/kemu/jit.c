@@ -117,6 +117,7 @@ void kemu_jit_free(struct kemu_mm *km)
 		kemu_chunk_free(km, c);
 	xa_destroy(&km->blocks);
 	kemu_inval_free(km);
+	xa_destroy(&km->tbi_pcs);
 	kvfree(km->scratch);
 	km->scratch = NULL;
 }
@@ -532,7 +533,7 @@ static int kemu_translate(struct kemu_mm *km, u64 pc, unsigned long *main,
 	struct kemu_xc_key key;
 	unsigned long off, uaddr;
 	u64 pages[KEMU_MAX_PAGES];
-	bool cacheable;
+	bool cacheable, tbi;
 	int c, err, tries = 0, npages = -1;
 	u64 gpc;
 	u32 moff;
@@ -554,7 +555,9 @@ static int kemu_translate(struct kemu_mm *km, u64 pc, unsigned long *main,
 		return 0;
 	}
 
-	cacheable = kemu_xc_key(pc, &key);
+	/* Blocks that keep faulting on tagged pointers mask addresses (TBI). */
+	tbi = xa_load(&km->tbi_pcs, pc >> 2) != NULL;
+	cacheable = !tbi && kemu_xc_key(pc, &key);
 	for (;;) {
 		if (km->cur_chunk < 0) {
 			err = kemu_chunk_new(km);
@@ -574,7 +577,7 @@ static int kemu_translate(struct kemu_mm *km, u64 pc, unsigned long *main,
 		}
 		err = kemu_rs_translate(km->scratch, pc, out,
 					KEMU_CHUNK_SIZE - km->chunk_used[c], uaddr,
-					km->code_base, &km->stubs, res, cacheable);
+					km->code_base, &km->stubs, res, cacheable, tbi);
 		if (err == -ENOSPC && km->chunk_used[c] > 0 && tries++ < 4) {
 			km->cur_chunk = -1;
 			continue;
@@ -779,6 +782,59 @@ void kemu_jit_exit_to_user(struct kemu_thread *kt, struct pt_regs *regs)
 		kt->cpu->scratch[KEMU_MXCSR_SLOT] =
 			kemu_rs_mxcsr_from(kt->cpu->fpcr, kt->cpu->fpsr);
 		kt->flags &= ~KEMU_TF_KSTATE;
+	}
+}
+
+/*
+ * #GP in translated code: a non-canonical data address. On arm64 that is a
+ * tagged pointer (TBI ignores the top byte) or an address beyond the VA
+ * range (a translation fault). Untagged code runs without masking, so run
+ * the instruction in the interpreter, which applies TBI, and either carry
+ * on or deliver the fault as arm64 would. Blocks that do this often are
+ * retranslated with address masking.
+ */
+#define KEMU_TBI_RETRANSLATE	8
+
+bool kemu_user_gp(struct pt_regs *regs)
+{
+	struct kemu_thread *kt = current->kemu;
+	struct kemu_mm *km = current->mm->kemu;
+	unsigned long ip = kemu_reg(regs, ip), off, boff;
+	struct kemu_blkinfo *bi;
+	struct kemu_rs_exit ex;
+	size_t len;
+	u8 *blk;
+
+	if (!kt || !km || ip < km->code_base + KEMU_CHUNK_SIZE ||
+	    ip >= km->code_base + KEMU_CODE_SIZE)
+		return false;
+	off = ip - km->code_base;
+	kemu_materialize(regs);
+
+	mutex_lock(&km->lock);
+	blk = kemu_find_block(km, off, &len);
+	if (blk) {
+		boff = (off & ~(KEMU_CHUNK_SIZE - 1)) +
+		       (blk - (u8 *)km->chunks[off >> KEMU_CHUNK_SHIFT]);
+		bi = xa_load(&km->binfo, boff / KEMU_BLOCK_ALIGN);
+		if (bi && ++bi->tbi_faults >= KEMU_TBI_RETRANSLATE &&
+		    !xa_err(xa_store(&km->tbi_pcs, bi->pc >> 2, xa_mk_value(1), GFP_KERNEL)))
+			kemu_blk_kill(km, boff);
+	}
+	mutex_unlock(&km->lock);
+
+	kt->shadow = *kt->cpu;
+	kemu_rs_interp(&kt->shadow, 1, &ex);
+	switch (ex.kind) {
+	case KEMU_EXIT_BUDGET:
+		*kt->cpu = kt->shadow;
+		km->tbi_emul++;
+		return true;
+	case KEMU_EXIT_FAULT:
+		kemu_force_fault(ex.addr, ex.access, ex.aux);
+		return true;
+	default:
+		return false;
 	}
 }
 

@@ -960,6 +960,10 @@ impl<'s, 'b> Gen<'s, 'b> {
             match self.gp(rn, true) {
                 Gp::R(r) => self.a.lea(Sz::Q, r, Mem::bisd(r, m, 0, 0)),
                 Gp::M(o) => {
+                    if self.cfg.tbi {
+                        // `base` holds the untagged copy; keep the tag.
+                        self.a.load(Sz::Q, base, Mem::gs(o));
+                    }
                     self.a.lea(Sz::Q, base, Mem::bisd(base, m, 0, 0));
                     self.a.store(Sz::Q, Mem::gs(o), base);
                 }
@@ -1006,6 +1010,10 @@ impl<'s, 'b> Gen<'s, 'b> {
                 match self.gp(rn, true) {
                     Gp::R(r) => self.a.lea(Sz::Q, r, Mem::bisd(r, m, 0, 0)),
                     Gp::M(o) => {
+                        if self.cfg.tbi {
+                            // `base` holds the untagged copy; keep the tag.
+                            self.a.load(Sz::Q, base, Mem::gs(o));
+                        }
                         self.a.lea(Sz::Q, base, Mem::bisd(base, m, 0, 0));
                         self.a.store(Sz::Q, Mem::gs(o), base);
                     }

@@ -43,6 +43,10 @@ Performance, measured against native x86_64 builds of the same C source
 | qsort | ~84% |
 | matmul (NEON) | ~65% |
 
+Tagged pointers work as on arm64 Linux: the top byte of data addresses is
+ignored (TBI). Untagged code runs at full speed; code that uses tags is
+retranslated with address masking after a few faults.
+
 io_uring isn't offered to arm64 programs (the syscalls return `ENOSYS` and
 libraries fall back to plain syscalls), because ring operations use native
 struct layouts behind kemu's back.

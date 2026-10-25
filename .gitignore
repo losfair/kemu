@@ -4,3 +4,4 @@ Cargo.lock
 tests/kernel/mtstress
 tests/kernel/lzmat
 __pycache__/
+tests/kernel/tbi

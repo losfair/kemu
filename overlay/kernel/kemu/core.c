@@ -142,6 +142,7 @@ static struct kemu_mm *kemu_mm_alloc(void)
 	xa_init(&km->binfo);
 	xa_init(&km->pages);
 	xa_init(&km->sites);
+	xa_init(&km->tbi_pcs);
 	spin_lock_init(&km->pend_lock);
 	ida_init(&km->slot_ida);
 	spin_lock_init(&km->threads_lock);
@@ -160,10 +161,10 @@ static void kemu_mm_free(struct kemu_mm *km)
 		unsigned long xe, xb;
 
 		kemu_xc_stats(&xe, &xb);
-		pr_info("kemu: %s[%d] mm stats: %lu translations (%lu from xcache), %lu lookups (%llu us), %lu chains, %lu helpers, %lu flushes, %lu invalidations (%lu blocks), %lu interp insns; xcache %lu entries %lu KiB, %ld hits %ld misses %ld stale\n",
+		pr_info("kemu: %s[%d] mm stats: %lu translations (%lu from xcache), %lu lookups (%llu us), %lu chains, %lu helpers, %lu flushes, %lu invalidations (%lu blocks), %lu tagged accesses emulated, %lu interp insns; xcache %lu entries %lu KiB, %ld hits %ld misses %ld stale\n",
 			current->comm, task_pid_nr(current), km->translations, km->xc_hits,
 			km->lookups, km->translate_ns / 1000, km->chains, km->helpers,
-			km->flushes, km->invals, km->killed, km->interp_insns, xe, xb >> 10,
+			km->flushes, km->invals, km->killed, km->tbi_emul, km->interp_insns, xe, xb >> 10,
 			atomic_long_read(&kemu_xc_hits), atomic_long_read(&kemu_xc_misses),
 			atomic_long_read(&kemu_xc_stale));
 	}

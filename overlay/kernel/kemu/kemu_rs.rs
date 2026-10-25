@@ -352,6 +352,7 @@ pub unsafe extern "C" fn kemu_rs_translate(
     info: *const KemuStubs,
     res: *mut KemuTrans,
     reloc: bool,
+    tbi: bool,
 ) -> c_int {
     // SAFETY: `Scratch` is repr(C) and made only of integers, so any
     // initialized bytes are a valid value; the rest is guaranteed by the
@@ -364,7 +365,7 @@ pub unsafe extern "C" fn kemu_rs_translate(
             &mut *res,
         )
     };
-    let cfg = t1::Cfg { stubs: info.addrs(stubs_base), code_uaddr, reloc };
+    let cfg = t1::Cfg { stubs: info.addrs(stubs_base), code_uaddr, reloc, tbi };
     match t1::translate(&mut KEnv, pc, out, &cfg, s) {
         Ok(r) => {
             res.size = r.size as u64;

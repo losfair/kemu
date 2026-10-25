@@ -1285,6 +1285,18 @@ the code and its commit history are authoritative.
   sleeping in `futex()` pins all of them). The epoch is published after the table
   reset, so a thread that sees it can't pick up a stale table entry.
 - **io_uring is disabled for guests** (§11.2).
+- **Top-byte-ignore (TBI).** arm64 Linux ignores bits 63:56 of user data
+  addresses. The interpreter applies this to every data access. Translated code
+  doesn't mask addresses, so untagged programs pay nothing. A tagged pointer is
+  non-canonical on x86, so a tagged access raises #GP. A #GP hook in
+  `exc_general_protection` recovers the guest state and runs the instruction in
+  the interpreter, then continues, or delivers `SEGV_MAPERR`/`SEGV_ACCERR` with
+  the untagged address, as arm64 reports it. After 8 such faults a block is
+  retranslated with address masking (`Cfg::tbi`: the base is copied and untagged
+  with `shl 8; sar 8`; atomics and exclusives use the interpreter helper), and
+  such translations bypass the shared cache. The tagged-address syscall ABI
+  (`PR_SET_TAGGED_ADDR_CTRL`) isn't supported, so syscalls given tagged pointers
+  fail with `EFAULT` (the arm64 default).
 - **Oversized superblocks.** When exit slots or recovery points run out, the
   translation is retried with half the instruction limit instead of failing.
 
@@ -1301,6 +1313,10 @@ the code and its commit history are authoritative.
   translation time, flushes and targeted invalidations.
 - `kemu.stress=<n>` bumps the epoch and kicks every other thread once per n
   translations. This forces state recovery at arbitrary points in translated code.
+  (State recovery once mistook a block's exit trampolines, which run after the
+  remap epilogue, for remapped code. A thread interrupted there got one guest
+  register's value in another, which crashed HotSpot's C2 compiler about once in
+  60 runs. Trampolines now start with an explicit canonical `REMAP 0` point.)
 - kemu-user:
   - `KEMU_JIT_STATS` prints a helper-instruction histogram;
   - `KEMU_XLAT_BENCH=<span>` measures translator throughput;

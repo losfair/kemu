@@ -81,6 +81,15 @@ static void test_signals(void)
 		      "addr %p code %d", segv_addr, segv_code);
 	}
 
+	/* Beyond the 48-bit VA range (non-canonical on x86): SEGV_MAPERR + address */
+	if (!sigsetjmp(segv_jb, 1)) {
+		(void)*(volatile long *)0x0041c000b0004680UL;
+		CHECK("sigsegv-high", 0, "no fault");
+	} else {
+		CHECK("sigsegv-high", segv_addr == (void *)0x0041c000b0004680UL && segv_code == SEGV_MAPERR,
+		      "addr %p code %d", segv_addr, segv_code);
+	}
+
 	/* Read-only page: SEGV_ACCERR */
 	char *ro = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (!sigsetjmp(segv_jb, 1)) {

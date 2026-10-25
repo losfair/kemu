@@ -188,6 +188,11 @@ pub struct Cfg {
     /// guest-PC immediates are full imm64s, and relocations and guest-code
     /// dependencies are recorded in the scratch area.
     pub reloc: bool,
+    /// Apply top-byte-ignore to guest data addresses (TBI, as arm64 Linux
+    /// configures EL0). Untagged code runs without it; the kernel falls
+    /// back to the interpreter when a tagged access faults, and
+    /// retranslates blocks that do that often with this set.
+    pub tbi: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1448,13 +1453,32 @@ impl<'s, 'b> Gen<'s, 'b> {
 
     /// Base register value for an access (SP-encoded rn) in a register.
     fn base(&mut self, rn: u32) -> Reg {
-        self.get(rn, true, RDX)
+        let r = self.get(rn, true, RDX);
+        if !self.cfg.tbi {
+            return r;
+        }
+        if r != RDX {
+            self.a.mov_rr(Sz::Q, RDX, r);
+        }
+        self.untag(RDX);
+        RDX
+    }
+
+    /// Strip a TBI tag in place: bits 63:56 become copies of bit 55.
+    fn untag(&mut self, r: Reg) {
+        self.clobber();
+        self.a.shift_ri(Shift::Shl, Sz::Q, r, 8);
+        self.a.shift_ri(Shift::Sar, Sz::Q, r, 8);
     }
 
     fn writeback(&mut self, rn: u32, base: Reg, off: i64) {
         match self.gp(rn, true) {
             Gp::R(r) => self.a.lea(Sz::Q, r, Mem::bd(r, off as i32)),
             Gp::M(o) => {
+                if self.cfg.tbi {
+                    // `base` holds the untagged copy; keep the tag.
+                    self.a.load(Sz::Q, base, Mem::gs(o));
+                }
                 self.a.lea(Sz::Q, base, Mem::bd(base, off as i32));
                 self.a.store(Sz::Q, Mem::gs(o), base);
             }
@@ -1618,9 +1642,12 @@ impl<'s, 'b> Gen<'s, 'b> {
             }
         };
         let base = self.get(rn, true, RAX);
-        let m = if base == RAX {
+        let m = if base == RAX || self.cfg.tbi {
             // Free RAX for data: fold into RDX.
-            self.a.lea(Sz::Q, RDX, Mem::bisd(RAX, idx, shift as u8, 0));
+            self.a.lea(Sz::Q, RDX, Mem::bisd(base, idx, shift as u8, 0));
+            if self.cfg.tbi {
+                self.untag(RDX);
+            }
             Mem::b(RDX)
         } else {
             Mem::bisd(base, idx, shift as u8, 0)
@@ -1699,6 +1726,9 @@ impl<'s, 'b> Gen<'s, 'b> {
     }
 
     fn atomic(&mut self, op: RmwOp, size: u8, rs: u32, rt: u32, rn: u32) -> bool {
+        if self.cfg.tbi {
+            return false; // RDX is needed after base(): use the helper
+        }
         let sz = match size {
             0 => Sz::B,
             1 => Sz::W,
@@ -1809,6 +1839,9 @@ impl<'s, 'b> Gen<'s, 'b> {
     }
 
     fn cas(&mut self, size: u8, rs: u32, rt: u32, rn: u32) -> bool {
+        if self.cfg.tbi {
+            return false; // RDX is needed after base(): use the helper
+        }
         let sz = match size {
             0 => Sz::B,
             1 => Sz::W,
@@ -1840,6 +1873,9 @@ impl<'s, 'b> Gen<'s, 'b> {
     /// LDXR / STXR (single register). The monitor lives in the state page
     /// with the same layout the interpreter uses.
     fn excl(&mut self, load: bool, size: u8, rs: u32, rt: u32, rn: u32) -> bool {
+        if self.cfg.tbi {
+            return false; // RDX is needed after base(): use the helper
+        }
         let sz = [Sz::B, Sz::W, Sz::D, Sz::Q][(size & 3) as usize];
         if !matches!(self.gp(rn, true), Gp::R(_)) {
             return false;
