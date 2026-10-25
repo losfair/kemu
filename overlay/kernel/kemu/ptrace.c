@@ -36,12 +36,12 @@ static void kemu_sync_syscall_view(struct task_struct *target)
 
 	if (!(kt->flags & KEMU_TF_IN_SVC))
 		return;
-	regs->di = kt->cpu->x[0];
-	regs->si = kt->cpu->x[1];
-	regs->dx = kt->cpu->x[2];
-	regs->r10 = kt->cpu->x[3];
-	regs->r8 = kt->cpu->x[4];
-	regs->r9 = kt->cpu->x[5];
+	kemu_reg(regs, di) = kt->cpu->x[0];
+	kemu_reg(regs, si) = kt->cpu->x[1];
+	kemu_reg(regs, dx) = kt->cpu->x[2];
+	kemu_reg(regs, r10) = kt->cpu->x[3];
+	kemu_reg(regs, r8) = kt->cpu->x[4];
+	kemu_reg(regs, r9) = kt->cpu->x[5];
 }
 
 static int kemu_gpr_set(struct task_struct *target, const struct user_regset *regset,
@@ -130,7 +130,7 @@ static int kemu_syscall_get(struct task_struct *target, const struct user_regset
 			    struct membuf to)
 {
 	int nr = (target->kemu->flags & KEMU_TF_IN_SVC) ?
-		 (int)task_pt_regs(target)->orig_ax : -1;
+		 (int)kemu_reg(task_pt_regs(target), orig_ax) : -1;
 
 	return membuf_store(&to, nr);
 }
@@ -140,13 +140,13 @@ static int kemu_syscall_set(struct task_struct *target, const struct user_regset
 			    const void __user *ubuf)
 {
 	int nr = (target->kemu->flags & KEMU_TF_IN_SVC) ?
-		 (int)task_pt_regs(target)->orig_ax : -1;
+		 (int)kemu_reg(task_pt_regs(target), orig_ax) : -1;
 	int err = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &nr, 0, sizeof(nr));
 
 	if (err)
 		return err;
 	if (target->kemu->flags & KEMU_TF_IN_SVC)
-		task_pt_regs(target)->orig_ax = nr;
+		kemu_reg(task_pt_regs(target), orig_ax) = nr;
 	return 0;
 }
 

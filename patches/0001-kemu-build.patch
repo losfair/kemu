@@ -34,3 +34,14 @@ index 9fe722305..8882d1088 100644
  obj-y += unwind/
  obj-$(CONFIG_MODULES) += module/
  
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -250,6 +250,7 @@ config X86
+ 	select HAVE_IRQ_TIME_ACCOUNTING
+ 	select HAVE_JUMP_LABEL_HACK		if HAVE_OBJTOOL
++	select HAVE_KEMU				if X86_64
+ 	select HAVE_KERNEL_BZIP2
+ 	select HAVE_KERNEL_GZIP
+ 	select HAVE_KERNEL_LZ4
+ 	select HAVE_KERNEL_LZMA

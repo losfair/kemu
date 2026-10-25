@@ -83,11 +83,11 @@ static int kemu_setup_rt_frame(struct ksignal *ksig, sigset_t *set)
 	frame = round_down(next_frame, 16) - KEMU_SIGFRAME_SIZE;
 
 	if ((sig == SIGSEGV || sig == SIGBUS) && !kt->fault_esr &&
-	    current->thread.trap_nr == X86_TRAP_PF) {
+	    kemu_fault_trap() == X86_TRAP_PF) {
 		/* A fault in translated code: describe it as an arm64 abort. */
-		unsigned long ec = current->thread.error_code;
+		unsigned long ec = kemu_fault_error();
 
-		kt->fault_addr = current->thread.cr2;
+		kt->fault_addr = kemu_fault_address();
 		kt->fault_esr = ESR_IL | ((u64)((ec & X86_PF_INSTR) ? ESR_EC_IABT_LOW :
 						ESR_EC_DABT_LOW) << ESR_EC_SHIFT) |
 				((ec & X86_PF_WRITE) ? ESR_WNR : 0) |
@@ -148,8 +148,8 @@ void kemu_do_signal(struct pt_regs *regs)
 	if (kemu_debug)
 		pr_info("kemu: %s[%d] signal pending %lx at pc %llx (host ip %lx trap %ld cr2 %lx err %lx) x0=%llx sp=%llx lr=%llx\n",
 			current->comm, task_pid_nr(current), current->pending.signal.sig[0],
-			cpu->pc, regs->ip, current->thread.trap_nr, current->thread.cr2,
-			current->thread.error_code, cpu->x[0], cpu->sp, cpu->x[30]);
+			cpu->pc, kemu_reg(regs, ip), kemu_fault_trap(), kemu_fault_address(),
+			kemu_fault_error(), cpu->x[0], cpu->sp, cpu->x[30]);
 	if (kemu_debug) {
 		u64 fp = cpu->x[29], fr[2];
 		int i;
@@ -171,7 +171,7 @@ void kemu_do_signal(struct pt_regs *regs)
 	if (syscall) {
 		retval = (long)cpu->x[0];
 		kt->flags &= ~KEMU_TF_IN_SVC;
-		regs->orig_ax = -1;
+		kemu_reg(regs, orig_ax) = -1;
 		switch (retval) {
 		case -ERESTARTNOHAND:
 		case -ERESTARTSYS:
@@ -187,7 +187,7 @@ void kemu_do_signal(struct pt_regs *regs)
 		if (kemu_debug)
 			pr_info("kemu: %s[%d] sig %d code %d addr %px at pc %llx (host ip %lx) x0=%llx sp=%llx lr=%llx\n",
 				current->comm, task_pid_nr(current), ksig.sig, ksig.info.si_code,
-				ksig.info.si_addr, cpu->pc, regs->ip, cpu->x[0], cpu->sp, cpu->x[30]);
+				ksig.info.si_addr, cpu->pc, kemu_reg(regs, ip), cpu->x[0], cpu->sp, cpu->x[30]);
 		if (syscall && cpu->pc == restart &&
 		    (retval == -ERESTARTNOHAND ||
 		     retval == -ERESTART_RESTARTBLOCK ||

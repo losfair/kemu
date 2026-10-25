@@ -28,6 +28,15 @@ DECLARE_STATIC_KEY_FALSE(kemu_active_key);
 /* x86 syscall entry for kemu tasks (noinstr). Returns true for SYSRET. */
 bool kemu_do_syscall(struct pt_regs *regs, int nr);
 
+/* Architecture host services. cmpxchg receives a naturally aligned address,
+ * size 1/2/4/8/16, and old[1] initialized to zero by the common layer.
+ * Return 0 with the previous value in old, or -EFAULT on inaccessible memory.
+ * Counter values and frequency must describe the same monotonic timebase. */
+int kemu_arch_cmpxchg(u64 addr, u32 size, const u64 *exp, const u64 *new, u64 *old);
+u64 kemu_arch_cntvct(void);
+u64 kemu_arch_cntfrq(void);
+bool kemu_arch_random(u64 *out);
+
 /* Called with interrupts disabled right before returning to user mode. */
 void kemu_exit_to_user(struct pt_regs *regs);
 

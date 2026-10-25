@@ -14,6 +14,8 @@
 #include <linux/sched.h>
 #include <linux/build_bug.h>
 
+#include <asm/kemu.h>
+
 /* ---- Guest CPU state (mirror of rust/kemu_core/src/state.rs) ---- */
 
 struct kemu_cpu {

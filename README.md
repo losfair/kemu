@@ -85,6 +85,21 @@ When working on kemu itself, `scripts/build.sh` re-syncs `overlay/` into an
 already patched tree (`$LINUX`, default `~/src/linux-6.18`) and rebuilds.
 `scripts/export-patches.sh` regenerates `patches/` from that tree.
 
+### Architecture interface
+
+The common emulator uses the architecture interface in `asm/kemu.h` for
+register access, syscall entry, TLS, fault information and ELF personality.
+The native implementation lives in `overlay/arch/x86/`; other x86_64 kernel
+ports supply their own architecture code and select `HAVE_KEMU`.
+
+Host atomic access, the virtual counter and random-number generation use
+the `kemu_arch_*` services declared in `include/linux/kemu.h`. The common
+layer validates atomic sizes and alignment before calling the backend.
+Architecture entry code must run syscall-exit tracing after `kemu_svc()`
+returns, so tracers see the result in the emulated register state. Kernel
+ports also supply the lifecycle, signal, fault and ptrace call sites from
+that header and the native syscall wrappers used by `syscall_table.h`.
+
 ## Running
 
 On a kemu kernel, arm64 binaries run directly:

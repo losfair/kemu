@@ -82,14 +82,14 @@ u32 kemu_oflags_to_guest(u32 f)
 
 long kemu_sys_openat(struct pt_regs *regs)
 {
-	regs->dx = kemu_oflags_to_host(regs->dx);
+	kemu_reg(regs, dx) = kemu_oflags_to_host(kemu_reg(regs, dx));
 	return __x64_sys_openat(regs);
 }
 
 long kemu_sys_openat2(struct pt_regs *regs)
 {
-	struct open_how __user *uhow = (void __user *)regs->dx;
-	size_t usize = regs->r10;
+	struct open_how __user *uhow = (void __user *)kemu_reg(regs, dx);
+	size_t usize = kemu_reg(regs, r10);
 	struct open_how how;
 	int err;
 
@@ -103,16 +103,16 @@ long kemu_sys_openat2(struct pt_regs *regs)
 		return err;
 	/* Bits outside the translated set are validated by the core. */
 	how.flags = (how.flags & ~(u64)U32_MAX) | kemu_oflags_to_host((u32)how.flags);
-	return do_sys_openat2((int)regs->di, (const char __user *)regs->si, &how);
+	return do_sys_openat2((int)kemu_reg(regs, di), (const char __user *)kemu_reg(regs, si), &how);
 }
 
 long kemu_sys_fcntl(struct pt_regs *regs)
 {
-	unsigned int cmd = regs->si;
+	unsigned int cmd = kemu_reg(regs, si);
 	long ret;
 
 	if (cmd == F_SETFL)
-		regs->dx = kemu_oflags_to_host(regs->dx);
+		kemu_reg(regs, dx) = kemu_oflags_to_host(kemu_reg(regs, dx));
 	ret = __x64_sys_fcntl(regs);
 	if (cmd == F_GETFL && ret >= 0)
 		ret = kemu_oflags_to_guest(ret);
@@ -121,19 +121,19 @@ long kemu_sys_fcntl(struct pt_regs *regs)
 
 long kemu_sys_pipe2(struct pt_regs *regs)
 {
-	regs->si = kemu_oflags_to_host(regs->si);
+	kemu_reg(regs, si) = kemu_oflags_to_host(kemu_reg(regs, si));
 	return __x64_sys_pipe2(regs);
 }
 
 long kemu_sys_open_by_handle_at(struct pt_regs *regs)
 {
-	regs->dx = kemu_oflags_to_host(regs->dx);
+	kemu_reg(regs, dx) = kemu_oflags_to_host(kemu_reg(regs, dx));
 	return __x64_sys_open_by_handle_at(regs);
 }
 
 long kemu_sys_fanotify_init(struct pt_regs *regs)
 {
-	regs->si = kemu_oflags_to_host(regs->si);
+	kemu_reg(regs, si) = kemu_oflags_to_host(kemu_reg(regs, si));
 	return __x64_sys_fanotify_init(regs);
 }
 
@@ -195,11 +195,11 @@ long kemu_sys_newfstatat(struct pt_regs *regs)
 	struct kstat stat;
 	int err;
 
-	err = vfs_fstatat((int)regs->di, (const char __user *)regs->si, &stat,
-			  (int)regs->r10);
+	err = vfs_fstatat((int)kemu_reg(regs, di), (const char __user *)kemu_reg(regs, si), &stat,
+			  (int)kemu_reg(regs, r10));
 	if (err)
 		return err;
-	return kemu_cp_stat(&stat, (void __user *)regs->dx);
+	return kemu_cp_stat(&stat, (void __user *)kemu_reg(regs, dx));
 }
 
 long kemu_sys_fstat(struct pt_regs *regs)
@@ -207,10 +207,10 @@ long kemu_sys_fstat(struct pt_regs *regs)
 	struct kstat stat;
 	int err;
 
-	err = vfs_fstat((unsigned int)regs->di, &stat);
+	err = vfs_fstat((unsigned int)kemu_reg(regs, di), &stat);
 	if (err)
 		return err;
-	return kemu_cp_stat(&stat, (void __user *)regs->si);
+	return kemu_cp_stat(&stat, (void __user *)kemu_reg(regs, si));
 }
 
 /* ---- epoll: arm64 struct epoll_event is 16 bytes, x86_64's is packed (12) ---- */
@@ -223,10 +223,10 @@ struct kemu_epoll_event {
 
 long kemu_sys_epoll_ctl(struct pt_regs *regs)
 {
-	struct kemu_epoll_event __user *uev = (void __user *)regs->r10;
+	struct kemu_epoll_event __user *uev = (void __user *)kemu_reg(regs, r10);
 	struct kemu_epoll_event gev;
 	struct epoll_event ev = {};
-	int op = regs->si;
+	int op = kemu_reg(regs, si);
 
 	if (ep_op_has_event(op)) {
 		if (copy_from_user(&gev, uev, sizeof(gev)))
@@ -234,7 +234,7 @@ long kemu_sys_epoll_ctl(struct pt_regs *regs)
 		ev.events = gev.events;
 		ev.data = gev.data;
 	}
-	return do_epoll_ctl((int)regs->di, op, (int)regs->dx, &ev, false);
+	return do_epoll_ctl((int)kemu_reg(regs, di), op, (int)kemu_reg(regs, dx), &ev, false);
 }
 
 /*
@@ -264,21 +264,21 @@ long kemu_sys_epoll_pwait(struct pt_regs *regs)
 {
 	long n = __x64_sys_epoll_pwait(regs);
 
-	return n > 0 ? kemu_epoll_expand((void __user *)regs->si, n) : n;
+	return n > 0 ? kemu_epoll_expand((void __user *)kemu_reg(regs, si), n) : n;
 }
 
 long kemu_sys_epoll_pwait2(struct pt_regs *regs)
 {
 	long n = __x64_sys_epoll_pwait2(regs);
 
-	return n > 0 ? kemu_epoll_expand((void __user *)regs->si, n) : n;
+	return n > 0 ? kemu_epoll_expand((void __user *)kemu_reg(regs, si), n) : n;
 }
 
 /* ---- misc ---- */
 
 long kemu_sys_uname(struct pt_regs *regs)
 {
-	struct new_utsname __user *u = (void __user *)regs->di;
+	struct new_utsname __user *u = (void __user *)kemu_reg(regs, di);
 	static const char machine[__NEW_UTS_LEN + 1] = "aarch64";
 	long ret = __x64_sys_newuname(regs);
 
@@ -292,6 +292,6 @@ long kemu_sys_uname(struct pt_regs *regs)
 /* arm64: clone(flags, newsp, ptid, tls, ctid); x86_64: (..., ctid, tls). */
 long kemu_sys_clone(struct pt_regs *regs)
 {
-	swap(regs->r10, regs->r8);
+	swap(kemu_reg(regs, r10), kemu_reg(regs, r8));
 	return __x64_sys_clone(regs);
 }
