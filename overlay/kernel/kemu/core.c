@@ -139,6 +139,10 @@ static struct kemu_mm *kemu_mm_alloc(void)
 	init_rwsem(&km->chunk_sem);
 	xa_init(&km->slots);
 	xa_init(&km->blocks);
+	xa_init(&km->binfo);
+	xa_init(&km->pages);
+	xa_init(&km->sites);
+	spin_lock_init(&km->pend_lock);
 	ida_init(&km->slot_ida);
 	spin_lock_init(&km->threads_lock);
 	INIT_LIST_HEAD(&km->threads);
@@ -156,10 +160,10 @@ static void kemu_mm_free(struct kemu_mm *km)
 		unsigned long xe, xb;
 
 		kemu_xc_stats(&xe, &xb);
-		pr_info("kemu: %s[%d] mm stats: %lu translations (%lu from xcache), %lu lookups (%llu us), %lu chains, %lu helpers, %lu flushes, %lu interp insns; xcache %lu entries %lu KiB, %ld hits %ld misses %ld stale\n",
+		pr_info("kemu: %s[%d] mm stats: %lu translations (%lu from xcache), %lu lookups (%llu us), %lu chains, %lu helpers, %lu flushes, %lu invalidations (%lu blocks), %lu interp insns; xcache %lu entries %lu KiB, %ld hits %ld misses %ld stale\n",
 			current->comm, task_pid_nr(current), km->translations, km->xc_hits,
 			km->lookups, km->translate_ns / 1000, km->chains, km->helpers,
-			km->flushes, km->interp_insns, xe, xb >> 10,
+			km->flushes, km->invals, km->killed, km->interp_insns, xe, xb >> 10,
 			atomic_long_read(&kemu_xc_hits), atomic_long_read(&kemu_xc_misses),
 			atomic_long_read(&kemu_xc_stale));
 	}
@@ -596,8 +600,8 @@ void kemu_thread_exit(struct task_struct *tsk)
 
 /*
  * An executable mapping was unmapped or lost PROT_EXEC (mmap lock held).
- * Translations of it are flushed by the thread that did it before it
- * returns to user mode.
+ * Translations of it are invalidated (kemu_jit_pending) by the thread that
+ * did it before it returns to user mode.
  */
 void kemu_unmapped(struct mm_struct *mm, unsigned long start, unsigned long end)
 {
@@ -606,8 +610,21 @@ void kemu_unmapped(struct mm_struct *mm, unsigned long start, unsigned long end)
 
 	if (!km || start >= end)
 		return;
-	if (xa_find(&km->blocks, &idx, (end - 1) >> 2, XA_PRESENT))
-		atomic_set(&km->flush_pending, 1);
+	if (!xa_find(&km->blocks, &idx, (end - 1) >> 2, XA_PRESENT)) {
+		idx = start >> PAGE_SHIFT;
+		if (!xa_find(&km->pages, &idx, (end - 1) >> PAGE_SHIFT, XA_PRESENT))
+			return;
+	}
+	spin_lock(&km->pend_lock);
+	if (!atomic_read(&km->flush_pending)) {
+		km->pend_lo = start;
+		km->pend_hi = end;
+	} else {
+		km->pend_lo = min(km->pend_lo, (u64)start);
+		km->pend_hi = max(km->pend_hi, (u64)end);
+	}
+	atomic_set(&km->flush_pending, 1);
+	spin_unlock(&km->pend_lock);
 }
 
 /* Hide kemu's private mappings from /proc/<pid>/{maps,smaps}. */

@@ -577,3 +577,33 @@ pub unsafe extern "C" fn kemu_rs_crc_table(out: *mut u32) {
     let o = unsafe { core::slice::from_raw_parts_mut(out, 256) };
     o.copy_from_slice(&t);
 }
+
+/// The guest pages (page-aligned) the last translation read instructions
+/// from; returns how many were written to `out`, or -1 if there were more
+/// than `max`.
+///
+/// # Safety
+/// `scratch` as in kemu_rs_translate; `out` must be `max` writable u64s.
+#[no_mangle]
+pub unsafe extern "C" fn kemu_rs_trans_pages(scratch: *const u8, out: *mut u64, max: usize) -> core::ffi::c_int {
+    // SAFETY: guaranteed by the caller.
+    let (s, o) = unsafe { (&*(scratch as *const t1::Scratch), core::slice::from_raw_parts_mut(out, max)) };
+    match s.pages() {
+        Some(p) if p.len() <= o.len() => {
+            o[..p.len()].copy_from_slice(p);
+            p.len() as core::ffi::c_int
+        }
+        _ => -1,
+    }
+}
+
+/// Same for a block taken from the shared cache and used for guest `pc`.
+///
+/// # Safety
+/// `blob` must be `blen` readable bytes; `out` must be `max` writable u64s.
+#[no_mangle]
+pub unsafe extern "C" fn kemu_rs_xc_pages(blob: *const u8, blen: usize, pc: u64, out: *mut u64, max: usize) -> core::ffi::c_int {
+    // SAFETY: guaranteed by the caller.
+    let (b, o) = unsafe { (core::slice::from_raw_parts(blob, blen), core::slice::from_raw_parts_mut(out, max)) };
+    kemu_core::jit::xcache::pages(b, pc, o).map(|n| n as core::ffi::c_int).unwrap_or(-1)
+}

@@ -57,9 +57,14 @@ pub struct Scratch {
     deps: [xcache::Dep; xcache::MAX_DEPS],
     ndeps: u32,
     xc_overflow: u32,
+    /// Guest pages the translation read (for targeted invalidation).
+    pages: [u64; MAX_PAGES],
+    npages: u32,
+    pages_overflow: u32,
 }
 
 const MAX_DEAD: usize = 32;
+pub const MAX_PAGES: usize = 4;
 
 impl Scratch {
     pub const fn new() -> Self {
@@ -75,6 +80,9 @@ impl Scratch {
             deps: [xcache::Dep { pc: 0, word: 0, ok: 0 }; xcache::MAX_DEPS],
             ndeps: 0,
             xc_overflow: 0,
+            pages: [0; MAX_PAGES],
+            npages: 0,
+            pages_overflow: 0,
         }
     }
 }
@@ -98,6 +106,30 @@ impl Scratch {
             return None;
         }
         Some(xcache::blob_size(self.nrelocs as usize, self.ndeps as usize))
+    }
+
+    /// The guest pages (page-aligned addresses) the last translation read
+    /// instructions from, or None if there were more than `MAX_PAGES`.
+    pub fn pages(&self) -> Option<&[u64]> {
+        if self.pages_overflow != 0 {
+            return None;
+        }
+        self.pages.get(..self.npages as usize)
+    }
+
+    fn record_page(&mut self, pc: u64) {
+        let pg = pc & !0xfff;
+        let n = self.npages as usize;
+        if self.pages.iter().take(n).any(|&x| x == pg) {
+            return;
+        }
+        match self.pages.get_mut(n) {
+            Some(x) => {
+                *x = pg;
+                self.npages += 1;
+            }
+            None => self.pages_overflow = 1,
+        }
     }
 
     fn record_fetch(&mut self, pc: u64, r: &Result<u32, Fault>) {
@@ -129,10 +161,11 @@ impl Scratch {
     }
 }
 
-/// Instruction fetch for the translator, recording dependencies in
-/// relocatable mode.
+/// Instruction fetch for the translator: records the page, and the word as
+/// a dependency in relocatable mode.
 fn fetch<E: Env>(env: &mut E, s: &mut Scratch, rec: bool, pc: u64) -> Result<u32, Fault> {
     let r = env.fetch(pc);
+    s.record_page(pc);
     if rec {
         s.record_fetch(pc, &r);
     }
@@ -2180,6 +2213,8 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
     s.nrelocs = 0;
     s.ndeps = 0;
     s.xc_overflow = 0;
+    s.npages = 0;
+    s.pages_overflow = 0;
     // 1. Fetch and decode (once; reused by every later pass).
     let mut insns = [Insn::Undefined; MAX_INSNS];
     let mut n = 0usize;

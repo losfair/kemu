@@ -88,14 +88,8 @@ void kemu_svc(struct pt_regs *regs)
 	/* The guest PC changed (e.g. rt_sigreturn): resume at dispatch. */
 	if (READ_ONCE(cpu->pc) != next_pc)
 		kemu_redirect(kt);
-	if (atomic_read(&current->mm->kemu->flush_pending) &&
-	    atomic_xchg(&current->mm->kemu->flush_pending, 0)) {
-		struct kemu_mm *km = current->mm->kemu;
-
-		mutex_lock(&km->lock);
-		kemu_jit_flush(km);
-		mutex_unlock(&km->lock);
-	}
+	if (atomic_read(&current->mm->kemu->flush_pending))
+		kemu_jit_pending(current->mm->kemu);
 	if (kt->flags & KEMU_TF_STEP_SVC) {
 		kt->flags &= ~KEMU_TF_STEP_SVC;
 		force_sig_fault(SIGTRAP, TRAP_TRACE, (void __user *)cpu->pc);
@@ -133,7 +127,7 @@ unsigned long kemu_interp(struct kemu_thread *kt, struct kemu_mm *km, u32 budget
 	case KEMU_EXIT_ICINV:
 		if (kemu_jit_enabled) {
 			mutex_lock(&km->lock);
-			kemu_jit_flush(km);
+			kemu_jit_invalidate(km, ex.addr, ex.addr + 1);
 			mutex_unlock(&km->lock);
 		}
 		break;

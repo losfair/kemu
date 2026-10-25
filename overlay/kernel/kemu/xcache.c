@@ -129,7 +129,7 @@ bool kemu_xc_key(u64 pc, struct kemu_xc_key *k)
  * @blk_off from the code base). Returns the block size, or 0 on a miss.
  */
 size_t kemu_xc_lookup(const struct kemu_xc_key *k, u64 pc, u8 *out, size_t avail,
-		      unsigned long blk_off, struct kemu_trans *res)
+		      unsigned long blk_off, struct kemu_trans *res, u64 *pages, int *npages)
 {
 	struct kemu_xc_entry *e;
 	size_t ret = 0;
@@ -159,6 +159,8 @@ size_t kemu_xc_lookup(const struct kemu_xc_key *k, u64 pc, u8 *out, size_t avail
 	res->main_off = e->main_off;
 	res->check_off = e->check_off;
 	res->ninsns = e->ninsns;
+	*npages = kemu_rs_xc_pages(e->data + e->code_len, e->blob_len, pc, pages,
+				   KEMU_MAX_PAGES);
 	ret = e->code_len;
 	atomic_long_inc(&kemu_xc_hits);
 out:

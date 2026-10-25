@@ -8,9 +8,17 @@
  * bitmap so a host PC can be mapped back to its block (and from there,
  * using the block's metadata, to the exact guest state).
  *
- * Invalidation (IC IVAU) flushes the whole cache: live chunks are retired
- * and only freed once every thread of the mm has returned to user mode
- * past the flush (and fixed up any stale host PC on the way).
+ * Invalidation is targeted: every block records the guest pages it read
+ * instructions from (its own page plus flag look-ahead into exit targets),
+ * and IC IVAU or the loss of an executable mapping removes just the blocks
+ * on the affected pages: out of the lookup table and block index, with
+ * jumps chained into them restored. Their code stays in place, so threads
+ * still inside them are unaffected; the epoch bump sends every thread back
+ * through the dispatcher at its next kernel exit.
+ *
+ * When code space runs out, the whole cache is flushed: live chunks are
+ * retired and only freed once no thread can be executing in them (see
+ * kemu_min_epoch_seen).
  */
 
 #include <linux/kernel.h>
@@ -19,6 +27,7 @@
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
+#include <linux/sched/task_stack.h>
 #include <linux/bitmap.h>
 
 #include "kemu_internal.h"
@@ -75,6 +84,8 @@ int kemu_jit_init(struct kemu_mm *km)
 	return km->scratch ? 0 : -ENOMEM;
 }
 
+static void kemu_inval_free(struct kemu_mm *km);
+
 static void kemu_chunk_free(struct kemu_mm *km, int c)
 {
 	vfree(km->chunks[c]);
@@ -92,20 +103,49 @@ void kemu_jit_free(struct kemu_mm *km)
 	for (c = 1; c < KEMU_MAX_CHUNKS; c++)
 		kemu_chunk_free(km, c);
 	xa_destroy(&km->blocks);
+	kemu_inval_free(km);
 	kvfree(km->scratch);
 	km->scratch = NULL;
 }
 
 /* ---- threads / epochs ---- */
 
+/*
+ * Can @kt still need code retired before the current epoch? The epoch
+ * check in kemu_jit_exit_to_user() runs after the last reschedule point,
+ * with IRQs off. So a thread that is current (in a kemu op), or switched
+ * out with its guest state already in the state page (blocked in a guest
+ * syscall or op), re-reads the epoch and is redirected to the dispatcher
+ * before it runs guest code again, without looking at old blocks.
+ * Without this, one thread sleeping in futex() would pin every retired
+ * chunk. A thread interrupted inside translated code still pins them
+ * (kemu_materialize() reads the block's metadata), but it is runnable.
+ */
+static bool kemu_thread_pins_code(struct kemu_mm *km, struct kemu_thread *kt)
+{
+	unsigned long ip;
+
+	if (kt->task == current)
+		return false;
+	if (task_curr(kt->task))
+		return true;
+	if (READ_ONCE(kt->flags) & KEMU_TF_KSTATE)
+		return false;
+	ip = kemu_reg(task_pt_regs(kt->task), ip);
+	return ip >= km->code_base + KEMU_CHUNK_SIZE && ip < km->code_base + KEMU_CODE_SIZE;
+}
+
 static u64 kemu_min_epoch_seen(struct kemu_mm *km)
 {
 	struct kemu_thread *kt;
 	u64 min = km->epoch;
 
+	/* Order the epoch bump before sampling which tasks are running. */
+	smp_mb();
 	spin_lock(&km->threads_lock);
 	list_for_each_entry(kt, &km->threads, node)
-		min = min_t(u64, min, READ_ONCE(kt->epoch_seen));
+		if (kemu_thread_pins_code(km, kt))
+			min = min_t(u64, min, READ_ONCE(kt->epoch_seen));
 	spin_unlock(&km->threads_lock);
 	return min;
 }
@@ -139,23 +179,248 @@ static void kemu_reclaim(struct kemu_mm *km)
 	mmap_read_unlock(mm);
 }
 
+/* ---- targeted invalidation (all with km->lock held) ---- */
+
+/* Append @off to *@pv, reallocating; *@pv is only replaced on success. */
+static struct kemu_pgvec *kemu_pgvec_add(struct kemu_pgvec *v, u32 off)
+{
+	struct kemu_pgvec *n;
+	u32 cap;
+
+	if (v && v->n < v->cap) {
+		v->off[v->n++] = off;
+		return v;
+	}
+	cap = v ? v->cap * 2 : 4;
+	n = kmalloc(struct_size(n, off, cap), GFP_KERNEL_ACCOUNT);
+	if (!n)
+		return NULL;
+	n->n = v ? v->n : 0;
+	n->cap = cap;
+	if (v)
+		memcpy(n->off, v->off, v->n * sizeof(u32));
+	n->off[n->n++] = off;
+	return n;
+}
+
+static int kemu_blk_register(struct kemu_mm *km, u32 off, u64 pc, u32 size,
+			     const u64 *pages, int npages)
+{
+	struct kemu_blkinfo *bi = kzalloc(sizeof(*bi), GFP_KERNEL_ACCOUNT);
+	struct kemu_pgvec *v, *n;
+	unsigned long idx;
+	int i;
+
+	if (!bi)
+		return -ENOMEM;
+	bi->pc = pc;
+	bi->off = off;
+	bi->size = size;
+	if (xa_err(xa_store(&km->binfo, off / KEMU_BLOCK_ALIGN, bi, GFP_KERNEL_ACCOUNT))) {
+		kfree(bi);
+		return -ENOMEM;
+	}
+	if (npages < 0) {
+		n = kemu_pgvec_add(km->wide, off);
+		if (!n)
+			goto fail;
+		if (n != km->wide)
+			kfree(km->wide);
+		km->wide = n;
+		return 0;
+	}
+	for (i = 0; i < npages; i++) {
+		idx = pages[i] >> PAGE_SHIFT;
+		v = xa_load(&km->pages, idx);
+		n = kemu_pgvec_add(v, off);
+		if (!n)
+			goto fail;
+		if (n != v) {
+			if (xa_err(xa_store(&km->pages, idx, n, GFP_KERNEL_ACCOUNT))) {
+				kfree(n);
+				goto fail;
+			}
+			kfree(v);
+		}
+	}
+	return 0;
+fail:
+	/* Index entries already added just name a dead offset. */
+	xa_erase(&km->binfo, off / KEMU_BLOCK_ALIGN);
+	kfree(bi);
+	return -ENOMEM;
+}
+
+static u32 *kemu_site_ptr(struct kemu_mm *km, u32 site)
+{
+	unsigned long c = site >> KEMU_CHUNK_SHIFT;
+
+	if (c == 0 || c >= KEMU_MAX_CHUNKS || !km->chunks[c] || km->chunk_retired[c])
+		return NULL;
+	return (u32 *)((u8 *)km->chunks[c] + (site & (KEMU_CHUNK_SIZE - 1)));
+}
+
+/* Remove a block from the lookup structures and unchain jumps into it. */
+static void kemu_blk_kill(struct kemu_mm *km, u32 off)
+{
+	struct kemu_blkinfo *bi = xa_erase(&km->binfo, off / KEMU_BLOCK_ALIGN);
+	unsigned long *t = km->table, lo, hi, e;
+	u32 i, *p;
+	void *v;
+
+	if (!bi)
+		return;
+	v = xa_load(&km->blocks, bi->pc >> 2);
+	if (v && xa_to_value(v) == off)
+		xa_erase(&km->blocks, bi->pc >> 2);
+	lo = km->code_base + off;
+	hi = lo + bi->size;
+	i = (bi->pc >> 2) & (KEMU_TABLE_ENTRIES - 1);
+	e = READ_ONCE(t[i]);
+	if (e >= lo && e < hi)
+		WRITE_ONCE(t[i], kemu_stub(km, km->stubs.miss));
+	for (i = 0; i < bi->nin; i++) {
+		p = kemu_site_ptr(km, bi->in[i].site);
+		v = xa_load(&km->sites, bi->in[i].site);
+		/* Only if it still jumps here (an IC site may have moved on). */
+		if (p && v && READ_ONCE(*p) == bi->in[i].val)
+			WRITE_ONCE(*p, (u32)xa_to_value(v));
+	}
+	kfree(bi->in);
+	kfree(bi);
+	km->killed++;
+}
+
+/* Remove every translation that read instructions in [lo, hi). */
+void kemu_jit_invalidate(struct kemu_mm *km, u64 lo, u64 hi)
+{
+	unsigned long idx, killed = km->killed;
+	struct kemu_pgvec *v;
+	u32 i;
+
+	if (lo >= hi)
+		return;
+	km->invals++;
+	xa_for_each_range(&km->pages, idx, v, lo >> PAGE_SHIFT, (hi - 1) >> PAGE_SHIFT) {
+		xa_erase(&km->pages, idx);
+		for (i = 0; i < v->n; i++)
+			kemu_blk_kill(km, v->off[i]);
+		kfree(v);
+	}
+	if (km->wide) {
+		for (i = 0; i < km->wide->n; i++)
+			kemu_blk_kill(km, km->wide->off[i]);
+		kfree(km->wide);
+		km->wide = NULL;
+	}
+	/* Send threads back through the dispatcher (see kemu_jit_flush). */
+	if (km->killed != killed)
+		smp_store_release(&km->epoch, km->epoch + 1);
+}
+
+/* Apply invalidations recorded by kemu_unmapped(). */
+void kemu_jit_pending(struct kemu_mm *km)
+{
+	u64 lo, hi;
+
+	spin_lock(&km->pend_lock);
+	if (!atomic_xchg(&km->flush_pending, 0)) {
+		spin_unlock(&km->pend_lock);
+		return;
+	}
+	lo = km->pend_lo;
+	hi = km->pend_hi;
+	spin_unlock(&km->pend_lock);
+	mutex_lock(&km->lock);
+	kemu_jit_invalidate(km, lo, hi);
+	mutex_unlock(&km->lock);
+}
+
+static void kemu_inval_free(struct kemu_mm *km)
+{
+	struct kemu_blkinfo *bi;
+	struct kemu_pgvec *v;
+	unsigned long idx;
+
+	xa_for_each(&km->binfo, idx, bi) {
+		kfree(bi->in);
+		kfree(bi);
+	}
+	xa_destroy(&km->binfo);
+	xa_for_each(&km->pages, idx, v)
+		kfree(v);
+	xa_destroy(&km->pages);
+	xa_destroy(&km->sites);
+	kfree(km->wide);
+	km->wide = NULL;
+}
+
+/* Fork: copy the invalidation index along with the code. */
+static int kemu_inval_dup(struct kemu_mm *okm, struct kemu_mm *km)
+{
+	struct kemu_blkinfo *bi, *nb;
+	struct kemu_pgvec *v, *nv;
+	unsigned long idx;
+	void *e;
+
+	xa_for_each(&okm->binfo, idx, bi) {
+		nb = kmemdup(bi, sizeof(*bi), GFP_KERNEL_ACCOUNT);
+		if (!nb)
+			return -ENOMEM;
+		nb->in = bi->cap ? kmemdup_array(bi->in, bi->cap, sizeof(*bi->in),
+						 GFP_KERNEL_ACCOUNT) : NULL;
+		if ((bi->cap && !nb->in) ||
+		    xa_err(xa_store(&km->binfo, idx, nb, GFP_KERNEL_ACCOUNT))) {
+			kfree(nb->in);
+			kfree(nb);
+			return -ENOMEM;
+		}
+	}
+	xa_for_each(&okm->pages, idx, v) {
+		nv = kmemdup(v, struct_size(v, off, v->cap), GFP_KERNEL_ACCOUNT);
+		if (!nv || xa_err(xa_store(&km->pages, idx, nv, GFP_KERNEL_ACCOUNT))) {
+			kfree(nv);
+			return -ENOMEM;
+		}
+	}
+	if (okm->wide) {
+		km->wide = kmemdup(okm->wide, struct_size(okm->wide, off, okm->wide->cap),
+				   GFP_KERNEL_ACCOUNT);
+		if (!km->wide)
+			return -ENOMEM;
+	}
+	xa_for_each(&okm->sites, idx, e)
+		if (xa_err(xa_store(&km->sites, idx, e, GFP_KERNEL_ACCOUNT)))
+			return -ENOMEM;
+	return 0;
+}
+
 /* Flush every translation of the mm. km->lock held. */
 void kemu_jit_flush(struct kemu_mm *km)
 {
 	unsigned long *t = km->table;
 	unsigned long miss = kemu_stub(km, km->stubs.miss);
 	struct kemu_thread *kt;
+	u64 epoch = km->epoch + 1;
 	int c, i;
 
-	km->epoch++;
 	km->flushes++;
 	for (i = 0; i < KEMU_TABLE_ENTRIES; i++)
 		WRITE_ONCE(t[i], miss);
 	xa_destroy(&km->blocks);
+	kemu_inval_free(km);
 	for (c = 1; c < KEMU_MAX_CHUNKS; c++)
 		if (km->chunks[c] && !km->chunk_retired[c])
-			km->chunk_retired[c] = km->epoch;
+			km->chunk_retired[c] = epoch;
 	km->cur_chunk = -1;
+	/*
+	 * Publish the epoch only now. A thread that sees it in
+	 * kemu_jit_exit_to_user() is sent to the dispatcher, which must then
+	 * find only the reset table; otherwise it could enter a retired
+	 * chunk while claiming the new epoch, and kemu_reclaim() would free
+	 * the chunk under it.
+	 */
+	smp_store_release(&km->epoch, epoch);
 
 	/* Make every other thread pass through the kernel to fix up. */
 	spin_lock(&km->threads_lock);
@@ -177,8 +442,16 @@ static int kemu_chunk_new(struct kemu_mm *km)
 		if (!km->chunks[c])
 			break;
 	if (c == KEMU_MAX_CHUNKS) {
-		/* Out of code space: flush; a later call can reclaim. */
-		kemu_jit_flush(km);
+		/*
+		 * Out of code space: flush (unless everything is already
+		 * retired and just waiting for running threads to pass
+		 * through the kernel); a later call can reclaim.
+		 */
+		for (c = 1; c < KEMU_MAX_CHUNKS; c++)
+			if (km->chunks[c] && !km->chunk_retired[c])
+				break;
+		if (c < KEMU_MAX_CHUNKS)
+			kemu_jit_flush(km);
 		return -EAGAIN;
 	}
 	mem = __vmalloc(KEMU_CHUNK_SIZE, GFP_KERNEL_ACCOUNT);
@@ -245,8 +518,9 @@ static int kemu_translate(struct kemu_mm *km, u64 pc, unsigned long *main,
 	void *v = xa_load(&km->blocks, pc >> 2);
 	struct kemu_xc_key key;
 	unsigned long off, uaddr;
+	u64 pages[KEMU_MAX_PAGES];
 	bool cacheable;
-	int c, err, tries = 0;
+	int c, err, tries = 0, npages = -1;
 	u64 gpc;
 	u32 moff;
 	u8 *out;
@@ -263,6 +537,7 @@ static int kemu_translate(struct kemu_mm *km, u64 pc, unsigned long *main,
 		kemu_table_set(km, pc, km->code_base + off + KEMU_BLK_CHECK_OFF);
 		*main = km->code_base + off + moff;
 		res->ic_entry = km->code_base + off + KEMU_BLK_IC_OFF;
+		res->blk_off = off;
 		return 0;
 	}
 
@@ -280,7 +555,7 @@ static int kemu_translate(struct kemu_mm *km, u64 pc, unsigned long *main,
 		uaddr = km->code_base + c * KEMU_CHUNK_SIZE + km->chunk_used[c];
 		if (cacheable && kemu_xc_lookup(&key, pc, out,
 						KEMU_CHUNK_SIZE - km->chunk_used[c],
-						uaddr - km->code_base, res)) {
+						uaddr - km->code_base, res, pages, &npages)) {
 			km->xc_hits++;
 			break;
 		}
@@ -293,12 +568,16 @@ static int kemu_translate(struct kemu_mm *km, u64 pc, unsigned long *main,
 		}
 		if (err)
 			return err;
+		npages = kemu_rs_trans_pages(km->scratch, pages, KEMU_MAX_PAGES);
 		if (cacheable)
 			kemu_xc_insert(&key, km->scratch, pc, out, res,
 				       uaddr - km->code_base);
 		break;
 	}
 	off = c * KEMU_CHUNK_SIZE + km->chunk_used[c];
+	err = kemu_blk_register(km, off, pc, res->size, pages, npages);
+	if (err)
+		return err;
 	set_bit(km->chunk_used[c] / KEMU_BLOCK_ALIGN, km->blockmap[c]);
 	km->chunk_used[c] += ALIGN(res->size, KEMU_BLOCK_ALIGN);
 	err = xa_err(xa_store(&km->blocks, pc >> 2, xa_mk_value(off), GFP_KERNEL));
@@ -308,14 +587,18 @@ static int kemu_translate(struct kemu_mm *km, u64 pc, unsigned long *main,
 	kemu_table_set(km, pc, km->code_base + off + res->check_off);
 	*main = km->code_base + off + res->main_off;
 	res->ic_entry = km->code_base + off + KEMU_BLK_IC_OFF;
+	res->blk_off = off;
 	return 0;
 }
 
 /* Patch a block exit (rel32 at user address @site) to jump to @main. */
 static void kemu_chain(struct kemu_mm *km, unsigned long site, u64 target,
-		       unsigned long main, unsigned long ic_entry)
+		       unsigned long main, unsigned long ic_entry, u32 blk_off)
 {
+	struct kemu_blkinfo *bi = xa_load(&km->binfo, blk_off / KEMU_BLOCK_ALIGN);
+	struct kemu_chain_site *in;
 	unsigned long off;
+	u32 *p, cur;
 	u8 *blk;
 	size_t len;
 	u64 t;
@@ -337,10 +620,27 @@ static void kemu_chain(struct kemu_mm *km, unsigned long site, u64 target,
 	else if (t != target)
 		return;
 	rel = (s64)main - (s64)(site + 4);
-	if (rel != (s32)rel)
+	if (rel != (s32)rel || !bi)
 		return;
-	WRITE_ONCE(*(u32 *)((u8 *)km->chunks[off >> KEMU_CHUNK_SHIFT] +
-			    (off & (KEMU_CHUNK_SIZE - 1))), (u32)(s32)rel);
+	/* Record the jump so invalidating the target can undo it. */
+	if (bi->nin == bi->cap) {
+		u32 cap = bi->cap ? bi->cap * 2 : 2;
+
+		in = krealloc_array(bi->in, cap, sizeof(*in), GFP_KERNEL_ACCOUNT);
+		if (!in)
+			return;
+		bi->in = in;
+		bi->cap = cap;
+	}
+	p = (u32 *)((u8 *)km->chunks[off >> KEMU_CHUNK_SHIFT] + (off & (KEMU_CHUNK_SIZE - 1)));
+	cur = READ_ONCE(*p);
+	if (!xa_load(&km->sites, off) &&
+	    xa_err(xa_store(&km->sites, off, xa_mk_value(cur), GFP_KERNEL_ACCOUNT)))
+		return;
+	bi->in[bi->nin].site = off;
+	bi->in[bi->nin].val = (u32)(s32)rel;
+	bi->nin++;
+	WRITE_ONCE(*p, (u32)(s32)rel);
 	km->chains++;
 }
 
@@ -399,7 +699,7 @@ void kemu_materialize(struct pt_regs *regs)
 	struct kemu_mm *km = current->mm->kemu;
 	struct kemu_cpu *cpu = kt->cpu;
 	struct kemu_host_regs h;
-	unsigned long ip = kemu_reg(regs, ip), off;
+	unsigned long ip = kemu_reg(regs, ip), off, c;
 	u8 *blk;
 	size_t len;
 
@@ -426,8 +726,11 @@ void kemu_materialize(struct pt_regs *regs)
 					     ((u8 *)km->chunks[off >> KEMU_CHUNK_SHIFT] +
 					      (off & (KEMU_CHUNK_SIZE - 1))) - blk,
 					     &h, &kt->shadow)) {
-			pr_warn_ratelimited("kemu: %s[%d]: cannot recover state at %lx\n",
-					    current->comm, task_pid_nr(current), ip);
+			c = off >> KEMU_CHUNK_SHIFT;
+			pr_warn_ratelimited("kemu: %s[%d]: cannot recover state at %lx (chunk %lu %s retired %llu used %x; epoch %llu seen %llu flags %lx)\n",
+					    current->comm, task_pid_nr(current), ip, c,
+					    km->chunks[c] ? "live" : "freed", km->chunk_retired[c],
+					    km->chunk_used[c], km->epoch, kt->epoch_seen, kt->flags);
 			force_sig(SIGKILL);
 		}
 	} else {
@@ -448,7 +751,7 @@ out:
 void kemu_jit_exit_to_user(struct kemu_thread *kt, struct pt_regs *regs)
 {
 	struct kemu_mm *km = current->mm->kemu;
-	u64 epoch = READ_ONCE(km->epoch);
+	u64 epoch = smp_load_acquire(&km->epoch);
 
 	if (kt->epoch_seen != epoch) {
 		if (!(kt->flags & KEMU_TF_KSTATE) && kemu_reg(regs, ip) >= km->code_base &&
@@ -479,8 +782,13 @@ static unsigned long kemu_op_translate(struct kemu_thread *kt, struct kemu_mm *k
 
 	mutex_lock(&km->lock);
 	err = kemu_translate(km, pc, &main, &res);
-	if (!err && chain)
-		kemu_chain(km, kt->cpu->exit_info, pc, main, res.ic_entry);
+	/*
+	 * The exit site was produced in the epoch this thread last entered
+	 * user mode in; after a flush its chunk may be freed or even reused
+	 * (kemu_reclaim() doesn't wait for threads that are in the kernel).
+	 */
+	if (!err && chain && kt->epoch_seen == km->epoch)
+		kemu_chain(km, kt->cpu->exit_info, pc, main, res.ic_entry, res.blk_off);
 	km->lookups++;
 	km->translate_ns += ktime_get_ns() - t0;
 	mutex_unlock(&km->lock);
@@ -518,7 +826,7 @@ static void kemu_op_helper(struct kemu_thread *kt, struct kemu_mm *km)
 		return;
 	case KEMU_EXIT_ICINV:
 		mutex_lock(&km->lock);
-		kemu_jit_flush(km);
+		kemu_jit_invalidate(km, ex.addr, ex.addr + 1);
 		mutex_unlock(&km->lock);
 		kemu_redirect(kt);
 		return;
@@ -563,7 +871,7 @@ unsigned long kemu_op_step(struct kemu_thread *kt, struct kemu_mm *km)
 	case KEMU_EXIT_ICINV:
 		if (kemu_jit_enabled) {
 			mutex_lock(&km->lock);
-			kemu_jit_flush(km);
+			kemu_jit_invalidate(km, ex.addr, ex.addr + 1);
 			mutex_unlock(&km->lock);
 		}
 		fallthrough;
@@ -632,6 +940,8 @@ int kemu_jit_dup(struct kemu_mm *okm, struct kemu_mm *km)
 		if (xa_err(xa_store(&km->blocks, idx, v, GFP_KERNEL)))
 			return -ENOMEM;
 	}
+	if (kemu_inval_dup(okm, km))
+		return -ENOMEM;
 	/* Table entries may point at retired chunks; start clean. */
 	{
 		unsigned long *t = km->table, miss = kemu_stub(km, km->stubs.miss);

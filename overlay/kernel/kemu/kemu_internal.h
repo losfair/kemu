@@ -105,8 +105,15 @@ struct kemu_mm {
 	u64 chunk_retired[KEMU_MAX_CHUNKS]; /* 0 = live, else retire epoch */
 	int cur_chunk;			/* chunk receiving translations, -1 none */
 	struct xarray blocks;		/* guest pc >> 2 -> xa_mk_value(block offset) */
-	u64 epoch;			/* bumped on every flush */
+	/* Targeted invalidation (see kemu_jit_invalidate). */
+	struct xarray binfo;		/* block offset / KEMU_BLOCK_ALIGN -> kemu_blkinfo */
+	struct xarray pages;		/* guest page >> PAGE_SHIFT -> kemu_pgvec */
+	struct kemu_pgvec *wide;	/* blocks reading too many pages to index */
+	struct xarray sites;		/* chained rel32 offset -> xa_mk_value(unchained value) */
+	u64 epoch;			/* bumped on every flush or invalidation */
 	atomic_t flush_pending;		/* executable mapping went away */
+	spinlock_t pend_lock;
+	u64 pend_lo, pend_hi;		/* ... this guest range */
 	void *scratch;			/* translator scratch (kemu_rs_scratch_size) */
 	struct kemu_stubs stubs;
 	spinlock_t threads_lock;
@@ -121,9 +128,31 @@ struct kemu_mm {
 	unsigned long chains;
 	unsigned long helpers;
 	unsigned long flushes;
+	unsigned long invals;		/* targeted invalidations */
+	unsigned long killed;		/* blocks they removed */
 	unsigned long lookups;		/* TRANSLATE/CHAIN ops */
 	unsigned long xc_hits;		/* translations taken from the xcache */
 	u64 translate_ns;		/* time spent in those ops */
+};
+
+/* A live translated block, for targeted invalidation. */
+struct kemu_chain_site {
+	u32 site;			/* code offset of a rel32 chained to the block */
+	u32 val;			/* the value that jumps to the block */
+};
+
+struct kemu_blkinfo {
+	u64 pc;
+	u32 off;			/* code offset of the block */
+	u32 size;
+	u32 nin, cap;
+	struct kemu_chain_site *in;
+};
+
+/* Offsets of the blocks translated from one guest page. */
+struct kemu_pgvec {
+	u32 n, cap;
+	u32 off[];
 };
 
 /* kemu_thread.flags */
@@ -190,6 +219,8 @@ void kemu_jit_free(struct kemu_mm *km);
 int kemu_jit_dup(struct kemu_mm *okm, struct kemu_mm *km);
 unsigned long kemu_jit_op(struct pt_regs *regs, unsigned long op);
 void kemu_jit_flush(struct kemu_mm *km);
+void kemu_jit_invalidate(struct kemu_mm *km, u64 lo, u64 hi);
+void kemu_jit_pending(struct kemu_mm *km);
 void kemu_materialize(struct pt_regs *regs);
 void kemu_enter_op(struct kemu_thread *kt);
 void kemu_jit_exit_to_user(struct kemu_thread *kt, struct pt_regs *regs);
@@ -255,6 +286,7 @@ struct kemu_trans {
 	u32 fault_access;
 	u64 fault_addr;
 	u64 ic_entry;		/* filled in by jit.c, not Rust */
+	u32 blk_off;		/* jit.c: code offset of the block */
 };
 
 struct kemu_host_regs {
@@ -273,6 +305,9 @@ long kemu_rs_xc_blob(void *scratch, u64 pc, u64 blk_off, u8 *out, size_t len);
 bool kemu_rs_xc_validate(const u8 *blob, size_t len, u64 pc);
 bool kemu_rs_xc_apply(const u8 *blob, size_t blen, u8 *code, size_t clen, u64 pc,
 		      u64 blk_off);
+int kemu_rs_trans_pages(void *scratch, u64 *out, size_t max);
+int kemu_rs_xc_pages(const u8 *blob, size_t blen, u64 pc, u64 *out, size_t max);
+#define KEMU_MAX_PAGES	4	/* t1::MAX_PAGES */
 
 /* Shared translation cache (xcache.c). */
 struct kemu_xc_key {
@@ -284,7 +319,7 @@ struct kemu_xc_key {
 };
 bool kemu_xc_key(u64 pc, struct kemu_xc_key *k);
 size_t kemu_xc_lookup(const struct kemu_xc_key *k, u64 pc, u8 *out, size_t avail,
-		      unsigned long blk_off, struct kemu_trans *res);
+		      unsigned long blk_off, struct kemu_trans *res, u64 *pages, int *npages);
 void kemu_xc_insert(const struct kemu_xc_key *k, void *scratch, u64 pc,
 		    const u8 *code, const struct kemu_trans *res,
 		    unsigned long blk_off);

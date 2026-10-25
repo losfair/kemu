@@ -170,6 +170,23 @@ pub fn validate<E: Env>(env: &mut E, b: &[u8], new_pc: u64) -> bool {
     true
 }
 
+/// The guest pages a cached block depends on when used for `new_pc`
+/// (page-aligned addresses, deduplicated). None if they don't fit in `out`.
+pub fn pages(b: &[u8], new_pc: u64, out: &mut [u64]) -> Option<usize> {
+    let bl = parse(b)?;
+    let delta = new_pc.wrapping_sub(bl.pc);
+    let mut n = 0;
+    for i in 0..bl.ndeps {
+        let pg = dep(&bl, i)?.pc.wrapping_add(delta) & !0xfff;
+        if out.iter().take(n).any(|&x| x == pg) {
+            continue;
+        }
+        *out.get_mut(n)? = pg;
+        n += 1;
+    }
+    Some(n)
+}
+
 /// Relocate a copy of a cached block (`code`, header included) for guest
 /// `new_pc`, placed `new_blk_off` bytes from the new code base.
 pub fn apply(b: &[u8], code: &mut [u8], new_pc: u64, new_blk_off: u64) -> bool {
