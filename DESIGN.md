@@ -546,11 +546,12 @@ in the translator:
 - **Spill hoisting.** Fills and spills of guest registers that aren't live-through
   a loop are moved to the loop's preheader and exits.
 
-**Vector registers.** V0–V13 are pinned to `xmm0–xmm13`, with `xmm14`/`xmm15` as
-scratch. V14–V31 live in `gs:[…]`. That's a good fit for AAPCS code, where V16–V31
-are short-lived temporaries T2 can allocate inside regions. Upper YMM halves are kept
-clean (VEX encoding everywhere, no legacy SSE), so there are no transition penalties
-and no `vzeroupper`.
+**Vector registers.** T1 assigns up to eight frequently used guest vectors to
+`xmm0–xmm7` within each block, reserving `xmm8–xmm15` for lowering temporaries.
+Unallocated vectors live in `gs:[…]`. Self-loop back-edges retain the allocation;
+other block boundaries use the state page. T2 can extend allocation across blocks.
+Upper YMM halves stay clean (VEX encoding everywhere, no legacy SSE), so there
+are no transition penalties and no `vzeroupper`.
 
 ### 8.2 Flags (NZCV)
 
@@ -1259,10 +1260,18 @@ the code and its commit history are authoritative.
   - cross-block flag liveness: direct exit targets are scanned and the flags image
     is skipped when the target writes NZCV first;
   - out-of-line flag saves on taken B.cond exits.
-- **Guest V registers live in the state page.** Each NEON/FP operation loads and
-  stores through `%gs`. Block-level xmm allocation needs xmm-aware state recovery
-  in the kernel (reading guest values out of saved FPU state). It's the main
-  remaining performance item (matmul).
+- **Block-local vector allocation.** Up to eight frequently used guest vectors
+  live in XMM0..7; XMM8..15 remain lowering temporaries. The allocation is fixed
+  per block and retained across self-loop back-edges. Other exits and interpreter
+  helpers spill the cache; helper returns refill it. Full, scalar and lane
+  accesses share cache-aware accessors, and results commit in one host instruction.
+  The metadata header records the mapping; `VSTATE` points distinguish the page
+  from saved XMM state without replacing instruction/flags recovery points.
+  During fills the page stays authoritative, and during spills XMM stays
+  authoritative until the last store. The kernel captures the interrupted task's
+  XMM state via an architecture hook (see README). Ports without the hook keep
+  the memory-only representation. Cross-block allocation and dynamic eviction
+  remain future work.
 - **Shared-cache keying.** The cache is keyed by (sb, ino, i_generation, file
   offset) and validated by content. Every guest instruction word a translation
   read, including flag look-ahead into exit targets, is re-read at the new
@@ -1308,7 +1317,8 @@ the code and its commit history are authoritative.
   - 2: helper for SIMD/FP;
   - 4: one-instruction blocks;
   - 8: no chaining;
-  - 32: no register remapping.
+  - 32: no register remapping;
+  - 64: no vector cache (`NO_VCACHE=1` in userspace tools).
 - `kemu.debug=1` prints per-mm statistics: translations, shared-cache hits,
   translation time, flushes and targeted invalidations.
 - `kemu.stress=<n>` bumps the epoch and kicks every other thread once per n

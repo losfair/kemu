@@ -26,12 +26,14 @@ use crate::env::{Env, Fault};
 mod crypto;
 pub use crypto::HostCrypto;
 mod fp;
+mod vector;
 
 pub const MAX_INSNS: usize = 64;
 
 /// Debug knob (kemu.jitoff=): disable JIT features to bisect bugs.
 /// 1 = helper for all non-control-flow insns, 2 = helper for SIMD/FP,
-/// 4 = single-instruction blocks, 32 = no register remapping.
+/// 4 = single-instruction blocks, 32 = no register remapping,
+/// 64 = no vector register cache.
 /// (8 = no chaining is handled by the kernel.)
 pub static JIT_OFF: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -198,6 +200,8 @@ pub struct Cfg {
     /// back to the interpreter when a tagged access faults, and
     /// retranslates blocks that do that often with this set.
     pub tbi: bool,
+    /// The caller can capture XMM0..7 for asynchronous state recovery.
+    pub vector_cache: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,6 +261,8 @@ struct Gen<'s, 'b> {
     live_in0: bool,
     /// Loop-body entry (after the remap prologue); self-loops jump here.
     body_off: usize,
+    vectors: [u8; meta::VECTOR_REGS],
+    vlive: bool,
 }
 
 pub const MAX_REMAP: usize = 4;
@@ -277,10 +283,11 @@ impl<'s, 'b> Gen<'s, 'b> {
     fn point(&mut self, kind: u8, a: u8, b: u8) {
         let p = Point { off: self.a.pos as u32, idx: self.idx as u16, kind, a, b };
         // Collapse points at the same offset (the later one wins).
-        // REMAP points are state changes, not resume points: keep them.
-        if self.np > 0 && kind != kind::REMAP {
+        // Location changes and resume points at the same offset are both
+        // needed (e.g. the first instruction after the cache fill).
+        if self.np > 0 && !matches!(kind, kind::REMAP | kind::VSTATE) {
             if let Some(prev) = self.s.points.get_mut(self.np - 1) {
-                if prev.off == p.off && prev.kind != kind::REMAP {
+                if prev.off == p.off && !matches!(prev.kind, kind::REMAP | kind::VSTATE) {
                     *prev = p;
                     return;
                 }
@@ -429,8 +436,9 @@ impl<'s, 'b> Gen<'s, 'b> {
         }
     }
 
-    /// Establish the block's register remapping (canonical -> remapped).
+    /// Fill the vector cache and establish the block's GPR remapping.
     fn remap_prologue(&mut self) {
+        self.vector_prologue();
         if self.nremap == 0 || self.remapped {
             return;
         }
@@ -449,8 +457,9 @@ impl<'s, 'b> Gen<'s, 'b> {
         self.point(kind::REMAP, 2, 0);
     }
 
-    /// Return to the canonical register map (remapped -> canonical).
+    /// Spill the vector cache and return GPRs to the canonical map.
     fn remap_epilogue(&mut self) {
+        self.vector_epilogue();
         if !self.remapped {
             return;
         }
@@ -593,7 +602,7 @@ impl<'s, 'b> Gen<'s, 'b> {
     /// Unconditional exit to guest `target`. Flags must be in memory.
     fn exit_to(&mut self, target: u64, main_off: usize) {
         if target == self.pc0 {
-            let t = if self.remapped { self.body_off } else { main_off };
+            let t = if self.remapped || self.vlive { self.body_off } else { main_off };
             self.a.jmp(Some(t));
             return;
         }
@@ -606,11 +615,13 @@ impl<'s, 'b> Gen<'s, 'b> {
     /// Conditional exit to guest `target` if `cc`.
     fn exit_if(&mut self, cc: Cc, target: u64, main_off: usize) {
         if target == self.pc0 {
-            let t = if self.remapped { self.body_off } else { main_off };
+            let t = if self.remapped || self.vlive { self.body_off } else { main_off };
             self.a.jcc(cc, Some(t));
             return;
         }
-        if self.remapped {
+        if self.remapped || self.vlive {
+            let was_remapped = self.remapped;
+            let was_vectors = self.vlive;
             // Out-of-line exit with the epilogue; fall through stays remapped.
             let skip = self.a.jcc(cc.invert(), None);
             self.remap_epilogue();
@@ -618,8 +629,10 @@ impl<'s, 'b> Gen<'s, 'b> {
             let at = self.a.jmp(None);
             self.add_exit(at as u32, target);
             self.a.bind32(skip);
-            self.remapped = true;
-            self.point(kind::REMAP, 2, 0);
+            self.remapped = was_remapped;
+            if was_remapped { self.point(kind::REMAP, 2, 0); }
+            self.vlive = was_vectors;
+            if was_vectors { self.point(kind::VSTATE, 1, 0); }
             return;
         }
         self.pad_for_rel32(2);
@@ -649,6 +662,7 @@ impl<'s, 'b> Gen<'s, 'b> {
         }
         let saved = self.fl;
         let was_remapped = self.remapped;
+        let was_vectors = self.vlive;
         let skip = self.a.jcc(cc.invert(), None);
         self.flags_to_mem();
         self.remap_epilogue();
@@ -661,6 +675,8 @@ impl<'s, 'b> Gen<'s, 'b> {
         if was_remapped {
             self.point(kind::REMAP, 2, 0);
         }
+        self.vlive = was_vectors;
+        if was_vectors { self.point(kind::VSTATE, 1, 0); }
         // Fall-through: the instruction can restart with flags in EFLAGS.
         self.insn_point();
         true
@@ -729,7 +745,6 @@ impl<'s, 'b> Gen<'s, 'b> {
     fn helper(&mut self) {
         self.flags_to_mem();
         self.fl.host = false;
-        let was = self.remapped;
         self.remap_epilogue();
         let pc = self.pc();
         self.gpc_imm(RAX, pc);
@@ -737,9 +752,7 @@ impl<'s, 'b> Gen<'s, 'b> {
         self.call_abs(self.cfg.stubs.helper);
         self.fl = Flags { host: false, inv: false, mem: true };
         self.point(kind::DONE, FLAGS_MEM, 0);
-        if was {
-            self.remap_prologue();
-        }
+        self.remap_prologue();
     }
 
     // ---- shifted / extended operands ----
@@ -1535,49 +1548,47 @@ impl<'s, 'b> Gen<'s, 'b> {
     }
 
     fn load_fp(&mut self, size: u8, rt: u32, m: Mem) {
-        let v = OFF_V + (rt as i32 & 31) * 16;
         match size {
             4 => {
                 self.a.vmovdqu_load(15, m);
-                self.a.vmovdqu_store(Mem::gs(v), 15);
+                self.store_vec(rt, 15);
             }
             3 => {
                 self.a.vmovq_load(15, m);
-                self.a.vmovdqu_store(Mem::gs(v), 15);
+                self.store_vec(rt, 15);
             }
             2 => {
                 self.a.vmovd_load(15, m);
-                self.a.vmovdqu_store(Mem::gs(v), 15);
+                self.store_vec(rt, 15);
             }
             _ => {
                 self.a.movzx(if size == 0 { Sz::B } else { Sz::W }, RAX, Rm::M(m));
                 self.a.vmov_from_gpr(Sz::D, 15, RAX);
-                self.a.vmovdqu_store(Mem::gs(v), 15);
+                self.store_vec(rt, 15);
             }
         }
     }
 
     fn store_fp(&mut self, size: u8, rt: u32, m: Mem) {
-        let v = OFF_V + (rt as i32 & 31) * 16;
         match size {
             4 => {
-                self.a.vmovdqu_load(15, Mem::gs(v));
+                self.ld_vec(15, rt);
                 self.a.vmovdqu_store(m, 15);
             }
             3 => {
-                self.a.load(Sz::Q, RAX, Mem::gs(v));
+                self.vector_extract(Sz::Q, RAX, rt, 0);
                 self.a.store(Sz::Q, m, RAX);
             }
             2 => {
-                self.a.load(Sz::D, RAX, Mem::gs(v));
+                self.vector_extract(Sz::D, RAX, rt, 0);
                 self.a.store(Sz::D, m, RAX);
             }
             1 => {
-                self.a.load(Sz::D, RAX, Mem::gs(v));
+                self.vector_extract(Sz::D, RAX, rt, 0);
                 self.a.store(Sz::W, m, RAX);
             }
             _ => {
-                self.a.load(Sz::D, RAX, Mem::gs(v));
+                self.vector_extract(Sz::D, RAX, rt, 0);
                 self.a.store(Sz::B, m, RAX);
             }
         }
@@ -2343,6 +2354,10 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
         nremap: 0,
         remapped: false,
         body_off: 0,
+        vectors: if cfg.vector_cache && jit_off() & 64 == 0 {
+            vector::choose(&insns[..n.min(MAX_INSNS)])
+        } else { [meta::NO_VECTOR; meta::VECTOR_REGS] },
+        vlive: false,
         live_in0,
     };
     if jit_off() & 32 == 0 {
@@ -2727,6 +2742,10 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
         g.remapped = false;
         g.point(kind::REMAP, 0, 0);
     }
+    if g.vectors[0] != meta::NO_VECTOR && ne > 0 {
+        g.vlive = false;
+        g.point(kind::VSTATE, 0, 0);
+    }
     for k in 0..ne {
         let e = g.s.exits.get(k).copied().unwrap_or_default();
         let t = g.a.pos;
@@ -2750,6 +2769,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
     let overflow = g.overflow;
     let g_nremap = g.nremap;
     let g_remap = g.remap;
+    let vectors = g.vectors;
     let mut a = g.a;
     let s = g.s;
     if overflow || !a.ok() {
@@ -2773,7 +2793,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
     for (d, s) in pairs.iter_mut().zip(remap.iter().take(nremap)) {
         *d = (s.0 as u8, s.1 as u8);
     }
-    let mlen = meta::write_meta(meta_buf, points, exits, &pairs[..nremap]).ok_or(TErr::NoSpace)?;
+    let mlen = meta::write_meta(meta_buf, points, exits, &pairs[..nremap], &vectors).ok_or(TErr::NoSpace)?;
     let hdr = Header {
         main_off: main_off as u32,
         code_end: code_end as u32,

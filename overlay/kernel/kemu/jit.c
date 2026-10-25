@@ -577,7 +577,8 @@ static int kemu_translate(struct kemu_mm *km, u64 pc, unsigned long *main,
 		}
 		err = kemu_rs_translate(km->scratch, pc, out,
 					KEMU_CHUNK_SIZE - km->chunk_used[c], uaddr,
-					km->code_base, &km->stubs, res, cacheable, tbi);
+					km->code_base, &km->stubs, res, cacheable, tbi,
+					KEMU_ARCH_VECTOR_CACHE);
 		if (err == -ENOSPC && km->chunk_used[c] > 0 && tries++ < 4) {
 			km->cur_chunk = -1;
 			continue;
@@ -693,6 +694,11 @@ static void kemu_host_regs(struct pt_regs *regs, struct kemu_host_regs *h)
 	h->gpr[14] = kemu_reg(regs, r14);
 	h->gpr[15] = kemu_reg(regs, r15);
 	h->rflags = kemu_reg(regs, flags);
+#if KEMU_ARCH_VECTOR_CACHE
+	kemu_arch_read_xmm(h->xmm);
+#else
+	memset(h->xmm, 0, sizeof(h->xmm));
+#endif
 }
 
 static u32 kemu_stub_info(struct kemu_mm *km, u32 off)

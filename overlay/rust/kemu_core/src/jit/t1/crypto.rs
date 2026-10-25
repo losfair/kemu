@@ -5,7 +5,6 @@
 //! vector operations leave NZCV, FPCR and FPSR untouched.
 
 use super::*;
-use super::fp::voff;
 
 /// Optional host crypto features. AVX state support is already required
 /// by the JIT; the 128-bit VEX forms need AES/PCLMUL, not VAES/VPCLMUL.
@@ -15,7 +14,7 @@ pub struct HostCrypto {
     pub pclmul: bool,
 }
 
-// Guest vectors live in the state page; these host registers are scratch.
+// XMM0..7 cache guest vectors; these host registers are scratch.
 const X: u8 = 8;
 const Y: u8 = 9;
 const W: u8 = 10;
@@ -80,15 +79,15 @@ impl<'s, 'b> Gen<'s, 'b> {
         if !self.cfg.crypto.aes {
             return false;
         }
+        self.ld_vec(X, rd);
+        self.ld_vec(Y, rn);
         let a = &mut self.a;
-        a.vmovdqu_load(X, Mem::gs(voff(rd)));
-        a.vmovdqu_load(Y, Mem::gs(voff(rn)));
         // Arm adds the round key before SubBytes/ShiftRows; x86 adds it
         // afterwards. XOR first, then use a last round with a zero key.
         bin(a, XOR, X, X, Y);
         bin(a, XOR, Y, Y, Y);
         a.vex(2, 1, false, false, if decrypt { 0xdf } else { 0xdd }, X, X, Rm::R(Y));
-        a.vmovdqu_store(Mem::gs(voff(rd)), X);
+        self.store_vec(rd, X);
         true
     }
 
@@ -96,8 +95,8 @@ impl<'s, 'b> Gen<'s, 'b> {
         if !self.cfg.crypto.aes {
             return false;
         }
+        self.ld_vec(X, rn);
         let a = &mut self.a;
-        a.vmovdqu_load(X, Mem::gs(voff(rn)));
         if inverse {
             a.vex(2, 1, false, false, 0xdb, X, 0, Rm::R(X)); // vaesimc
         } else {
@@ -107,7 +106,7 @@ impl<'s, 'b> Gen<'s, 'b> {
             a.vex(2, 1, false, false, 0xdf, X, X, Rm::R(Y));
             a.vex(2, 1, false, false, 0xdc, X, X, Rm::R(Y));
         }
-        a.vmovdqu_store(Mem::gs(voff(rd)), X);
+        self.store_vec(rd, X);
         true
     }
 
@@ -115,17 +114,19 @@ impl<'s, 'b> Gen<'s, 'b> {
         if size != 0 && (size != 3 || !self.cfg.crypto.pclmul) {
             return false;
         }
+        if size == 3 {
+            self.ld_vec(X, rn);
+            self.ld_vec(Y, rm);
+        } else {
+            self.widen(X, rn, 0, false, high);
+            self.widen(Y, rm, 0, false, high);
+        }
         let a = &mut self.a;
         if size == 3 {
-            a.vmovdqu_load(X, Mem::gs(voff(rn)));
-            a.vmovdqu_load(Y, Mem::gs(voff(rm)));
             a.vex_ib(3, 1, false, false, 0x44, W, X, Rm::R(Y), if high { 0x11 } else { 0 });
         } else {
             // Eight independent 8x8 -> 16-bit polynomial products.
             // Widen first so shifts cannot spill into adjacent lanes.
-            let offset = if high { 8 } else { 0 };
-            a.vex(2, 1, false, false, 0x30, X, 0, Rm::M(Mem::gs(voff(rn) + offset)));
-            a.vex(2, 1, false, false, 0x30, Y, 0, Rm::M(Mem::gs(voff(rm) + offset)));
             bin(a, XOR, W, W, W);
             for i in 0..8 {
                 // Broadcast bit i of each multiplier to a 16-bit mask.
@@ -138,7 +139,7 @@ impl<'s, 'b> Gen<'s, 'b> {
                 }
             }
         }
-        a.vmovdqu_store(Mem::gs(voff(rd)), W);
+        self.store_vec(rd, W);
         true
     }
 
@@ -146,13 +147,13 @@ impl<'s, 'b> Gen<'s, 'b> {
         if op > 5 {
             return false;
         }
+        self.ld_vec(X, rd);
+        self.ld_vec(Y, rn);
+        if op <= 3 { self.ld_vec(W, rm); }
         let a = &mut self.a;
-        a.vmovdqu_load(X, Mem::gs(voff(rd)));
-        a.vmovdqu_load(Y, Mem::gs(voff(rn)));
         match op {
             0..=2 => {
                 // X = [a,b,c,d], Y.low = e, W = four message words + K.
-                a.vmovdqu_load(W, Mem::gs(voff(rm)));
                 for _ in 0..4 {
                     shuffle(a, T, X, 0x55); // b
                     shuffle(a, U, X, 0xaa); // c
@@ -187,7 +188,6 @@ impl<'s, 'b> Gen<'s, 'b> {
                 }
             }
             3 => {
-                a.vmovdqu_load(W, Mem::gs(voff(rm)));
                 align(a, T, Y, X, 8); // [d2,d3,n0,n1]
                 bin(a, XOR, X, X, T);
                 bin(a, XOR, X, X, W);
@@ -207,7 +207,7 @@ impl<'s, 'b> Gen<'s, 'b> {
                 bin(a, XOR, X, Y, U); // high lane also XORs ROL(t0,2)
             }
         }
-        a.vmovdqu_store(Mem::gs(voff(rd)), X);
+        self.store_vec(rd, X);
         true
     }
 
@@ -215,15 +215,15 @@ impl<'s, 'b> Gen<'s, 'b> {
         if !matches!(op, 4 | 5 | 6 | 0x10) {
             return false;
         }
-        let a = &mut self.a;
         // Read every operand before committing, including when they alias.
-        a.vmovdqu_load(X, Mem::gs(voff(if op == 5 { rn } else { rd })));
-        a.vmovdqu_load(Y, Mem::gs(voff(if op == 5 { rd } else { rn })));
+        self.ld_vec(X, if op == 5 { rn } else { rd });
+        self.ld_vec(Y, if op == 5 { rd } else { rn });
+        if op != 0x10 { self.ld_vec(W, rm); }
+        let a = &mut self.a;
         let result = match op {
             4 | 5 => {
                 // Four rounds: X = [a,b,c,d], Y = [e,f,g,h], W = Wt+Kt.
                 // Only the low lane of each round's temporaries is used.
-                a.vmovdqu_load(W, Mem::gs(voff(rm)));
                 for _ in 0..4 {
                     sigma(a, T, Y, [6, 11, 25], false, U, V);
                     shuffle(a, U, Y, 0x55); // f
@@ -266,7 +266,6 @@ impl<'s, 'b> Gen<'s, 'b> {
             _ => {
                 // SHA256SU1: the upper two lanes depend on the newly
                 // computed lower lanes, not on the old destination.
-                a.vmovdqu_load(W, Mem::gs(voff(rm)));
                 align(a, T, W, Y, 4); // [n1,n2,n3,m0]
                 bin(a, ADD, X, X, T);
                 shift_bytes(a, Y, W, false, 8); // [m2,m3,0,0]
@@ -279,7 +278,7 @@ impl<'s, 'b> Gen<'s, 'b> {
                 X
             }
         };
-        a.vmovdqu_store(Mem::gs(voff(rd)), result);
+        self.store_vec(rd, result);
         true
     }
 }

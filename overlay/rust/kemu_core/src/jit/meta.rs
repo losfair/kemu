@@ -25,7 +25,10 @@ pub const IC_OFF: usize = 32;
 pub const CHECK_OFF: usize = 64;
 pub const POINT_SIZE: usize = 12;
 pub const EXIT_SIZE: usize = 16;
-pub const META_HDR_SIZE: usize = 8;
+pub const META_HDR_SIZE: usize = 16;
+/// XMM0..7 cache guest vectors; XMM8..15 are lowering temporaries.
+pub const VECTOR_REGS: usize = 8;
+pub const NO_VECTOR: u8 = 0xff;
 pub const NO_SITE: u32 = u32::MAX;
 
 /// Kinds of recovery points.
@@ -56,6 +59,9 @@ pub mod kind {
     /// STXR performed its compare-exchange: finish by writing the status
     /// (ZF ? 0 : 1) to guest register `a`; continue at the next insn.
     pub const ROLL_STATUS: u8 = 8;
+    /// Vector cache location: 0 = state page, 1 = XMM0..7. The metadata
+    /// header maps each host register to a guest vector (or NO_VECTOR).
+    pub const VSTATE: u8 = 9;
 }
 
 /// Flag locations for `kind::INSN` points.
@@ -175,13 +181,14 @@ impl Header {
 }
 
 /// Serialize metadata into `b`; returns bytes written.
-pub fn write_meta(b: &mut [u8], points: &[Point], exits: &[Exit], remap: &[(u8, u8)]) -> Option<usize> {
+pub fn write_meta(b: &mut [u8], points: &[Point], exits: &[Exit], remap: &[(u8, u8)], vectors: &[u8; VECTOR_REGS]) -> Option<usize> {
     let np = u16::try_from(points.len()).ok()?;
     let ne = u16::try_from(exits.len()).ok()?;
     let nr = u32::try_from(remap.len()).ok()?;
     if !(put16(b, 0, np) && put16(b, 2, ne) && put32(b, 4, nr)) {
         return None;
     }
+    b.get_mut(8..META_HDR_SIZE)?.copy_from_slice(vectors);
     let mut off = META_HDR_SIZE;
     for p in points {
         if !(put32(b, off, p.off) && put16(b, off + 4, p.idx)) {
@@ -264,11 +271,13 @@ pub fn find_exit_site(m: &[u8], site: u32) -> Option<Exit> {
     None
 }
 
-/// Host general-purpose registers and flags at the interruption point.
+/// Host registers at the interruption point. XMM8..15 hold only scratch
+/// values and need not be captured by the caller.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct HostRegs {
     pub gpr: [u64; 16],
     pub rflags: u64,
+    pub xmm: [[u64; 2]; VECTOR_REGS],
 }
 
 /// Copy pinned guest registers from host registers into `st`.
@@ -313,6 +322,7 @@ pub fn recover(blk: &[u8], host_off: u32, h: &HostRegs, st: &mut CpuState) -> bo
     let mut best: Option<Point> = None;
     let mut flags_loc = FLAGS_MEM;
     let mut remap_mode = 0u8;
+    let mut vectors_live = false;
     for i in 0..np {
         let p = match read_point(m, i) {
             Some(p) => p,
@@ -326,6 +336,10 @@ pub fn recover(blk: &[u8], host_off: u32, h: &HostRegs, st: &mut CpuState) -> bo
             kind::FLAGS_MEM => flags_loc = FLAGS_MEM,
             kind::REMAP => {
                 remap_mode = p.a;
+                continue;
+            }
+            kind::VSTATE => {
+                vectors_live = p.a != 0;
                 continue;
             }
             _ => {}
@@ -356,6 +370,17 @@ pub fn recover(blk: &[u8], host_off: u32, h: &HostRegs, st: &mut CpuState) -> bo
             set_guest(st, v, page_v);
             if remap_mode == 2 {
                 set_guest(st, c, host_val);
+            }
+        }
+    }
+    if vectors_live {
+        for (x, v) in h.xmm.iter().enumerate() {
+            let g = match m.get(8 + x) {
+                Some(&g) => g,
+                None => return false,
+            };
+            if g < 32 {
+                st.v[g as usize] = *v;
             }
         }
     }

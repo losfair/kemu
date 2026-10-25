@@ -242,7 +242,9 @@ fn id_space_mrs_is_raz() {
 #[test]
 fn xcache_validate_and_relocate() {
     use crate::jit::{stubs, t1, xcache};
-    let code: [u32; 8] = [
+    let code: [u32; 10] = [
+        0x4ee08400, // add v0.2d, v0.2d, v0.2d (cached vector)
+        0x4ee08400,
         0x90000000, // adrp x0, 0
         0xf9400001, // ldr  x1, [x0]
         0xeb02003f, // cmp  x1, x2
@@ -262,7 +264,7 @@ fn xcache_validate_and_relocate() {
     };
     let mut page = std::vec![0u8; 4096];
     let so = stubs::gen_stubs(&mut page, stubs::ExitMode::Syscall, 0x7000_1000_0000, 0xfff8).expect("stubs");
-    let cfg = t1::Cfg { stubs: so.addrs(0x7000_0000_0000), code_uaddr: 0x7000_0000_0000 + (1 << 20), reloc: true, tbi: false, crypto: t1::HostCrypto::default() };
+    let cfg = t1::Cfg { stubs: so.addrs(0x7000_0000_0000), code_uaddr: 0x7000_0000_0000 + (1 << 20), reloc: true, tbi: false, vector_cache: true, crypto: t1::HostCrypto::default() };
     let mut s = std::boxed::Box::new(t1::Scratch::new());
     let mut out = std::vec![0u8; 8192];
     let mut env = mk(0x40_0000, None);
@@ -284,8 +286,8 @@ fn xcache_validate_and_relocate() {
 
     // Changed instruction inside the block, or at an exit target the
     // flags look-ahead read: rejected. Unaligned delta: rejected.
-    assert!(!xcache::validate(&mut mk(base2, Some((1, 0xf9400401))), blob, base2));
-    assert!(!xcache::validate(&mut mk(base2, Some((5, 0x8b020021))), blob, base2));
+    assert!(!xcache::validate(&mut mk(base2, Some((3, 0xf9400401))), blob, base2));
+    assert!(!xcache::validate(&mut mk(base2, Some((7, 0x8b020021))), blob, base2));
     assert!(!xcache::validate(&mut mk(base2 + 4, None), blob, base2 + 4));
 }
 
@@ -311,7 +313,7 @@ fn recover_in_exit_trampoline_of_remapped_block() {
     let mut env = TestEnv { mem, base: 0x40_0000 };
     let mut page = std::vec![0u8; 4096];
     let so = stubs::gen_stubs(&mut page, stubs::ExitMode::Syscall, 0x7000_1000_0000, 0xfff8).expect("stubs");
-    let cfg = t1::Cfg { stubs: so.addrs(0x7000_0000_0000), code_uaddr: 0x7000_0000_0000 + (1 << 20), reloc: false, tbi: false, crypto: t1::HostCrypto::default() };
+    let cfg = t1::Cfg { stubs: so.addrs(0x7000_0000_0000), code_uaddr: 0x7000_0000_0000 + (1 << 20), reloc: false, tbi: false, vector_cache: true, crypto: t1::HostCrypto::default() };
     let mut s = std::boxed::Box::new(t1::Scratch::new());
     let mut out = std::vec![0u8; 8192];
     let r = t1::translate(&mut env, 0x40_0000, &mut out, &cfg, &mut s).expect("translate");
@@ -326,7 +328,7 @@ fn recover_in_exit_trampoline_of_remapped_block() {
     }
     assert!(!tramps.is_empty(), "no exit trampolines found");
 
-    let mut h = meta::HostRegs { gpr: [0; 16], rflags: 0x202 };
+    let mut h = meta::HostRegs { gpr: [0; 16], rflags: 0x202, ..Default::default() };
     for (i, g) in h.gpr.iter_mut().enumerate() {
         *g = 0x1000 + i as u64;
     }
@@ -346,5 +348,73 @@ fn recover_in_exit_trampoline_of_remapped_block() {
         }
         assert_eq!(st.xr(24), 0x9000 + 24, "x24 at trampoline offset {off:#x}");
         assert_eq!(st.xr(9), 0x9000 + 9, "x9 at trampoline offset {off:#x}");
+    }
+}
+
+/// Cache fills, spills, helper returns and side exits must agree about
+/// which copy of V0 is authoritative, including coincident metadata points.
+#[test]
+fn recover_cached_vectors() {
+    use crate::jit::{meta, stubs, t1};
+    let code: [u32; 7] = [
+        0x4ee08400, // add v0.2d, v0.2d, v0.2d
+        0x4ee08400,
+        0x4ee08400,
+        0x54000800, // b.eq +0x100: conditional side exit
+        0x4ee00c00, // sqadd v0.2d, v0.2d, v0.2d: interpreter helper
+        0x4ee08400,
+        0x17fffffa, // b pc0: retain the cache on the back-edge
+    ];
+    let mut mem = std::vec![0u8; 0x2000];
+    for (i, w) in code.iter().enumerate() {
+        mem[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    let mut env = TestEnv { mem, base: 0x40_0000 };
+    let mut stubs = std::vec![0u8; 4096];
+    let so = stubs::gen_stubs(&mut stubs, stubs::ExitMode::Syscall, 0x7000_1000_0000, 0xfff8).unwrap();
+    let mut cfg = t1::Cfg { stubs: so.addrs(0x7000_0000_0000), code_uaddr: 0x7000_0010_0000,
+        reloc: false, tbi: false, vector_cache: true, crypto: t1::HostCrypto::default() };
+    let mut scratch = std::boxed::Box::new(t1::Scratch::new());
+    let mut out = std::vec![0; 16384];
+    for enabled in [true, false] {
+        cfg.vector_cache = enabled;
+        let r = t1::translate(&mut env, 0x40_0000, &mut out, &cfg, &mut scratch).unwrap();
+        let blk = &out[..r.size];
+        let hdr = meta::Header::read(blk).unwrap();
+        let m = &blk[hdr.meta_off as usize..][..hdr.meta_len as usize];
+        assert_eq!(&m[8..16], if enabled { &[0, 255, 255, 255, 255, 255, 255, 255] } else { &[255; 8] });
+        let mut host = meta::HostRegs::default();
+        host.xmm = [[0xabc, 0xdef]; 8];
+        let check = |off, live| {
+            let mut st = CpuState::new();
+            st.v = [[0x123, 0x456]; 32];
+            assert!(meta::recover(blk, off, &host, &mut st));
+            assert_eq!(st.v[0], if live { host.xmm[0] } else { [0x123, 0x456] }, "at {off:#x}");
+            assert!(st.v[1..].iter().all(|v| *v == [0x123, 0x456]));
+        };
+        check(hdr.main_off, false); // fill has not run yet
+        let (np, _) = meta::meta_counts(m).unwrap();
+        let mut bodies = 0;
+        let mut helpers = 0;
+        let mut exits = 0;
+        for i in 0..np {
+            let p = meta::read_point(m, i).unwrap();
+            match p.kind {
+                meta::kind::INSN if p.idx == 1 || p.idx == 5 => {
+                    check(p.off, enabled); // after a result commit / helper refill
+                    bodies += 1;
+                }
+                meta::kind::DONE if p.idx == 4 => {
+                    check(p.off, false); // helper has returned; refill hasn't run
+                    helpers += 1;
+                }
+                meta::kind::EXIT => {
+                    check(p.off, false); // trampoline after a live self-loop
+                    exits += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(bodies >= 2 && (!enabled || helpers > 0) && exits > 0, "enabled={enabled} bodies={bodies} helpers={helpers} exits={exits}");
     }
 }
