@@ -208,7 +208,7 @@ fn lookup_or_translate(pc: u64) -> Result<u64, Fault> {
     }
     let base = REGION + hh.code_used as u64;
     let out = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, CODE_SIZE - hh.code_used) };
-    let cfg = Cfg { stubs: hh.stubs.addrs(REGION), code_uaddr: base, reloc: std::env::var("RELOC").is_ok(), tbi: std::env::var("TBI").is_ok(), crypto: host_crypto() };
+    let cfg = Cfg { stubs: hh.stubs.addrs(REGION), code_uaddr: base, reloc: std::env::var("RELOC").is_ok(), tbi: std::env::var("TBI").is_ok(), vector_cache: std::env::var("NO_VCACHE").is_err(), crypto: host_crypto() };
     match t1::translate(&mut UEnv, pc, out, &cfg, &mut hh.scratch) {
         Ok(r) => {
             hh.blocks.push((base, r.size));
@@ -253,7 +253,7 @@ extern "C" fn on_alarm(_sig: i32, _info: *mut libc::siginfo_t, ucv: *mut libc::c
     let uc = unsafe { &mut *(ucv as *mut libc::ucontext_t) };
     let g = &mut uc.uc_mcontext.gregs;
     let rip = g[libc::REG_RIP as usize] as u64;
-    let hregs = meta::HostRegs {
+    let mut hregs = meta::HostRegs {
         gpr: [
             g[libc::REG_RAX as usize] as u64, g[libc::REG_RCX as usize] as u64,
             g[libc::REG_RDX as usize] as u64, g[libc::REG_RBX as usize] as u64,
@@ -265,7 +265,13 @@ extern "C" fn on_alarm(_sig: i32, _info: *mut libc::siginfo_t, ucv: *mut libc::c
             g[libc::REG_R14 as usize] as u64, g[libc::REG_R15 as usize] as u64,
         ],
         rflags: g[libc::REG_EFL as usize] as u64,
+        xmm: [[0; 2]; meta::VECTOR_REGS],
     };
+    let fp = unsafe { &*uc.uc_mcontext.fpregs };
+    for (d, s) in hregs.xmm.iter_mut().zip(fp._xmm.iter()) {
+        d[0] = s.element[0] as u64 | ((s.element[1] as u64) << 32);
+        d[1] = s.element[2] as u64 | ((s.element[3] as u64) << 32);
+    }
     let st = state();
     let hh = h();
     if rip >= REGION && rip < REGION + 4096 {
@@ -636,6 +642,9 @@ fn gen_loop(r: &mut Rng) -> Vec<u32> {
 }
 
 fn gen_case(r: &mut Rng, mode: u32) -> Vec<u32> {
+    if mode == 8 {
+        return gen_vectors(r);
+    }
     if mode == 4 {
         return gen_calls(r);
     }
@@ -688,6 +697,50 @@ fn gen_case(r: &mut Rng, mode: u32) -> Vec<u32> {
         v.push(0x9a88_00e6 | ((r.below(14) as u32) << 12)); // csel x6,x7,x8,cond
     }
     v.push(0xd420_0000); // brk #0
+    v
+}
+
+/// Cache pressure, partial vector writes, helper coherence, memory, calls
+/// and conditional self-loops. X16 is the counter; X20 is the data base.
+fn gen_vectors(r: &mut Rng) -> Vec<u32> {
+    const OPS: &[u32] = &[
+        0x4ee18400, 0x6e211c00, 0x4ee10c00, // ADD, EOR, SQADD (helper)
+        0x4e1f1ce0, 0x4e1e1ce0, 0x4e1c1ce0, 0x4e181ce0, // INS from GPR
+        0x6e1b5c20, 0x6e1a5420, 0x6e1c4420, 0x6e180420, // INS element
+        0x9eaf00e0, 0x1e2700e0, 0x9e6700e0, // FMOV top/S/D
+        0x4e1f0420, 0x4e1e0420, 0x4e1c0420, 0x4e180420, // DUP B/H/S/D
+        0x3dc00680, 0x3d800a80, // LDR/STR Q
+        0x3d400280, 0x7d400280, 0xbd400280, 0xfd400280, // LDR B/H/S/D
+        0x3d000280, 0x7d000280, 0xbd000280, 0xfd000280, // STR B/H/S/D
+        0xad400680, 0xad000680, // LDP/STP Q
+        0x4c402280, 0x4c002280, 0x4d40ce80, // LD1/ST1/LD1R
+        0x4e020020, // TBL: helper reads and writes cached vectors
+    ];
+    let mut v = vec![0xd2800090, 0x14000001]; // mov x16,#4; b loop
+    let loop_start = v.len();
+    for _ in 0..24 {
+        let w = OPS[r.below(OPS.len() as u64) as usize];
+        // Reuse V0..9, with occasional V31/wrapping structure accesses.
+        let mut rd = if r.below(8) == 0 { 31 } else { r.below(10) as u32 };
+        if w == 0xad400680 && rd == 1 { rd = 0; } // LDP destinations must differ
+        v.push(w | rd);
+    }
+    // Read cached lanes into a GPR and use the result for a side exit.
+    let reads = [0x0e1f3c09, 0x0e1e3c09, 0x0e1c3c09, 0x4e183c09, 0x9eae0009];
+    v.push(reads[r.below(5) as usize] | ((r.below(10) as u32) << 5));
+    v.push(0xb4000049); // cbz x9,+8
+    v.push(0x4ee18400); // add v0.2d,v0.2d,v1.2d
+    // Exercise the cache across a call on half the cases; otherwise keep
+    // the entire loop in one block so the back-edge retains XMM state.
+    let call = if r.below(2) == 0 { let i = v.len(); v.push(0); Some(i) } else { None };
+    v.push(0xf1000610); // subs x16,x16,#1
+    let back = (loop_start as i32 - v.len() as i32) as u32;
+    v.push(0x54000001 | ((back & 0x7ffff) << 5)); // b.ne loop
+    v.push(0xd4200000);
+    if let Some(i) = call {
+        v[i] = 0x94000000 | ((v.len() - i) as u32);
+        v.extend([0x4ee08400, 0x4ee08400, 0x4ee08400, 0xd65f03c0]);
+    }
     v
 }
 

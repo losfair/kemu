@@ -16,6 +16,10 @@
 
 #include <asm/kemu.h>
 
+#ifndef KEMU_ARCH_VECTOR_CACHE
+#define KEMU_ARCH_VECTOR_CACHE 0
+#endif
+
 /* ---- Guest CPU state (mirror of rust/kemu_core/src/state.rs) ---- */
 
 struct kemu_cpu {
@@ -295,6 +299,7 @@ struct kemu_trans {
 struct kemu_host_regs {
 	u64 gpr[16];
 	u64 rflags;
+	u64 xmm[8][2];
 };
 
 int kemu_rs_gen_stubs(u8 *out, size_t len, u64 table_base, u32 mask8,
@@ -302,7 +307,7 @@ int kemu_rs_gen_stubs(u8 *out, size_t len, u64 table_base, u32 mask8,
 size_t kemu_rs_scratch_size(void);
 int kemu_rs_translate(void *scratch, u64 pc, u8 *out, size_t len, u64 code_uaddr,
 		      u64 stubs_base, const struct kemu_stubs *info,
-		      struct kemu_trans *res, bool reloc, bool tbi);
+		      struct kemu_trans *res, bool reloc, bool tbi, bool vector_cache);
 long kemu_rs_xc_blob_size(void *scratch);
 long kemu_rs_xc_blob(void *scratch, u64 pc, u64 blk_off, u8 *out, size_t len);
 bool kemu_rs_xc_validate(const u8 *blob, size_t len, u64 pc);

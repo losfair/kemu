@@ -7,6 +7,36 @@
 #include <linux/highmem.h>
 #include <asm/tsc.h>
 #include <asm/archrandom.h>
+#include <asm/fpu/api.h>
+#include <asm/fpu/sched.h>
+#include <asm/kemu.h>
+
+void kemu_arch_read_xmm(u64 xmm[8][2])
+{
+	struct fpu *fpu = x86_task_fpu(current);
+	const void *src;
+
+	/*
+	 * The image may be stale until the live FPU is saved. Epoch recovery
+	 * runs with IRQs off, which already excludes preemption/softirqs;
+	 * fpu_sync_fpstate() uses BH locking and requires IRQs enabled.
+	 */
+	if (irqs_disabled()) {
+		if (!test_thread_flag(TIF_NEED_FPU_LOAD))
+			save_fpregs_to_fpstate(fpu);
+	} else {
+		fpu_sync_fpstate(fpu);
+	}
+	if (boot_cpu_has(X86_FEATURE_XSAVE))
+		src = get_xsave_addr(&fpu->fpstate->regs.xsave, XFEATURE_SSE);
+	else
+		src = fpu->fpstate->regs.fxsave.xmm_space;
+	/* XSAVE's init optimization can leave stale bytes in the image. */
+	if (src)
+		memcpy(xmm, src, 8 * 16);
+	else
+		memset(xmm, 0, 8 * 16);
+}
 
 static int kemu_cmpxchg128(u64 addr, const u64 *exp, const u64 *new, u64 *old)
 {

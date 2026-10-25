@@ -26,6 +26,8 @@ Working:
 - Threads, futexes, LL/SC and seq_cst atomics, signals, ptrace and
   single-step, core dumps, seccomp/audit as `AUDIT_ARCH_AARCH64`.
 - T1 JIT with superblocks, block chaining, register remapping and lazy flags.
+- Block-local caching of up to eight guest vectors in XMM registers, retained
+  across self-loops, with saved-XMM recovery for signals and faults.
 - SHA-256 rounds, message schedules and vector byte reversal translated to
   AVX2, without kernel entries per instruction or a requirement for host
   SHA extensions.
@@ -61,7 +63,7 @@ libraries fall back to plain syscalls), because ring operations use native
 struct layouts behind kemu's back.
 
 Not done yet: a real vDSO, rseq, perf callchains through translated code, the
-optimizing tier (T2), host-register allocation for NEON, the LSM hook and the
+optimizing tier (T2), cross-block vector allocation, the LSM hook and the
 code-cache verifier.
 
 ## Layout
@@ -113,6 +115,14 @@ register access, syscall entry, TLS, fault information and ELF personality.
 The native implementation lives in `overlay/arch/x86/`; other x86_64 kernel
 ports supply their own architecture code and select `HAVE_KEMU`.
 
+To enable the vector register cache, a port defines `KEMU_ARCH_VECTOR_CACHE`
+as 1 and provides `kemu_arch_read_xmm(u64 xmm[8][2])` in `asm/kemu.h`. It must
+capture the interrupted task's user XMM0..7, synchronizing live FPU state
+first, and work in task context with IRQs either enabled or disabled. Without
+this opt-in, vectors remain in the state page. The native implementation
+handles lazy FPU state and XSAVE's init-state optimization. Userspace callers
+opt in with `Cfg::vector_cache` and supply `HostRegs::xmm` during recovery.
+
 Host atomic access, the virtual counter and random-number generation use
 the `kemu_arch_*` services declared in `include/linux/kemu.h`. The common
 layer validates atomic sizes and alignment before calling the backend.
@@ -158,7 +168,7 @@ x86 applets over the rootfs's binaries.
 | Parameter | Effect |
 |---|---|
 | `kemu.jit=0` | interpreter only |
-| `kemu.jitoff=<mask>` | turn off JIT features one at a time, for bisecting (1 helper for all non-branches, 2 helper for SIMD/FP, 4 one-insn blocks, 8 no chaining, 32 no register remapping) |
+| `kemu.jitoff=<mask>` | turn off JIT features one at a time, for bisecting (1 helper for all non-branches, 2 helper for SIMD/FP, 4 one-insn blocks, 8 no chaining, 32 no register remapping, 64 no vector cache) |
 | `kemu.xcache=0` | disable the shared translation cache |
 | `kemu.xcache_mb=<n>` | shared cache size limit (default 128) |
 | `kemu.debug=1` | per-process translation statistics on exit |

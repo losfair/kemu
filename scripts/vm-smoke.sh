@@ -14,9 +14,10 @@ grep -q "ALL PASSED" /tmp/abi.log && echo "SMOKE ok abi"
 echo "== mtstress"; ./mtstress | tail -3 | tee /tmp/mt.log; grep -q "mtstress: ok" /tmp/mt.log && echo "SMOKE ok mtstress"
 echo "== tbi"; ./tbi > /tmp/tbi.log 2>&1; grep FAIL /tmp/tbi.log; tail -1 /tmp/tbi.log
 grep -q "TBI ALL PASSED" /tmp/tbi.log && echo "SMOKE ok tbi"
+echo "== vector-state"; ./vector-state && echo "SMOKE ok vector-state"
 echo "== intbench"; ../bench/intbench.arm64 && echo "SMOKE ok intbench"
 ' 2>&1 | grep -vE '^\[ |iPXE|SeaBIOS|Press|Booting|^.\[\?7l' | tee "$log"
-want="hello abi tbi mtstress intbench"
+want="hello abi tbi vector-state mtstress intbench"
 rc=0
 for t in $want; do
 	grep -q "SMOKE ok $t" "$log" || { echo "FAILED: $t"; rc=1; }

@@ -369,6 +369,7 @@ pub unsafe extern "C" fn kemu_rs_translate(
     res: *mut KemuTrans,
     reloc: bool,
     tbi: bool,
+    vector_cache: bool,
 ) -> c_int {
     // SAFETY: `Scratch` is repr(C) and made only of integers, so any
     // initialized bytes are a valid value; the rest is guaranteed by the
@@ -381,7 +382,7 @@ pub unsafe extern "C" fn kemu_rs_translate(
             &mut *res,
         )
     };
-    let cfg = t1::Cfg { stubs: info.addrs(stubs_base), code_uaddr, reloc, tbi, crypto: host_crypto() };
+    let cfg = t1::Cfg { stubs: info.addrs(stubs_base), code_uaddr, reloc, tbi, vector_cache, crypto: host_crypto() };
     match t1::translate(&mut KEnv, pc, out, &cfg, s) {
         Ok(r) => {
             res.size = r.size as u64;
@@ -463,10 +464,11 @@ pub unsafe extern "C" fn kemu_rs_xc_apply(
 pub struct KemuHostRegs {
     pub gpr: [u64; 16],
     pub rflags: u64,
+    pub xmm: [[u64; 2]; meta::VECTOR_REGS],
 }
 
 fn host_regs(h: &KemuHostRegs) -> meta::HostRegs {
-    meta::HostRegs { gpr: h.gpr, rflags: h.rflags }
+    meta::HostRegs { gpr: h.gpr, rflags: h.rflags, xmm: h.xmm }
 }
 
 /// Rebuild the guest state for a host PC inside a translated block.

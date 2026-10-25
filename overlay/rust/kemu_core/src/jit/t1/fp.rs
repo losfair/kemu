@@ -2,8 +2,8 @@
 //! Tier-1 lowering of scalar floating point and common Advanced SIMD
 //! instructions to SSE/AVX2 (VEX-encoded).
 //!
-//! V registers live in the state page. Results are computed in scratch
-//! xmm registers (13..15) and committed with a single 128-bit store, so
+//! V registers live in the cache or state page. Results use scratch
+//! XMM registers (12..15) and commit in a single host instruction, so
 //! every instruction stays restartable. Bit-exactness: whenever a result
 //! could differ from AArch64 semantics (NaN results, out-of-range
 //! conversions), the fast path branches to the helper, which re-executes
@@ -44,7 +44,11 @@ impl<'s, 'b> Gen<'s, 'b> {
     /// Load a scalar (32/64-bit) from V[n] into xmm `x` (upper zeroed).
     fn ld_scalar(&mut self, double: bool, x: u8, n: u32) {
         if double {
-            self.a.vmovq_load(x, Mem::gs(voff(n)));
+            self.a.vex(1, PP_F3, false, false, 0x7e, x, 0, self.v_rm(n));
+        } else if let Some(src) = self.vector_host(n) {
+            // Keep only the low word without borrowing a GPR or flags.
+            self.a.vex_ib(1, PP_66, false, false, 0x73, 7, x, Rm::R(src), 12);
+            self.a.vex_ib(1, PP_66, false, false, 0x73, 3, x, Rm::R(x), 12);
         } else {
             self.a.vmovd_load(x, Mem::gs(voff(n)));
         }
@@ -59,7 +63,7 @@ impl<'s, 'b> Gen<'s, 'b> {
             self.a.vmov_to_gpr(Sz::D, RAX, x);
             self.a.vmov_from_gpr(Sz::D, x, RAX);
         }
-        self.a.vmovdqu_store(Mem::gs(voff(d)), x);
+        self.store_vec(d, x);
     }
 
     /// Commit a vector result: zero the upper half for 64-bit forms.
@@ -67,7 +71,7 @@ impl<'s, 'b> Gen<'s, 'b> {
         if !q {
             self.a.vex(1, PP_F3, false, false, 0x7e, x, 0, Rm::R(x));
         }
-        self.a.vmovdqu_store(Mem::gs(voff(d)), x);
+        self.store_vec(d, x);
     }
 
     /// Branch to the slow path if `x` holds a NaN (scalar). Returns the
@@ -120,7 +124,7 @@ impl<'s, 'b> Gen<'s, 'b> {
         let v = fp_imm(double, imm8);
         self.mov_imm(RAX, v);
         self.a.vmov_from_gpr(Sz::Q, X14, RAX);
-        self.a.vmovdqu_store(Mem::gs(voff(rd)), X14);
+        self.store_vec(rd, X14);
         true
     }
 
@@ -140,9 +144,7 @@ impl<'s, 'b> Gen<'s, 'b> {
         self.fp_prologue();
         let pp = if double { PP_F2 } else { PP_F3 };
         self.ld_scalar(double, X14, rn);
-        let m = if double { Mem::gs(voff(rm)) } else { Mem::gs(voff(rm)) };
-        // Scalar VEX ops with a memory operand read only 32/64 bits.
-        self.a.vex(1, pp, false, false, opc, X14, X14, Rm::M(m));
+        self.a.vex(1, pp, false, false, opc, X14, X14, self.v_rm(rm));
         let s = self.nan_guard_scalar(double, X14);
         if op == Fp2Op::Nmul {
             self.a.vmov_to_gpr(Sz::Q, RAX, X14);
@@ -173,7 +175,7 @@ impl<'s, 'b> Gen<'s, 'b> {
         self.fp_prologue();
         self.ld_scalar(double, X14, ra);
         self.ld_scalar(double, X15, rn);
-        self.a.vex(2, PP_66, double, false, opc, X14, X15, Rm::M(Mem::gs(voff(rm))));
+        self.a.vex(2, PP_66, double, false, opc, X14, X15, self.v_rm(rm));
         let s = self.nan_guard_scalar(double, X14);
         self.st_scalar(double, X14, rd);
         self.slow_paths(&[s]);
@@ -190,7 +192,7 @@ impl<'s, 'b> Gen<'s, 'b> {
             Fp1Op::Mov | Fp1Op::Abs | Fp1Op::Neg => {
                 // Pure bit operations, never trap.
                 self.clobber();
-                self.a.load(Sz::Q, RAX, Mem::gs(voff(rn)));
+                self.vector_extract(Sz::Q, RAX, rn, 0);
                 if !double {
                     self.a.mov_rr(Sz::D, RAX, RAX);
                 }
@@ -202,7 +204,7 @@ impl<'s, 'b> Gen<'s, 'b> {
                     _ => {}
                 }
                 self.a.vmov_from_gpr(Sz::Q, X14, RAX);
-                self.a.vmovdqu_store(Mem::gs(voff(rd)), X14);
+                self.store_vec(rd, X14);
                 true
             }
             Fp1Op::Sqrt => {
@@ -289,16 +291,22 @@ impl<'s, 'b> Gen<'s, 'b> {
         }
         self.flags_to_host();
         let cc = self.cond_cc(cond);
-        self.a.load(Sz::Q, RAX, Mem::gs(voff(rm)));
+        self.vector_extract(Sz::Q, RAX, rm, 0);
         match cc {
-            Some(cc) => self.a.cmov(cc, Sz::Q, RAX, Rm::M(Mem::gs(voff(rn)))),
-            None => self.a.load(Sz::Q, RAX, Mem::gs(voff(rn))),
+            Some(cc) if self.vector_host(rn).is_none() => {
+                self.a.cmov(cc, Sz::Q, RAX, Rm::M(Mem::gs(voff(rn))));
+            }
+            Some(cc) => {
+                self.vector_extract(Sz::Q, RDX, rn, 0);
+                self.a.cmov(cc, Sz::Q, RAX, Rm::R(RDX));
+            }
+            None => self.vector_extract(Sz::Q, RAX, rn, 0),
         }
         if ftype == 0 {
             self.a.mov_rr(Sz::D, RAX, RAX);
         }
         self.a.vmov_from_gpr(Sz::Q, X14, RAX);
-        self.a.vmovdqu_store(Mem::gs(voff(rd)), X14);
+        self.store_vec(rd, X14);
         true
     }
 
@@ -319,16 +327,16 @@ impl<'s, 'b> Gen<'s, 'b> {
                 if to_fp {
                     let r = self.get(rn, false, RAX);
                     if top {
-                        self.a.store(Sz::Q, Mem::gs(voff(rd) + 8), r);
+                        self.vector_insert(Sz::Q, rd, 1, r);
                     } else {
                         self.a.vmov_from_gpr(sz, X14, r);
-                        self.a.vmovdqu_store(Mem::gs(voff(rd)), X14);
+                        self.store_vec(rd, X14);
                     }
                 } else {
                     match self.gp(rd, false) {
-                        Gp::R(r) => self.a.load(sz, r, Mem::gs(voff(rn) + off)),
+                        Gp::R(r) => self.vector_extract(sz, r, rn, (off / 8) as u8),
                         Gp::M(o) => {
-                            self.a.load(sz, RAX, Mem::gs(voff(rn) + off));
+                            self.vector_extract(sz, RAX, rn, (off / 8) as u8);
                             self.a.store(Sz::Q, Mem::gs(o), RAX);
                         }
                         Gp::Zero => {}
@@ -419,10 +427,6 @@ impl<'s, 'b> Gen<'s, 'b> {
 
     // ---- Advanced SIMD ----
 
-    fn ld_vec(&mut self, x: u8, n: u32) {
-        self.a.vmovdqu_load(x, Mem::gs(voff(n)));
-    }
-
     /// Splat a 32-bit constant into xmm `x`.
     fn splat32(&mut self, x: u8, v: u32) {
         self.a.mov_ri32(RAX, v);
@@ -449,10 +453,10 @@ impl<'s, 'b> Gen<'s, 'b> {
                 // 64-bit compares: pcmpeqq / pcmpgtq (0F38 29 / 37)
                 let o = if op == SimdOp::CmEq { 0x29 } else { 0x37 };
                 self.ld_vec(X14, rn);
-                self.a.vex(2, PP_66, false, false, o, X14, X14, Rm::M(Mem::gs(voff(rm))));
+                self.a.vex(2, PP_66, false, false, o, X14, X14, self.v_rm(rm));
             } else {
                 self.ld_vec(X14, rn);
-                self.a.vex(1, PP_66, false, false, opc, X14, X14, Rm::M(Mem::gs(voff(rm))));
+                self.a.vex(1, PP_66, false, false, opc, X14, X14, self.v_rm(rm));
             }
             self.st_vec(q, X14, rd);
             return true;
@@ -462,9 +466,9 @@ impl<'s, 'b> Gen<'s, 'b> {
             SimdOp::And | SimdOp::Orr | SimdOp::Eor | SimdOp::Bic => {
                 self.ld_vec(X14, rn);
                 match op {
-                    SimdOp::And => self.a.vex(1, PP_66, false, false, 0xdb, X14, X14, Rm::M(Mem::gs(voff(rm)))),
-                    SimdOp::Orr => self.a.vex(1, PP_66, false, false, 0xeb, X14, X14, Rm::M(Mem::gs(voff(rm)))),
-                    SimdOp::Eor => self.a.vex(1, PP_66, false, false, 0xef, X14, X14, Rm::M(Mem::gs(voff(rm)))),
+                    SimdOp::And => self.a.vex(1, PP_66, false, false, 0xdb, X14, X14, self.v_rm(rm)),
+                    SimdOp::Orr => self.a.vex(1, PP_66, false, false, 0xeb, X14, X14, self.v_rm(rm)),
+                    SimdOp::Eor => self.a.vex(1, PP_66, false, false, 0xef, X14, X14, self.v_rm(rm)),
                     _ => {
                         // vpandn x14, x15(rm), x14(rn) : ~rm & rn
                         self.ld_vec(X15, rm);
@@ -519,7 +523,7 @@ impl<'s, 'b> Gen<'s, 'b> {
                     (_, _) => (2, 0x39),
                 };
                 self.ld_vec(X14, rn);
-                self.a.vex(map, PP_66, false, false, opc, X14, X14, Rm::M(Mem::gs(voff(rm))));
+                self.a.vex(map, PP_66, false, false, opc, X14, X14, self.v_rm(rm));
                 self.st_vec(q, X14, rd);
                 true
             }
@@ -549,9 +553,9 @@ impl<'s, 'b> Gen<'s, 'b> {
             SimdOp::Mul | SimdOp::Mla | SimdOp::Mls if size == 1 || size == 2 => {
                 self.ld_vec(X14, rn);
                 if size == 1 {
-                    self.a.vex(1, PP_66, false, false, 0xd5, X14, X14, Rm::M(Mem::gs(voff(rm)))); // vpmullw
+                    self.a.vex(1, PP_66, false, false, 0xd5, X14, X14, self.v_rm(rm)); // vpmullw
                 } else {
-                    self.a.vex(2, PP_66, false, false, 0x40, X14, X14, Rm::M(Mem::gs(voff(rm)))); // vpmulld
+                    self.a.vex(2, PP_66, false, false, 0x40, X14, X14, self.v_rm(rm)); // vpmulld
                 }
                 if op != SimdOp::Mul {
                     self.ld_vec(X15, rd);
@@ -642,12 +646,12 @@ impl<'s, 'b> Gen<'s, 'b> {
                 };
                 self.fp_prologue();
                 self.ld_vec(X14, rn);
-                self.a.vex(1, if double { PP_66 } else { PP_NONE }, false, false, opc, X14, X14, Rm::M(Mem::gs(voff(rm))));
+                self.a.vex(1, if double { PP_66 } else { PP_NONE }, false, false, opc, X14, X14, self.v_rm(rm));
                 if !q {
                     self.a.vex(1, PP_F3, false, false, 0x7e, X14, 0, Rm::R(X14));
                 }
                 let s = self.nan_guard_vec(double, X14);
-                self.a.vmovdqu_store(Mem::gs(voff(rd)), X14);
+                self.store_vec(rd, X14);
                 self.slow_paths(&[s]);
                 true
             }
@@ -660,12 +664,12 @@ impl<'s, 'b> Gen<'s, 'b> {
                 self.ld_vec(X14, rd);
                 self.ld_vec(X15, rn);
                 let opc = if op == SimdOp::FMla { 0xb8 } else { 0xbc }; // vfmadd231ps / vfnmadd231ps
-                self.a.vex(2, PP_66, double, false, opc, X14, X15, Rm::M(Mem::gs(voff(rm))));
+                self.a.vex(2, PP_66, double, false, opc, X14, X15, self.v_rm(rm));
                 if !q {
                     self.a.vex(1, PP_F3, false, false, 0x7e, X14, 0, Rm::R(X14));
                 }
                 let s = self.nan_guard_vec(double, X14);
-                self.a.vmovdqu_store(Mem::gs(voff(rd)), X14);
+                self.store_vec(rd, X14);
                 self.slow_paths(&[s]);
                 true
             }
@@ -674,11 +678,11 @@ impl<'s, 'b> Gen<'s, 'b> {
     }
 
     /// x = sign/zero-extended lower (or upper) half of V[n] to double width.
-    fn widen(&mut self, x: u8, n: u32, size: u8, signed: bool, hi: bool) {
-        let m = Mem::gs(voff(n) + if hi { 8 } else { 0 });
+    pub(super) fn widen(&mut self, x: u8, n: u32, size: u8, signed: bool, hi: bool) {
+        let src = self.vector_slice(n, if hi { 8 } else { 0 }, x);
         // vpmovsx{bw,wd,dq} 0F38 20/23/25 ; vpmovzx 30/33/35 (64-bit memory operand)
         let o = [0x20u8, 0x23, 0x25][(size & 3).min(2) as usize] + if signed { 0 } else { 0x10 };
-        self.a.vex(2, PP_66, false, false, o, x, 0, Rm::M(m));
+        self.a.vex(2, PP_66, false, false, o, x, 0, src);
     }
 
     pub(super) fn simd_permute(&mut self, q: bool, size: u8, opcode: u8, rd: u32, rn: u32, rm: u32) -> bool {
@@ -754,14 +758,14 @@ impl<'s, 'b> Gen<'s, 'b> {
             }
             Simd2Op::Abs if size < 3 => {
                 let opc = [0x1cu8, 0x1d, 0x1e][size as usize];
-                self.a.vex(2, PP_66, false, false, opc, X14, 0, Rm::M(Mem::gs(voff(rn))));
+                self.a.vex(2, PP_66, false, false, opc, X14, 0, self.v_rm(rn));
                 self.st_vec(q, X14, rd);
                 return true;
             }
             Simd2Op::Neg => {
                 let opc = [0xf8u8, 0xf9, 0xfa, 0xfb][(size & 3) as usize];
                 self.a.vex(1, PP_66, false, false, 0xef, X14, X14, Rm::R(X14));
-                self.a.vex(1, PP_66, false, false, opc, X14, X14, Rm::M(Mem::gs(voff(rn))));
+                self.a.vex(1, PP_66, false, false, opc, X14, X14, self.v_rm(rn));
                 self.st_vec(q, X14, rd);
                 return true;
             }
@@ -788,8 +792,8 @@ impl<'s, 'b> Gen<'s, 'b> {
             self.a.vex(2, PP_66, false, false, opc, X14, 0, Rm::R(X14));
         } else {
             let idx = imm5 >> (size + 1);
-            let off = voff(rn) + (idx << size) as i32;
-            self.a.vex(2, PP_66, false, false, opc, X14, 0, Rm::M(Mem::gs(off)));
+            let src = self.vector_slice(rn, (idx << size) as u8, X14);
+            self.a.vex(2, PP_66, false, false, opc, X14, 0, src);
         }
         self.st_vec(q, X14, rd);
         true
@@ -801,18 +805,15 @@ impl<'s, 'b> Gen<'s, 'b> {
             return false;
         }
         let idx = imm5 >> (size + 1);
-        let m = Mem::gs(voff(rn) + (idx << size) as i32);
-        // Scalar DUP/MOV copies one element and zeros the rest of Vd.
-        // MOVZX/VMOV preserve live NZCV and read before any aliased write.
-        match size {
-            0 | 1 => {
-                self.a.movzx(if size == 0 { Sz::B } else { Sz::W }, RAX, Rm::M(m));
-                self.a.vmov_from_gpr(Sz::D, X14, RAX);
-            }
-            2 => self.a.vmovd_load(X14, m),
-            _ => self.a.vmovq_load(X14, m),
+        let sz = [Sz::B, Sz::W, Sz::D, Sz::Q][size as usize];
+        if self.vector_host(rn).is_none() && size >= 2 {
+            let m = Mem::gs(voff(rn) + (idx << size) as i32);
+            if size == 3 { self.a.vmovq_load(X14, m); } else { self.a.vmovd_load(X14, m); }
+        } else {
+            self.vector_extract(sz, RAX, rn, idx as u8);
+            self.a.vmov_from_gpr(if size == 3 { Sz::Q } else { Sz::D }, X14, RAX);
         }
-        self.a.vmovdqu_store(Mem::gs(voff(rd)), X14);
+        self.store_vec(rd, X14);
         true
     }
 
@@ -831,7 +832,7 @@ impl<'s, 'b> Gen<'s, 'b> {
         if q {
             self.a.vex(2, PP_66, false, false, 0x59, X14, 0, Rm::R(X14)); // vpbroadcastq
         }
-        self.a.vmovdqu_store(Mem::gs(voff(rd)), X14);
+        self.store_vec(rd, X14);
         true
     }
 
@@ -911,7 +912,7 @@ impl<'s, 'b> Gen<'s, 'b> {
                     // SHRN2: insert into upper half of Vd
                     self.ld_vec(X15, rd);
                     self.a.vex(1, PP_66, false, false, 0x6c, X15, X15, Rm::R(X14)); // punpcklqdq
-                    self.a.vmovdqu_store(Mem::gs(voff(rd)), X15);
+                    self.store_vec(rd, X15);
                 } else {
                     self.st_vec(false, X14, rd);
                 }
@@ -927,7 +928,7 @@ impl<'s, 'b> Gen<'s, 'b> {
         }
         // EXT: bytes imm4.. of Vm:Vn  ==  vpalignr x14, vm, vn, imm4
         self.ld_vec(X15, rm);
-        self.a.vex_ib(3, PP_66, false, false, 0x0f, X14, X15, Rm::M(Mem::gs(voff(rn))), imm4 as u8);
+        self.a.vex_ib(3, PP_66, false, false, 0x0f, X14, X15, self.v_rm(rn), imm4 as u8);
         self.st_vec(true, X14, rd);
         true
     }
@@ -938,18 +939,12 @@ impl<'s, 'b> Gen<'s, 'b> {
             return false;
         }
         let idx = imm5 >> (size + 1);
-        let m = Mem::gs(voff(rn) + (idx << size) as i32);
         let dst = match self.gp(rd, false) {
             Gp::R(r) => r,
             Gp::Zero => return true,
             Gp::M(_) => RAX,
         };
-        match size {
-            0 => self.a.movzx(Sz::B, dst, Rm::M(m)),
-            1 => self.a.movzx(Sz::W, dst, Rm::M(m)),
-            2 => self.a.load(Sz::D, dst, m),
-            _ => self.a.load(Sz::Q, dst, m),
-        }
+        self.vector_extract([Sz::B, Sz::W, Sz::D, Sz::Q][size as usize], dst, rn, idx as u8);
         if dst == RAX {
             self.put(rd, false, RAX);
         }
@@ -962,15 +957,9 @@ impl<'s, 'b> Gen<'s, 'b> {
             return false;
         }
         let idx = imm5 >> (size + 1);
-        let m = Mem::gs(voff(rd) + (idx << size) as i32);
         let sz = [Sz::B, Sz::W, Sz::D, Sz::Q][size as usize];
-        match self.gp(rn, false) {
-            Gp::Zero => self.a.store_imm(sz, m, 0),
-            _ => {
-                let r = self.get(rn, false, RAX);
-                self.a.store(sz, m, r);
-            }
-        }
+        let r = self.get(rn, false, RAX);
+        self.vector_insert(sz, rd, idx as u8, r);
         true
     }
 
@@ -982,13 +971,8 @@ impl<'s, 'b> Gen<'s, 'b> {
         let di = imm5 >> (size + 1);
         let si = imm4 >> size;
         let sz = [Sz::B, Sz::W, Sz::D, Sz::Q][size as usize];
-        let src = Mem::gs(voff(rn) + (si << size) as i32);
-        match size {
-            0 => self.a.movzx(Sz::B, RAX, Rm::M(src)),
-            1 => self.a.movzx(Sz::W, RAX, Rm::M(src)),
-            _ => self.a.load(sz, RAX, src),
-        }
-        self.a.store(sz, Mem::gs(voff(rd) + (di << size) as i32), RAX);
+        self.vector_extract(sz, RAX, rn, si as u8);
+        self.vector_insert(sz, rd, di as u8, RAX);
         true
     }
 
@@ -1057,12 +1041,12 @@ impl<'s, 'b> Gen<'s, 'b> {
                 } else {
                     self.a.vmovq_load(X14, m);
                 }
-                self.a.vmovdqu_store(Mem::gs(voff(r)), X14);
+                self.store_vec(r, X14);
             } else if q {
-                self.a.vmovdqu_load(X14, Mem::gs(voff(r)));
+                self.ld_vec(X14, r);
                 self.a.vmovdqu_store(m, X14);
             } else {
-                self.a.load(Sz::Q, RAX, Mem::gs(voff(r)));
+                self.vector_extract(Sz::Q, RAX, r, 0);
                 self.a.store(Sz::Q, m, RAX);
             }
         }
