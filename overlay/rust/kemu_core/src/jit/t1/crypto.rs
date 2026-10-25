@@ -1,11 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0
-//! SHA256 lowering using the AVX2 baseline, without requiring x86 SHA
-//! extensions. Keep intermediate state in scratch XMM registers and
+//! Crypto lowering using AVX2, with optional AES-NI and PCLMULQDQ.
+//! Keep intermediate state in scratch XMM registers and
 //! commit Vd once, so an interrupted instruction can restart. Integer
 //! vector operations leave NZCV, FPCR and FPSR untouched.
 
 use super::*;
 use super::fp::voff;
+
+/// Optional host crypto features. AVX state support is already required
+/// by the JIT; the 128-bit VEX forms need AES/PCLMUL, not VAES/VPCLMUL.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HostCrypto {
+    pub aes: bool,
+    pub pclmul: bool,
+}
 
 // Guest vectors live in the state page; these host registers are scratch.
 const X: u8 = 8;
@@ -68,6 +76,141 @@ fn blend(a: &mut Asm<'_>, d: u8, n: u8, m: u8, lanes: u8) {
 }
 
 impl<'s, 'b> Gen<'s, 'b> {
+    pub(super) fn aes(&mut self, decrypt: bool, rd: u32, rn: u32) -> bool {
+        if !self.cfg.crypto.aes {
+            return false;
+        }
+        let a = &mut self.a;
+        a.vmovdqu_load(X, Mem::gs(voff(rd)));
+        a.vmovdqu_load(Y, Mem::gs(voff(rn)));
+        // Arm adds the round key before SubBytes/ShiftRows; x86 adds it
+        // afterwards. XOR first, then use a last round with a zero key.
+        bin(a, XOR, X, X, Y);
+        bin(a, XOR, Y, Y, Y);
+        a.vex(2, 1, false, false, if decrypt { 0xdf } else { 0xdd }, X, X, Rm::R(Y));
+        a.vmovdqu_store(Mem::gs(voff(rd)), X);
+        true
+    }
+
+    pub(super) fn aes_mix(&mut self, inverse: bool, rd: u32, rn: u32) -> bool {
+        if !self.cfg.crypto.aes {
+            return false;
+        }
+        let a = &mut self.a;
+        a.vmovdqu_load(X, Mem::gs(voff(rn)));
+        if inverse {
+            a.vex(2, 1, false, false, 0xdb, X, 0, Rm::R(X)); // vaesimc
+        } else {
+            // AESDECLAST undoes SubBytes/ShiftRows, so AESENC with zero
+            // keys cancels those steps and leaves just MixColumns.
+            bin(a, XOR, Y, Y, Y);
+            a.vex(2, 1, false, false, 0xdf, X, X, Rm::R(Y));
+            a.vex(2, 1, false, false, 0xdc, X, X, Rm::R(Y));
+        }
+        a.vmovdqu_store(Mem::gs(voff(rd)), X);
+        true
+    }
+
+    pub(super) fn pmull(&mut self, size: u8, high: bool, rd: u32, rn: u32, rm: u32) -> bool {
+        if size != 0 && (size != 3 || !self.cfg.crypto.pclmul) {
+            return false;
+        }
+        let a = &mut self.a;
+        if size == 3 {
+            a.vmovdqu_load(X, Mem::gs(voff(rn)));
+            a.vmovdqu_load(Y, Mem::gs(voff(rm)));
+            a.vex_ib(3, 1, false, false, 0x44, W, X, Rm::R(Y), if high { 0x11 } else { 0 });
+        } else {
+            // Eight independent 8x8 -> 16-bit polynomial products.
+            // Widen first so shifts cannot spill into adjacent lanes.
+            let offset = if high { 8 } else { 0 };
+            a.vex(2, 1, false, false, 0x30, X, 0, Rm::M(Mem::gs(voff(rn) + offset)));
+            a.vex(2, 1, false, false, 0x30, Y, 0, Rm::M(Mem::gs(voff(rm) + offset)));
+            bin(a, XOR, W, W, W);
+            for i in 0..8 {
+                // Broadcast bit i of each multiplier to a 16-bit mask.
+                a.vex_ib(1, 1, false, false, 0x71, 6, T, Rm::R(Y), 15 - i);
+                a.vex_ib(1, 1, false, false, 0x71, 4, T, Rm::R(T), 15);
+                bin(a, AND, T, T, X);
+                bin(a, XOR, W, W, T);
+                if i != 7 {
+                    a.vex_ib(1, 1, false, false, 0x71, 6, X, Rm::R(X), 1);
+                }
+            }
+        }
+        a.vmovdqu_store(Mem::gs(voff(rd)), W);
+        true
+    }
+
+    pub(super) fn sha1(&mut self, op: u8, rd: u32, rn: u32, rm: u32) -> bool {
+        if op > 5 {
+            return false;
+        }
+        let a = &mut self.a;
+        a.vmovdqu_load(X, Mem::gs(voff(rd)));
+        a.vmovdqu_load(Y, Mem::gs(voff(rn)));
+        match op {
+            0..=2 => {
+                // X = [a,b,c,d], Y.low = e, W = four message words + K.
+                a.vmovdqu_load(W, Mem::gs(voff(rm)));
+                for _ in 0..4 {
+                    shuffle(a, T, X, 0x55); // b
+                    shuffle(a, U, X, 0xaa); // c
+                    shuffle(a, V, X, 0xff); // d
+                    match op {
+                        0 => {
+                            bin(a, XOR, U, U, V);
+                            bin(a, AND, U, U, T);
+                            bin(a, XOR, U, U, V);
+                        }
+                        1 => {
+                            bin(a, XOR, U, U, T);
+                            bin(a, XOR, U, U, V);
+                        }
+                        _ => {
+                            bin(a, OR, S, T, U);
+                            bin(a, AND, S, S, V);
+                            bin(a, AND, U, U, T);
+                            bin(a, OR, U, U, S);
+                        }
+                    }
+                    ror(a, S, X, 27, R); // ROL(a,5)
+                    bin(a, ADD, S, S, Y);
+                    bin(a, ADD, S, S, U);
+                    bin(a, ADD, S, S, W); // new a
+                    ror(a, T, X, 2, R); // ROL(b,30) in lane 1
+                    blend(a, X, X, T, 2);
+                    shift_bytes(a, X, X, true, 4);
+                    blend(a, X, X, S, 1); // [new a,a,ROL(b,30),c]
+                    shuffle(a, Y, V, 0); // new e = old d
+                    shift_bytes(a, W, W, false, 4);
+                }
+            }
+            3 => {
+                a.vmovdqu_load(W, Mem::gs(voff(rm)));
+                align(a, T, Y, X, 8); // [d2,d3,n0,n1]
+                bin(a, XOR, X, X, T);
+                bin(a, XOR, X, X, W);
+            }
+            4 => {
+                ror(a, X, Y, 2, T);
+                // SHA1H writes a scalar S register, clearing all high bits.
+                shift_bytes(a, X, X, true, 12);
+                shift_bytes(a, X, X, false, 12);
+            }
+            _ => {
+                shift_bytes(a, T, Y, false, 4);
+                bin(a, XOR, X, X, T);
+                ror(a, Y, X, 31, T); // ROL(t,1)
+                ror(a, U, X, 30, T); // ROL(t,2)
+                shift_bytes(a, U, U, true, 12);
+                bin(a, XOR, X, Y, U); // high lane also XORs ROL(t0,2)
+            }
+        }
+        a.vmovdqu_store(Mem::gs(voff(rd)), X);
+        true
+    }
+
     pub(super) fn sha256(&mut self, op: u8, rd: u32, rn: u32, rm: u32) -> bool {
         if !matches!(op, 4 | 5 | 6 | 0x10) {
             return false;

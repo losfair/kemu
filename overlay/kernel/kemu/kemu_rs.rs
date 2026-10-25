@@ -335,6 +335,22 @@ pub struct KemuTrans {
     pub fault_addr: u64,
 }
 
+/// Cache optional host CPU features at the unsafe kernel boundary; the
+/// translator core itself remains entirely safe Rust.
+fn host_crypto() -> t1::HostCrypto {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    static FEATURES: AtomicU8 = AtomicU8::new(0);
+    let mut bits = FEATURES.load(Ordering::Relaxed);
+    if bits == 0 {
+        // SAFETY: the JIT runs on x86-64, where CPUID is always available.
+        // This only reads integer registers and does not use kernel SIMD.
+        let ecx = unsafe { core::arch::x86_64::__cpuid(1) }.ecx;
+        bits = 4 | (((ecx >> 25) & 1) as u8) | ((ecx & 2) as u8);
+        FEATURES.store(bits, Ordering::Relaxed);
+    }
+    t1::HostCrypto { aes: bits & 1 != 0, pclmul: bits & 2 != 0 }
+}
+
 /// Translate the guest block at `pc` into `out` (user address `code_uaddr`).
 ///
 /// # Safety
@@ -365,7 +381,7 @@ pub unsafe extern "C" fn kemu_rs_translate(
             &mut *res,
         )
     };
-    let cfg = t1::Cfg { stubs: info.addrs(stubs_base), code_uaddr, reloc, tbi };
+    let cfg = t1::Cfg { stubs: info.addrs(stubs_base), code_uaddr, reloc, tbi, crypto: host_crypto() };
     match t1::translate(&mut KEnv, pc, out, &cfg, s) {
         Ok(r) => {
             res.size = r.size as u64;

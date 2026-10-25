@@ -458,6 +458,7 @@ impl<'s, 'b> Gen<'s, 'b> {
             return true;
         }
         match op {
+            SimdOp::PMull | SimdOp::PMull2 => self.pmull(size, op == SimdOp::PMull2, rd, rn, rm),
             SimdOp::And | SimdOp::Orr | SimdOp::Eor | SimdOp::Bic => {
                 self.ld_vec(X14, rn);
                 match op {

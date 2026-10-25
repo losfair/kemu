@@ -262,7 +262,7 @@ fn xcache_validate_and_relocate() {
     };
     let mut page = std::vec![0u8; 4096];
     let so = stubs::gen_stubs(&mut page, stubs::ExitMode::Syscall, 0x7000_1000_0000, 0xfff8).expect("stubs");
-    let cfg = t1::Cfg { stubs: so.addrs(0x7000_0000_0000), code_uaddr: 0x7000_0000_0000 + (1 << 20), reloc: true, tbi: false };
+    let cfg = t1::Cfg { stubs: so.addrs(0x7000_0000_0000), code_uaddr: 0x7000_0000_0000 + (1 << 20), reloc: true, tbi: false, crypto: t1::HostCrypto::default() };
     let mut s = std::boxed::Box::new(t1::Scratch::new());
     let mut out = std::vec![0u8; 8192];
     let mut env = mk(0x40_0000, None);
@@ -311,7 +311,7 @@ fn recover_in_exit_trampoline_of_remapped_block() {
     let mut env = TestEnv { mem, base: 0x40_0000 };
     let mut page = std::vec![0u8; 4096];
     let so = stubs::gen_stubs(&mut page, stubs::ExitMode::Syscall, 0x7000_1000_0000, 0xfff8).expect("stubs");
-    let cfg = t1::Cfg { stubs: so.addrs(0x7000_0000_0000), code_uaddr: 0x7000_0000_0000 + (1 << 20), reloc: false, tbi: false };
+    let cfg = t1::Cfg { stubs: so.addrs(0x7000_0000_0000), code_uaddr: 0x7000_0000_0000 + (1 << 20), reloc: false, tbi: false, crypto: t1::HostCrypto::default() };
     let mut s = std::boxed::Box::new(t1::Scratch::new());
     let mut out = std::vec![0u8; 8192];
     let r = t1::translate(&mut env, 0x40_0000, &mut out, &cfg, &mut s).expect("translate");
