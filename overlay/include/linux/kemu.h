@@ -65,10 +65,13 @@ void kemu_unmapped(struct mm_struct *mm, unsigned long start, unsigned long end)
 bool kemu_vma_hidden(struct vm_area_struct *vma);
 int kemu_show_cpuinfo(struct seq_file *m, unsigned int cpu);
 bool kemu_user_fault(struct pt_regs *regs, unsigned long address);
+bool kemu_user_gp(struct pt_regs *regs);
 
 #else /* !CONFIG_KEMU */
 
 #define task_is_kemu(t) false
+
+static inline bool kemu_user_gp(struct pt_regs *regs) { return false; }
 
 static inline void kemu_exit_to_user(struct pt_regs *regs) { }
 static inline void kemu_do_signal(struct pt_regs *regs) { }

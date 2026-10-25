@@ -1,3 +1,26 @@
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index 6b22611e6..e28641933 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -43,6 +43,7 @@
+ #include <linux/atomic.h>
+ #include <linux/iommu.h>
+ #include <linux/ubsan.h>
++#include <linux/kemu.h>
+ 
+ #include <asm/stacktrace.h>
+ #include <asm/processor.h>
+@@ -819,6 +820,10 @@ DEFINE_IDTENTRY_ERRORCODE(exc_general_protection)
+ 		if (fixup_vdso_exception(regs, X86_TRAP_GP, error_code, 0))
+ 			goto exit;
+ 
++		/* kemu: non-canonical (e.g. arm64 tagged) guest data address. */
++		if (task_is_kemu(current) && kemu_user_gp(regs))
++			goto exit;
++
+ 		gp_user_force_sig_segv(regs, X86_TRAP_GP, error_code, desc);
+ 		goto exit;
+ 	}
 diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
 index 998bd807f..0ccf0c668 100644
 --- a/arch/x86/mm/fault.c

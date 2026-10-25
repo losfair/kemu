@@ -110,6 +110,7 @@ struct kemu_mm {
 	struct xarray pages;		/* guest page >> PAGE_SHIFT -> kemu_pgvec */
 	struct kemu_pgvec *wide;	/* blocks reading too many pages to index */
 	struct xarray sites;		/* chained rel32 offset -> xa_mk_value(unchained value) */
+	struct xarray tbi_pcs;		/* guest pc >> 2 of blocks translated with TBI */
 	u64 epoch;			/* bumped on every flush or invalidation */
 	atomic_t flush_pending;		/* executable mapping went away */
 	spinlock_t pend_lock;
@@ -130,6 +131,7 @@ struct kemu_mm {
 	unsigned long flushes;
 	unsigned long invals;		/* targeted invalidations */
 	unsigned long killed;		/* blocks they removed */
+	unsigned long tbi_emul;		/* tagged accesses run by the interpreter */
 	unsigned long lookups;		/* TRANSLATE/CHAIN ops */
 	unsigned long xc_hits;		/* translations taken from the xcache */
 	u64 translate_ns;		/* time spent in those ops */
@@ -146,6 +148,7 @@ struct kemu_blkinfo {
 	u32 off;			/* code offset of the block */
 	u32 size;
 	u32 nin, cap;
+	u32 tbi_faults;			/* tagged-pointer #GPs in this block */
 	struct kemu_chain_site *in;
 };
 
@@ -299,7 +302,7 @@ int kemu_rs_gen_stubs(u8 *out, size_t len, u64 table_base, u32 mask8,
 size_t kemu_rs_scratch_size(void);
 int kemu_rs_translate(void *scratch, u64 pc, u8 *out, size_t len, u64 code_uaddr,
 		      u64 stubs_base, const struct kemu_stubs *info,
-		      struct kemu_trans *res, bool reloc);
+		      struct kemu_trans *res, bool reloc, bool tbi);
 long kemu_rs_xc_blob_size(void *scratch);
 long kemu_rs_xc_blob(void *scratch, u64 pc, u64 blk_off, u8 *out, size_t len);
 bool kemu_rs_xc_validate(const u8 *blob, size_t len, u64 pc);

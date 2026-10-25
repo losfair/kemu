@@ -99,6 +99,22 @@ fn memory_roundtrip() {
 }
 
 #[test]
+fn tagged_pointer_tbi() {
+    // movz x1,#0x2000; movk x1,#0x5a00,lsl #48 (tag 0x5a); movz x0,#0xabcd;
+    // str x0,[x1]; movz x5,#0x2000; ldr x2,[x5]; svc
+    let (cpu, e) = run_code(&[0xd2840001, 0xf2eb4001, 0xd29579a0, 0xf9000020, 0xd2840005, 0xf94000a2, 0xd4000001]);
+    assert_eq!(e, Exit::Svc);
+    assert_eq!(cpu.x[2], 0xabcd);
+    // A fault through a tagged pointer reports the untagged address.
+    // movz x1,#0xfff0,lsl #16 (0xfff00000); movk x1,#0x3300,lsl #48; ldr x0,[x1]
+    let (_, e) = run_code(&[0xd2bffe01, 0xf2e66001, 0xf9400020]);
+    match e {
+        Exit::Fault(f) => assert_eq!(f.addr, 0xfff0_0000),
+        e => panic!("expected fault, got {e:?}"),
+    }
+}
+
+#[test]
 fn ccmp_and_cond() {
     // cmp x0,#0 (x0=0) => eq; cset x0,eq -> 1
     // movz x0,#0 ; cmp x0,#0 ; cset x0, eq
@@ -246,7 +262,7 @@ fn xcache_validate_and_relocate() {
     };
     let mut page = std::vec![0u8; 4096];
     let so = stubs::gen_stubs(&mut page, stubs::ExitMode::Syscall, 0x7000_1000_0000, 0xfff8).expect("stubs");
-    let cfg = t1::Cfg { stubs: so.addrs(0x7000_0000_0000), code_uaddr: 0x7000_0000_0000 + (1 << 20), reloc: true };
+    let cfg = t1::Cfg { stubs: so.addrs(0x7000_0000_0000), code_uaddr: 0x7000_0000_0000 + (1 << 20), reloc: true, tbi: false };
     let mut s = std::boxed::Box::new(t1::Scratch::new());
     let mut out = std::vec![0u8; 8192];
     let mut env = mk(0x40_0000, None);
@@ -295,7 +311,7 @@ fn recover_in_exit_trampoline_of_remapped_block() {
     let mut env = TestEnv { mem, base: 0x40_0000 };
     let mut page = std::vec![0u8; 4096];
     let so = stubs::gen_stubs(&mut page, stubs::ExitMode::Syscall, 0x7000_1000_0000, 0xfff8).expect("stubs");
-    let cfg = t1::Cfg { stubs: so.addrs(0x7000_0000_0000), code_uaddr: 0x7000_0000_0000 + (1 << 20), reloc: false };
+    let cfg = t1::Cfg { stubs: so.addrs(0x7000_0000_0000), code_uaddr: 0x7000_0000_0000 + (1 << 20), reloc: false, tbi: false };
     let mut s = std::boxed::Box::new(t1::Scratch::new());
     let mut out = std::vec![0u8; 8192];
     let r = t1::translate(&mut env, 0x40_0000, &mut out, &cfg, &mut s).expect("translate");

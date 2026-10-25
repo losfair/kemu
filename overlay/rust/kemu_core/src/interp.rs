@@ -43,7 +43,7 @@ pub fn run<E: Env>(cpu: &mut CpuState, env: &mut E, max_insns: u32) -> (Exit, u3
             Err(f) => return (Exit::Fault(f), n),
         };
         let insn = decode(word);
-        match step(cpu, env, insn, word) {
+        match step(cpu, &mut crate::env::Tbi(&mut *env), insn, word) {
             Step::Next => {
                 cpu.pc = cpu.pc.wrapping_add(4);
                 n += 1;
@@ -52,6 +52,7 @@ pub fn run<E: Env>(cpu: &mut CpuState, env: &mut E, max_insns: u32) -> (Exit, u3
                 cpu.pc = t;
                 n += 1;
             }
+            Step::Exit(Exit::IcInvalidate(va)) => return (Exit::IcInvalidate(crate::env::untag(va)), n),
             Step::Exit(e) => return (e, n),
         }
     }

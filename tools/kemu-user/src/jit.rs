@@ -109,7 +109,7 @@ fn translate(pc: u64) -> Option<(u64, u64)> {
     }
     let base = REGION + j.used as u64;
     let out = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, CODE_SIZE - j.used) };
-    let cfg = Cfg { stubs: j.stubs.addrs(REGION), code_uaddr: base, reloc: false };
+    let cfg = Cfg { stubs: j.stubs.addrs(REGION), code_uaddr: base, reloc: false, tbi: false };
     let t0 = std::time::Instant::now();
     let res = t1::translate(&mut j.env, pc, out, &cfg, &mut j.scratch);
     j.translate_ns += t0.elapsed().as_nanos() as u64;
@@ -310,7 +310,7 @@ fn reloc_check(start: u64, span: u64) {
     let (mut n, mut bad, mut uncacheable) = (0u64, 0u64, 0u64);
     let mut pc = start;
     while pc < start + span {
-        let ca = Cfg { stubs: j.stubs.addrs(REGION), code_uaddr: REGION + off_a, reloc: true };
+        let ca = Cfg { stubs: j.stubs.addrs(REGION), code_uaddr: REGION + off_a, reloc: true, tbi: false };
         let ra = match t1::translate(&mut j.env, pc, &mut a, &ca, &mut j.scratch) {
             Ok(r) => r,
             Err(_) => {
@@ -326,7 +326,7 @@ fn reloc_check(start: u64, span: u64) {
                 continue;
             }
         };
-        let cb = Cfg { stubs: j.stubs.addrs(REGION), code_uaddr: REGION + off_b, reloc: true };
+        let cb = Cfg { stubs: j.stubs.addrs(REGION), code_uaddr: REGION + off_b, reloc: true, tbi: false };
         let rb = {
             let mut sh = Shifted { env: &mut j.env, d };
             t1::translate(&mut sh, pc + d, &mut b, &cb, &mut j.scratch)
