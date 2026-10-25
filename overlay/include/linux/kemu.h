@@ -42,6 +42,8 @@ void kemu_exit_to_user(struct pt_regs *regs);
 
 /* Signal delivery and syscall restart for kemu tasks. */
 void kemu_do_signal(struct pt_regs *regs);
+/* syscall_rollback() on a kemu task (current): guest x0 gets orig_x0 back. */
+void kemu_syscall_rollback(struct task_struct *task);
 
 /* mm / task lifecycle. */
 int kemu_dup_mm(struct mm_struct *oldmm, struct mm_struct *mm);

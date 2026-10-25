@@ -57,6 +57,18 @@ static long kemu_dispatch(struct pt_regs *regs, long nr)
 	return kemu_syscall_table(regs, nr);
 }
 
+/*
+ * syscall_rollback() hook (seccomp RET_TRAP/RET_KILL, syscall user
+ * dispatch): always on current, inside its syscall.
+ */
+void kemu_syscall_rollback(struct task_struct *task)
+{
+	struct kemu_thread *kt = task->kemu;
+
+	if (kt->flags & KEMU_TF_IN_SVC)
+		kt->flags |= KEMU_TF_ROLLBACK;
+}
+
 /* KEMU_OP_SVC: a guest `svc #0`. The guest PC already points past it. */
 void kemu_svc(struct pt_regs *regs)
 {
@@ -70,7 +82,7 @@ void kemu_svc(struct pt_regs *regs)
 	next_pc = cpu->pc;
 	kemu_load_syscall_view(regs, cpu);
 	kt->orig_x0 = kemu_reg(regs, di);
-	kt->flags |= KEMU_TF_IN_SVC;
+	kt->flags = (kt->flags & ~KEMU_TF_ROLLBACK) | KEMU_TF_IN_SVC;
 
 	nr = kemu_syscall_enter(regs);
 	kemu_store_syscall_args(regs, cpu);
@@ -96,11 +108,12 @@ void kemu_svc(struct pt_regs *regs)
 	 * dispatch rolled the syscall back (RET_TRAP, RET_KILL). x86 rollback
 	 * writes orig_ax (here the arm64 syscall nr) into ax, but arm64 restores
 	 * orig_x0; a SIGSYS broker (Chromium, Firefox) reads orig_x0 from the
-	 * frame. A rollback is the skip (nr == -1) whose ax equals orig_ax; an
-	 * errno skip (RET_ERRNO) has ax = -errno and is written normally.
+	 * frame. syscall_rollback() flags the rollback: a skip that sets a
+	 * return value (RET_ERRNO, a user-notification reply) can leave ax
+	 * equal to orig_ax too, and must still be written.
 	 */
 	if (kt->flags & KEMU_TF_IN_SVC) {
-		if (nr == -1 && kemu_reg(regs, ax) == kemu_reg(regs, orig_ax))
+		if (kt->flags & KEMU_TF_ROLLBACK)
 			WRITE_ONCE(kt->cpu->x[0], kt->orig_x0);
 		else
 			WRITE_ONCE(kt->cpu->x[0], kemu_reg(regs, ax));

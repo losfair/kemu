@@ -101,12 +101,19 @@ static void kemu_inval_free(struct kemu_mm *km);
 
 static void kemu_chunk_free(struct kemu_mm *km, int c)
 {
-	vfree(km->chunks[c]);
-	kvfree(km->blockmap[c]);
-	km->chunks[c] = NULL;
-	km->blockmap[c] = NULL;
+	void *mem = km->chunks[c];
+	unsigned long *bm = km->blockmap[c];
+
+	WRITE_ONCE(km->chunks[c], NULL);
+	WRITE_ONCE(km->blockmap[c], NULL);
 	km->chunk_used[c] = 0;
-	km->chunk_retired[c] = 0;
+	/*
+	 * kemu_materialize() reads chunk_retired locklessly and then trusts
+	 * the pointers of a live (0) chunk: clear them first.
+	 */
+	smp_store_release(&km->chunk_retired[c], 0);
+	vfree(mem);
+	kvfree(bm);
 }
 
 void kemu_jit_free(struct kemu_mm *km)
@@ -484,7 +491,8 @@ static int kemu_chunk_new(struct kemu_mm *km)
 	km->blockmap[c] = bm;
 	km->chunk_used[c] = 0;
 	km->chunk_retired[c] = 0;
-	WRITE_ONCE(km->chunks[c], mem);
+	/* Publish the blockmap with the chunk (kemu_materialize is lockless). */
+	smp_store_release(&km->chunks[c], mem);
 	up_write(&km->chunk_sem);
 	km->cur_chunk = c;
 	return 0;
@@ -503,14 +511,17 @@ static u8 *kemu_find_block(struct kemu_mm *km, unsigned long off, size_t *len)
 	u64 gpc;
 	u32 main;
 	size_t sz;
-	u8 *blk;
+	u8 *chunk, *blk;
 
-	if (c == 0 || c >= KEMU_MAX_CHUNKS || !km->chunks[c] || in >= km->chunk_used[c])
+	if (c == 0 || c >= KEMU_MAX_CHUNKS)
+		return NULL;
+	chunk = smp_load_acquire(&km->chunks[c]);
+	if (!chunk || in >= km->chunk_used[c])
 		return NULL;
 	bit = find_last_bit(km->blockmap[c], in / KEMU_BLOCK_ALIGN + 1);
 	if (bit > in / KEMU_BLOCK_ALIGN)
 		return NULL;
-	blk = km->chunks[c] + bit * KEMU_BLOCK_ALIGN;
+	blk = chunk + bit * KEMU_BLOCK_ALIGN;
 	sz = kemu_rs_block_info(blk, km->chunk_used[c] - bit * KEMU_BLOCK_ALIGN, &gpc, &main);
 	if (!sz || in >= bit * KEMU_BLOCK_ALIGN + sz)
 		return NULL;
@@ -748,7 +759,7 @@ void kemu_materialize(struct pt_regs *regs)
 		 * code never runs there: acknowledging an epoch resets the host
 		 * return stack. Only a forged return address gets here.
 		 */
-		retired = READ_ONCE(km->chunk_retired[c]);
+		retired = smp_load_acquire(&km->chunk_retired[c]);
 		blk = retired && retired <= kt->epoch_seen ? NULL : kemu_find_block(km, off, &len);
 		if (!blk || !kemu_rs_recover(blk, len,
 					     ((u8 *)km->chunks[off >> KEMU_CHUNK_SHIFT] +

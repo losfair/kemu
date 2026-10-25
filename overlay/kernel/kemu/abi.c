@@ -105,9 +105,10 @@ long kemu_sys_openat2(struct pt_regs *regs)
 	err = copy_struct_from_user(&how, sizeof(how), uhow, usize);
 	if (err)
 		return err;
+	/* Audit logs the guest's (arm64) flags, under AUDIT_ARCH_AARCH64. */
+	audit_openat2_how(&how);
 	/* Bits outside the translated set are validated by the core. */
 	how.flags = (how.flags & ~(u64)U32_MAX) | kemu_oflags_to_host((u32)how.flags);
-	audit_openat2_how(&how);
 	/* O_LARGEFILE is forced on 64-bit (non-O_PATH), as in native openat2. */
 	if (!(how.flags & O_PATH) && force_o_largefile())
 		how.flags |= O_LARGEFILE;
@@ -361,6 +362,10 @@ long kemu_sys_semctl(struct pt_regs *regs)
 	struct semid64_ds k;
 	int err;
 
+	/* As ksys_semctl(): the stat/set helpers would mask a negative id
+	 * into a valid index. */
+	if (semid < 0)
+		return -EINVAL;
 	switch (cmd) {
 	case IPC_STAT:
 	case SEM_STAT:

@@ -25,6 +25,7 @@
 #include <sys/syscall.h>
 #include <sys/auxv.h>
 #include <stddef.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <sys/ptrace.h>
 #include <sys/uio.h>
@@ -355,6 +356,16 @@ static void test_semctl(void)
 	int r = semctl(id, 0, IPC_STAT, arg);
 	CHECK("semctl-stat", r == 0 && s.ds.sem_nsems == 3 && s.canary == 0xfeedface,
 	      "r %d nsems %lu canary %lx", r, (unsigned long)s.ds.sem_nsems, s.canary);
+	/* A negative id is EINVAL before anything else, as native: not a
+	 * masked index (INT_MIN -> set 0) or an EFAULT from the bad buffer. */
+	arg.buf = (struct semid_ds *)1;
+	errno = 0;
+	r = semctl(-1, 0, IPC_SET, arg);
+	CHECK("semctl-negative-set", r == -1 && errno == EINVAL, "r %d errno %d", r, errno);
+	arg.buf = &s.ds;
+	errno = 0;
+	r = semctl(INT_MIN, 0, SEM_STAT_ANY, arg);
+	CHECK("semctl-negative-stat", r == -1 && errno == EINVAL, "r %d errno %d", r, errno);
 	semctl(id, 0, IPC_RMID);
 }
 
@@ -417,10 +428,10 @@ static void test_seccomp_strict(void)
 	if (p == 0) {
 		if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT, 0, 0, 0))
 			_exit(2);
-		/* read/write of the pipe below and exit must be permitted. */
 		char c = 'k';
 		write(2, &c, 0);	/* zero-length write: just the syscall */
-		_exit(0);		/* exit_group */
+		/* Strict mode allows exit but not exit_group (glibc's _exit). */
+		syscall(__NR_exit, 0);
 	}
 	int st;
 	waitpid(p, &st, 0);
@@ -430,12 +441,61 @@ static void test_seccomp_strict(void)
 	      WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st));
 }
 
+/*
+ * x0 after a seccomp-skipped syscall: the return value it set, even when
+ * that equals the syscall number (RET_ERRNO|0 on io_setup, nr 0, returns
+ * 0); but the original x0 after a rollback (RET_TRAP), where SIGSYS sees
+ * the registers as they were at the svc.
+ */
+static volatile unsigned long sys_x0;
+static void on_sys(int sig, siginfo_t *si, void *ucv)
+{
+	sys_x0 = ((ucontext_t *)ucv)->uc_mcontext.regs[0];
+}
+
+static void test_seccomp_x0(void)
+{
+	struct sock_filter prog[] = {
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 5),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0 /* arm64 io_setup */, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 172 /* arm64 getpid */, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+	};
+	struct sock_fprog fp = { .len = ARRAY_SIZE(prog), .filter = prog };
+	struct sigaction sa = { .sa_sigaction = on_sys, .sa_flags = SA_SIGINFO };
+	pid_t p = fork();
+
+	if (p == 0) {
+		unsigned long ctx = 0;
+
+		sigaction(SIGSYS, &sa, NULL);
+		if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) ||
+		    syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, &fp))
+			_exit(100 + (errno & 0x7f));
+		long r = syscall(0, 1234, &ctx);	/* io_setup */
+		if (r != 0)
+			_exit(r == 1234 ? 2 : 3);
+		syscall(172, 0x5eedUL);			/* getpid -> SIGSYS */
+		_exit(sys_x0 == 0x5eed ? 0 : 4);
+	}
+	int st;
+	waitpid(p, &st, 0);
+	CHECK("seccomp-x0", WIFEXITED(st) && WEXITSTATUS(st) == 0,
+	      "exit %d (2: errno-0 return replaced by x0, 4: SIGSYS x0, 100+: setup)",
+	      WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+}
+
 static void test_abi_fixes(void)
 {
 	test_semctl();
 	test_openat2();
 	test_seccomp_arch();
 	test_seccomp_strict();
+	test_seccomp_x0();
 }
 
 int main(int argc, char **argv)
