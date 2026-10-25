@@ -276,13 +276,7 @@ extern "C" fn on_alarm(_sig: i32, _info: *mut libc::siginfo_t, ucv: *mut libc::c
     let hh = h();
     if rip >= REGION && rip < REGION + 4096 {
         let info = hh.stubs.info((rip - REGION) as u32);
-        if info != stubs::STUB_PAGE_STATE {
-            if info == stubs::STUB_PINNED_LIVE_PC_RAX {
-                st.pc = hregs.gpr[0];
-            }
-            meta::pinned_from_host(st, &hregs);
-        }
-        st.nzcv = nzcv_from_image(st.flags_x86);
+        stubs::recover(info, &hregs, st);
     } else if let Some(&(b, sz)) = hh.blocks.iter().find(|(b, sz)| rip >= *b && rip < *b + *sz as u64) {
         let blk = unsafe { std::slice::from_raw_parts(b as *const u8, sz) };
         if !meta::recover(blk, (rip - b) as u32, &hregs, st) {

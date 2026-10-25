@@ -488,15 +488,15 @@ pub unsafe extern "C" fn kemu_rs_recover(
     meta::recover(blk, host_off, &host_regs(h), cpu)
 }
 
-/// Copy pinned guest registers from host registers.
+/// Recover guest state using a stub range's attribute.
 ///
 /// # Safety
 /// `h` and `cpu` must be valid.
 #[no_mangle]
-pub unsafe extern "C" fn kemu_rs_pinned_from_host(h: *const KemuHostRegs, cpu: *mut CpuState) {
+pub unsafe extern "C" fn kemu_rs_recover_stub(info: u32, h: *const KemuHostRegs, cpu: *mut CpuState) {
     // SAFETY: guaranteed by the caller.
     let (h, cpu) = unsafe { (&*h, &mut *cpu) };
-    meta::pinned_from_host(cpu, &host_regs(h));
+    stubs::recover(info as u8, &host_regs(h), cpu);
 }
 
 /// Validate a block header; returns its size (0 if invalid).

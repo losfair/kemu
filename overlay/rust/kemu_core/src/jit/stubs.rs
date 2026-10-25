@@ -5,8 +5,10 @@
 //! block chaining, single-instruction helpers and guest syscalls. Stubs
 //! transfer to the kernel with `syscall` (`%eax` = kemu operation).
 
+use super::meta::{self, HostRegs};
 use super::regmap::*;
 use super::x86::*;
+use crate::state::CpuState;
 
 /// kemu operations (include/linux/kemu_abi.h).
 pub const OP_SVC: u32 = 0x6b65_6d00;
@@ -49,6 +51,25 @@ pub struct StubOffsets {
 pub const STUB_PAGE_STATE: u8 = 0; // guest state fully in the state page
 pub const STUB_PINNED_LIVE: u8 = 1; // pinned regs in host regs, pc in page
 pub const STUB_PINNED_LIVE_PC_RAX: u8 = 2; // pinned in host regs, pc in %rax
+pub const STUB_PINNED_LIVE_SVC: u8 = 3; // pinned live, pending SVC at page pc - 4
+pub const STUB_PAGE_STATE_SVC: u8 = 4; // page authoritative, pending SVC at pc - 4
+
+/// Recover an interrupted stub using its range attribute. SVC callers
+/// advance the page PC before entering the stub. Before the host
+/// syscall/call executes, recovery must restart that guest SVC. At its
+/// return address the page may contain a new PC and registers restored
+/// by rt_sigreturn, which must remain authoritative.
+pub fn recover(info: u8, h: &HostRegs, st: &mut CpuState) {
+    match info {
+        STUB_PINNED_LIVE_PC_RAX => st.pc = h.gpr[RAX as usize],
+        STUB_PINNED_LIVE_SVC | STUB_PAGE_STATE_SVC => st.pc = st.pc.wrapping_sub(4),
+        _ => {}
+    }
+    if matches!(info, STUB_PINNED_LIVE | STUB_PINNED_LIVE_PC_RAX | STUB_PINNED_LIVE_SVC) {
+        meta::pinned_from_host(st, h);
+    }
+    st.nzcv = nzcv_from_image(st.flags_x86);
+}
 
 /// Absolute user addresses of the stubs, as needed by the translator.
 #[derive(Clone, Copy, Debug, Default)]
@@ -186,14 +207,16 @@ pub fn gen_stubs(out: &mut [u8], mode: ExitMode, table_base: u64, table_mask8: u
     let s = a.pos;
     spill_all(&mut a);
     exit(&mut a, mode, OP_SVC, slot);
-    o.push(s, a.pos, STUB_PINNED_LIVE);
+    o.push(s, a.pos, STUB_PINNED_LIVE_SVC);
     reload_all(&mut a);
     a.ret();
 
     // interp_svc: interpreter mode; state is in the page.
     a.align(16);
     o.interp_svc = a.pos as u32;
+    let s = a.pos;
     exit(&mut a, mode, OP_SVC, slot);
+    o.push(s, a.pos, STUB_PAGE_STATE_SVC);
     let d = o.dispatch as usize;
     a.jmp(Some(d));
 
@@ -209,5 +232,56 @@ pub fn gen_stubs(out: &mut [u8], mode: ExitMode, table_base: u64, table_mask8: u
         Some(o)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recover_svc_entry_and_return_boundaries() {
+        let mut page = [0u8; 4096];
+        let o = gen_stubs(&mut page, ExitMode::Syscall, 0x7000_1000_0000, 0xfff8).unwrap();
+        let mut host = HostRegs::default();
+        host.gpr.fill(0xdead_beef);
+        let state = |pc| {
+            let mut st = CpuState::new();
+            st.pc = pc;
+            st.x[0] = 0x1234;
+            st.v[0] = [0x5678, 0x9abc];
+            st.flags_x86 = image_from_nzcv(0xa000_0000);
+            st
+        };
+        for (start, end, pending, pinned) in [
+            (o.svc, o.interp_svc, STUB_PINNED_LIVE_SVC, true),
+            (o.interp_svc, o.step, STUB_PAGE_STATE_SVC, false),
+        ] {
+            let bytes = &page[start as usize..end as usize];
+            let syscall = start + bytes.windows(2).position(|b| b == [0x0f, 0x05]).unwrap() as u32;
+            // Include the syscall instruction itself: an interrupt at
+            // its IP is still before the guest syscall takes effect.
+            for off in start..syscall + 2 {
+                assert_eq!(o.info(off), pending, "at {off:#x}");
+                let mut st = state(0x6404_0008);
+                recover(o.info(off), &host, &mut st);
+                assert_eq!(st.pc, 0x6404_0004, "pending SVC at {off:#x}");
+                assert_eq!(st.x[0], if pinned { 0xdead_beef } else { 0x1234 });
+                assert_eq!(st.v[0], [0x5678, 0x9abc]);
+                assert_eq!(st.nzcv, 0xa000_0000);
+            }
+            // Ordinary syscall completion and rt_sigreturn both leave
+            // the page authoritative, including throughout GPR reloads.
+            for off in syscall + 2..end {
+                assert_eq!(o.info(off), STUB_PAGE_STATE, "at {off:#x}");
+                for pc in [0x6404_0008, 0x400970] {
+                    let mut st = state(pc);
+                    recover(o.info(off), &host, &mut st);
+                    assert_eq!(st.pc, pc, "completed SVC at {off:#x}");
+                    assert_eq!(st.x[0], 0x1234);
+                    assert_eq!(st.v[0], [0x5678, 0x9abc]);
+                }
+            }
+        }
     }
 }
