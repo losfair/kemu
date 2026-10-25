@@ -26,8 +26,9 @@ Working:
 - Threads, futexes, LL/SC and seq_cst atomics, signals, ptrace and
   single-step, core dumps, seccomp/audit as `AUDIT_ARCH_AARCH64`.
 - T1 JIT with superblocks, block chaining, register remapping and lazy flags.
-- SHA-256 rounds and message schedules translated to AVX2, without kernel
-  entries per instruction or a requirement for host SHA extensions.
+- SHA-256 rounds, message schedules and vector byte reversal translated to
+  AVX2, without kernel entries per instruction or a requirement for host
+  SHA extensions.
 - A shared translation cache for file-backed code. Library code translated by
   one process is reused by the next one after re-validating it against the
   bytes in memory.

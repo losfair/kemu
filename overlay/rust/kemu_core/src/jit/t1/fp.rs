@@ -714,6 +714,33 @@ impl<'s, 'b> Gen<'s, 'b> {
             return false;
         }
         match op {
+            Simd2Op::Rev16 | Simd2Op::Rev32 | Simd2Op::Rev64 => {
+                let container = match op {
+                    Simd2Op::Rev16 => 1,
+                    Simd2Op::Rev32 => 2,
+                    _ => 3,
+                };
+                if size >= container {
+                    return false;
+                }
+                // Reverse element order within each container while
+                // preserving byte order within an element. SHA-256 uses
+                // REV32.16B for every input vector before its rounds.
+                let swap = (1u64 << container) - (1u64 << size);
+                let mut mask = 0u64;
+                for byte in 0..8 {
+                    mask |= (byte ^ swap) << (byte * 8);
+                }
+                self.mov_imm(RAX, mask);
+                self.a.vmov_from_gpr(Sz::Q, X15, RAX);
+                self.mov_imm(RAX, mask | 0x0808_0808_0808_0808);
+                self.a.vmov_from_gpr(Sz::Q, X13, RAX);
+                self.a.vex(1, PP_66, false, false, 0x6c, X15, X15, Rm::R(X13)); // vpunpcklqdq
+                self.ld_vec(X14, rn);
+                self.a.vex(2, PP_66, false, false, 0x00, X14, X14, Rm::R(X15)); // vpshufb
+                self.st_vec(q, X14, rd);
+                return true;
+            }
             Simd2Op::Not => {}
             Simd2Op::NotOrRbit if !u => {}
             Simd2Op::CmEq0 if size < 3 => {

@@ -723,18 +723,26 @@ fn gen_fp(r: &mut Rng) -> u32 {
     }
 }
 
-/// SHA256H/H2/SU0/SU1, including aliased operands and V31. Mode 6 also
+/// SHA256H/H2/SU0/SU1 and vector byte-order reversal, including aliased
+/// operands and V31. Mode 6 also
 /// requires native lowering: interpreter fallbacks make hashing large
 /// files spend millions of kernel entries on individual instructions.
 fn gen_sha256(r: &mut Rng) -> u32 {
     let rd = r.below(32) as u32;
     let rn = if r.below(3) == 0 { rd } else { r.below(32) as u32 };
     let rm = if r.below(3) == 0 { rn } else { r.below(32) as u32 };
-    match r.below(4) {
+    match r.below(10) {
         0 => 0x5e00_4000 | (rm << 16) | (rn << 5) | rd,
         1 => 0x5e00_5000 | (rm << 16) | (rn << 5) | rd,
         2 => 0x5e28_2800 | (rn << 5) | rd,
-        _ => 0x5e00_6000 | (rm << 16) | (rn << 5) | rd,
+        3 => 0x5e00_6000 | (rm << 16) | (rn << 5) | rd,
+        i => {
+            // REV64 .8B/.4H/.2S, REV32 .8B/.4H, REV16 .8B, and
+            // their Q=1 forms. Q=0 must clear the upper 64 bits.
+            let base = [0x0e20_0800, 0x0e60_0800, 0x0ea0_0800,
+                        0x2e20_0800, 0x2e60_0800, 0x0e20_1800][(i - 4) as usize];
+            base | ((r.below(2) as u32) << 30) | (rn << 5) | rd
+        }
     }
 }
 
