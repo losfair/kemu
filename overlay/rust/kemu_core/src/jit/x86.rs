@@ -859,6 +859,15 @@ impl<'a> Asm<'a> {
         }
     }
 
+    /// Legacy SHA256RNDS2/MSG1/MSG2 (no mandatory prefix or VEX form).
+    pub fn sha256(&mut self, op: u8, dst: u8, src: u8) {
+        // SHA-NI has only legacy SSE encodings. The guest may have left
+        // dirty YMM upper halves (e.g. DC ZVA); avoid the AVX/SSE assist.
+        // Guest vectors are 128-bit, so this preserves every live value.
+        self.bytes(&[0xc5, 0xf8, 0x77]); // vzeroupper
+        self.op_rm(None, Sz::D, &[0x0f, 0x38, op], dst, Rm::R(src));
+    }
+
     // BMI1/BMI2 (operate on 32/64-bit GPRs).
 
     /// `shlx/sarx/shrx dst, src, cnt` (pp: 1=shlx, 2=sarx, 3=shrx)

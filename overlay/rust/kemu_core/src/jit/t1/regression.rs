@@ -86,3 +86,35 @@ fn xcache_fetch_is_memoized_against_a_racing_writer() {
     assert_eq!(hb, rb, "dependency records diverge under a racing writer");
     assert_eq!(hc, rc, "emitted code diverges under a racing writer");
 }
+
+/// Once MSR changes live MXCSR, a signal must observe the complete guest
+/// register write, even before the following state-page store executes.
+#[test]
+fn fp_sysreg_recovery_commits_the_loaded_control_or_status() {
+    use crate::jit::{meta, regmap};
+    use crate::state::CpuState;
+    for (word, value, status) in [(0xd51b4400, 1 << 22, false), (0xd51b4420, 0x0800_0080, true)] {
+        let mut env = Racy {
+            words: vec![word, 0xd65f03c0], flip_at: 0, first: 0, second: 0, seen: false,
+        };
+        let (code, _) = xlate(&mut env);
+        let hdr = meta::Header::read(&code).unwrap();
+        let m = &code[hdr.meta_off as usize..(hdr.meta_off + hdr.meta_len) as usize];
+        let (np, _) = meta::meta_counts(m).unwrap();
+        let p = (0..np).map(|i| meta::read_point(m, i).unwrap())
+            .find(|p| p.kind == meta::kind::ROLL_FP).unwrap();
+        let mut host = meta::HostRegs::default();
+        host.gpr[0] = value as u64;
+        let mut state = CpuState::new();
+        state.fpsr = 0x1f;
+        assert!(meta::recover(&code, p.off, &host, &mut state));
+        assert_eq!(state.pc, PC0 + 4);
+        if status {
+            assert_eq!(state.fpsr, value);
+            assert_eq!(regmap::fpsr_merge(state.fpsr, regmap::mxcsr_from(0, value)), value);
+        } else {
+            assert_eq!(state.fpcr, value);
+            assert_eq!(state.fpsr, 0x1f);
+        }
+    }
+}

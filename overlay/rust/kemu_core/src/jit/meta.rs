@@ -62,6 +62,9 @@ pub mod kind {
     /// Vector cache location: 0 = state page, 1 = XMM0..7. The metadata
     /// header maps each host register to a guest vector (or NO_VECTOR).
     pub const VSTATE: u8 = 9;
+    /// MSR has loaded the new live MXCSR. Finish the state-page write
+    /// from host GPR `b`: `a` = 0 for FPCR, 1 for FPSR, then advance PC.
+    pub const ROLL_FP: u8 = 10;
 }
 
 /// Flag locations for `kind::INSN` points.
@@ -418,6 +421,16 @@ pub fn recover(blk: &[u8], host_off: u32, h: &HostRegs, st: &mut CpuState) -> bo
         kind::DONE => {
             st.pc = pc_of(p.idx.wrapping_add(1));
             flags_from(st, p.a);
+        }
+        kind::ROLL_FP => {
+            let value = h.gpr[(p.b & 15) as usize] as u32;
+            match p.a {
+                0 => st.fpcr = value,
+                1 => st.fpsr = value,
+                _ => return false,
+            }
+            st.pc = pc_of(p.idx.wrapping_add(1));
+            st.nzcv = regmap::nzcv_from_image(st.flags_x86);
         }
         kind::ROLL_STATUS => {
             let zf = (h.rflags >> 6) & 1 != 0;

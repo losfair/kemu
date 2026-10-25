@@ -105,6 +105,7 @@ fn host_crypto() -> t1::HostCrypto {
     t1::HostCrypto {
         aes: std::is_x86_feature_detected!("aes"),
         pclmul: std::is_x86_feature_detected!("pclmulqdq"),
+        sha: std::is_x86_feature_detected!("sha") && std::env::var("NO_SHA").is_err(),
     }
 }
 

@@ -231,7 +231,14 @@ mod hx {
 
 #[inline]
 unsafe fn host(nr: i64, a: [u64; 6]) -> i64 {
-    libc::syscall(nr as libc::c_long, a[0], a[1], a[2], a[3], a[4], a[5]) as i64
+    raw_result(libc::syscall(nr as libc::c_long, a[0], a[1], a[2], a[3], a[4], a[5]))
+}
+
+// libc's syscall wrapper returns -1 and sets errno; the guest expects
+// the raw -errno ABI. In particular, GCC must see ENOENT while searching
+// include directories, rather than treating every missing file as EPERM.
+fn raw_result(r: libc::c_long) -> i64 {
+    if r == -1 { -(unsafe { *libc::__errno_location() } as i64) } else { r as i64 }
 }
 
 /// Returns Some(code) if the process should exit.
@@ -360,7 +367,7 @@ fn do_fstat(fd: u64, dst: u64) -> i64 {
     if r == 0 {
         write_arm64_stat(&st, dst);
     }
-    r as i64
+    raw_result(r)
 }
 
 fn do_fstatat(dirfd: u64, path: u64, dst: u64, flags: u64) -> i64 {
@@ -369,7 +376,16 @@ fn do_fstatat(dirfd: u64, path: u64, dst: u64, flags: u64) -> i64 {
     if r == 0 {
         write_arm64_stat(&st, dst);
     }
-    r as i64
+    raw_result(r)
+}
+
+#[test]
+fn syscall_errors_preserve_errno() {
+    assert_eq!(unsafe { host(hx::CLOSE, [u64::MAX, 0, 0, 0, 0, 0]) }, -libc::EBADF as i64);
+    assert_eq!(do_fstat(u64::MAX, 0), -libc::EBADF as i64);
+    let path = c"/proc/self/kemu-missing-test".as_ptr() as u64;
+    assert_eq!(unsafe { host(hx::OPENAT, [libc::AT_FDCWD as u64, path, 0, 0, 0, 0]) }, -libc::ENOENT as i64);
+    assert_eq!(do_fstatat(libc::AT_FDCWD as u64, path, 0, 0), -libc::ENOENT as i64);
 }
 
 fn do_uname(dst: u64) -> i64 {

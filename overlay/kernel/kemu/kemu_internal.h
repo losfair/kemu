@@ -59,7 +59,7 @@ static_assert(sizeof(struct kemu_cpu) == KEMU_CPU_STATE_SIZE);
 
 #define KEMU_CHUNK_SHIFT	20			/* 1 MiB code chunks */
 #define KEMU_CHUNK_SIZE		(1UL << KEMU_CHUNK_SHIFT)
-#define KEMU_MAX_CHUNKS		64			/* 64 MiB code VA */
+#define KEMU_MAX_CHUNKS		128			/* allocated on demand */
 #define KEMU_CODE_SIZE		(KEMU_MAX_CHUNKS * KEMU_CHUNK_SIZE)
 #define KEMU_STUBS_SIZE		PAGE_SIZE		/* chunk 0 holds only the stubs */
 #define KEMU_BLOCK_ALIGN	16
@@ -259,6 +259,7 @@ long kemu_sys_semctl(struct pt_regs *regs);
 int kemu_c_read(u64 addr, void *buf, size_t len);
 int kemu_c_write(u64 addr, const void *buf, size_t len);
 int kemu_c_fetch(u64 pc, u32 *out);
+int kemu_c_fetch_words(u64 pc, u32 *out, size_t n);
 int kemu_c_cmpxchg(u64 addr, u32 size, const u64 *exp, const u64 *new, u64 *old);
 u64 kemu_c_cntvct(void);
 u64 kemu_c_cntfrq(void);

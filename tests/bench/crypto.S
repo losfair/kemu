@@ -68,4 +68,13 @@ begin sha1
 .endr
 end sha1
 
+begin sha256
+.rept 2
+    sha256h q0, q1, v2.4s
+    sha256h2 q1, q0, v2.4s
+    sha256su0 v2.4s, v0.4s
+    sha256su1 v2.4s, v0.4s, v1.4s
+.endr
+end sha256
+
 .section .note.GNU-stack,"",%progbits

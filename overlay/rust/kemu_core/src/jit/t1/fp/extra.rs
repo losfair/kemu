@@ -364,6 +364,34 @@ impl<'s, 'b> Gen<'s, 'b> {
     }
 
     pub(in super::super) fn fp_across(&mut self, q: bool, size: u8, op: AcrossOp, rd: u32, rn: u32) -> bool {
+        if op == AcrossOp::AddP && size == 3 {
+            self.ld_vec(X14, rn);
+            self.a.vex_ib(1, PP_66, false, false, 0x73, 3, X15, Rm::R(X14), 8);
+            self.a.vex(1, PP_66, false, false, 0xd4, X14, X14, Rm::R(X15));
+            self.st_scalar(true, X14, rd);
+            return true;
+        }
+        if op == AcrossOp::AddV && size < 3 {
+            if size < 2 { self.clobber(); }
+            if q { self.ld_vec(X14, rn); } else { self.ld_scalar(true, X14, rn); }
+            if size == 0 {
+                self.a.vex(1, PP_66, false, false, 0xef, X15, X15, Rm::R(X15));
+                self.a.vex(1, PP_66, false, false, 0xf6, X14, X14, Rm::R(X15)); // vpsadbw
+                self.a.vex_ib(1, PP_66, false, false, 0x73, 3, X15, Rm::R(X14), 8);
+                self.a.vex(1, PP_66, false, false, 0xd4, X14, X14, Rm::R(X15));
+            } else {
+                for _ in 0..(4 - size) {
+                    self.a.vex(2, PP_66, false, false, size, X14, X14, Rm::R(X14)); // vphaddw/d
+                }
+            }
+            self.a.vmov_to_gpr(Sz::D, RAX, X14);
+            if size < 2 {
+                self.a.alu_ri(Alu::And, Sz::D, Rm::R(RAX), if size == 0 { 0xff } else { 0xffff });
+            }
+            self.a.vmov_from_gpr(Sz::D, X14, RAX);
+            self.store_vec(rd, X14);
+            return true;
+        }
         let pair = match op {
             AcrossOp::FAddP => SimdOp::FAddP,
             AcrossOp::FMinP | AcrossOp::FMinV => SimdOp::FMinP,

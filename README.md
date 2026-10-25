@@ -28,18 +28,22 @@ Working:
 - T1 JIT with superblocks, block chaining, register remapping and lazy flags.
 - Block-local caching of up to eight guest vectors in XMM registers, retained
   across self-loops, with saved-XMM recovery for signals and faults.
-- SHA-256 rounds, message schedules and vector byte reversal translated to
-  AVX2, without kernel entries per instruction or a requirement for host
-  SHA extensions.
+- SHA-256 rounds and message schedules use SHA-NI when available, with
+  AVX2 lowering on other hosts. Vector byte reversal stays in translated
+  code in both cases.
 - SHA-1 and byte-wise PMULL/PMULL2 translated to AVX2. AES instructions
   use AES-NI and 64-bit PMULL/PMULL2 use PCLMULQDQ when the host provides
   them; otherwise those instructions use the interpreter. Optional host
   features are detected without changing the x86-64-v3 minimum.
+- FPCR/FPSR reads and writes, NEON bit selects, and libc/compiler bit
+  scans, population counts and reductions stay in translated code.
 - Scalar SIMD lane moves and scalar/byte shifts used in GHASH stay in
   translated code as well, avoiding helpers in OpenSSL's AES-GCM loop.
 - A shared translation cache for file-backed code. Library code translated by
   one process is reused by the next one after re-validating it against the
-  bytes in memory.
+  bytes in memory. Adjacent validation reads are batched within executable
+  pages. Per-process code chunks grow on demand up to 128 MiB, so a GCC
+  compilation can retain its working set without a mid-compile flush.
 - The decoder and interpreter are checked against Arm's machine-readable A64
   specification and differentially against qemu (`tools/isa-audit`,
   `tools/difftest`).
@@ -184,16 +188,18 @@ cargo test --manifest-path overlay/rust/kemu_core/Cargo.toml --features std
 cargo run --release --manifest-path tools/jit-test/Cargo.toml -- 100000
 INTR=50 RELOC=1 tools/jit-test/target/release/jit-test 50000   # async interrupts + relocation
 INTR=50 RELOC=1 tools/jit-test/target/release/jit-test 20000 1 6 # SHA256, with no interpreter fallback
+NO_SHA=1 INTR=50 RELOC=1 tools/jit-test/target/release/jit-test 20000 1 6 # AVX2 fallback
 INTR=50 RELOC=1 tools/jit-test/target/release/jit-test 20000 1 7 # AES, PMULL, SHA1
 NO_AES=1 NO_PCLMUL=1 tools/jit-test/target/release/jit-test 20000 1 7 # optional-feature fallback
 INTR=20 RELOC=1 tools/jit-test/target/release/jit-test 10000 1 9 # FP min/max and indexed multiply/FMA
 INTR=20 RELOC=1 tools/jit-test/target/release/jit-test 10000 1 10 # TBL/TBX and byte/halfword ZIP/UZP
 INTR=20 RELOC=1 tools/jit-test/target/release/jit-test 10000 1 11 # full FP catalog, exact status and native-path checks
+INTR=10 RELOC=1 tools/jit-test/target/release/jit-test 30000 1 12 # FP control/status and libc/compiler SIMD
 scripts/vm-smoke.sh                                            # in-kernel ABI suite etc.
 ```
 
 `tests/bench/crypto.c` and `crypto.S` provide crypto instruction
-microbenchmarks (including both PMULL widths and all SHA-1 operations).
+microbenchmarks (including both PMULL widths and all SHA-1/SHA-256 operations).
 Build and run the same binary on baseline and patched kernels, checking
 its checksums against QEMU:
 
@@ -235,6 +241,14 @@ and the same optimization level, linking the same zlib version, and run them
 in the same VM. Compiler vectorization can differ across architectures.
 Run helper profiling separately with `KEMU_JIT_STATS=1`; its per-helper
 formatting and counters distort timings.
+
+`tests/bench/libm.c` measures scalar libm calls, including the FPCR reads
+and NEON bit selects used by glibc's `sin`, `cos`, and `atan`. Build with
+`-O2 -static` and `-lm`; pass an optional iteration count (default one million).
+For complete hash throughput use
+`openssl speed -elapsed -seconds 2 -bytes 8192 sha256`.
+Always use elapsed time: in-kernel emulation contributes to
+system CPU time, which OpenSSL's default user-time measurement excludes.
 
 T1 lowers every currently decoded S/D FP instruction family: scalar and SIMD
 arithmetic, comparisons (including conditional comparisons), rounding,

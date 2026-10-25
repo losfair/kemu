@@ -30,6 +30,7 @@ const EINVAL: c_int = 22;
 
 extern "C" {
     fn kemu_c_fetch(pc: u64, out: *mut u32) -> c_int;
+    fn kemu_c_fetch_words(pc: u64, out: *mut u32, n: usize) -> c_int;
     fn kemu_c_read(addr: u64, buf: *mut u8, len: usize) -> c_int;
     fn kemu_c_write(addr: u64, buf: *const u8, len: usize) -> c_int;
     fn kemu_c_cmpxchg(addr: u64, size: u32, exp: *const u64, new: *const u64, old: *mut u64)
@@ -67,6 +68,12 @@ impl KEnv {
 }
 
 impl Env for KEnv {
+    fn fetch_words(&mut self, pc: u64, words: &mut [u32]) -> Result<(), Fault> {
+        // SAFETY: `words` is a writable array of words.len() u32s. The C
+        // helper validates the page bounds and uses checked user accesses.
+        let r = unsafe { kemu_c_fetch_words(pc, words.as_mut_ptr(), words.len()) };
+        if r == 0 { Ok(()) } else { Err(Fault { addr: pc, access: Access::Exec, align: false }) }
+    }
     fn fetch(&mut self, pc: u64) -> Result<u32, Fault> {
         let mut w = 0u32;
         // SAFETY: `w` is a valid u32 out-parameter.
@@ -345,10 +352,11 @@ fn host_crypto() -> t1::HostCrypto {
         // SAFETY: the JIT runs on x86-64, where CPUID is always available.
         // This only reads integer registers and does not use kernel SIMD.
         let ecx = unsafe { core::arch::x86_64::__cpuid(1) }.ecx;
-        bits = 4 | (((ecx >> 25) & 1) as u8) | ((ecx & 2) as u8);
+        let sha = unsafe { core::arch::x86_64::__cpuid_count(7, 0) }.ebx & (1 << 29) != 0;
+        bits = 0x80 | (((ecx >> 25) & 1) as u8) | ((ecx & 2) as u8) | ((sha as u8) << 2);
         FEATURES.store(bits, Ordering::Relaxed);
     }
-    t1::HostCrypto { aes: bits & 1 != 0, pclmul: bits & 2 != 0 }
+    t1::HostCrypto { aes: bits & 1 != 0, pclmul: bits & 2 != 0, sha: bits & 4 != 0 }
 }
 
 /// Translate the guest block at `pc` into `out` (user address `code_uaddr`).

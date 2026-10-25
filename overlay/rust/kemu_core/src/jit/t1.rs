@@ -26,6 +26,7 @@ use crate::env::{Access, Env, Fault};
 mod crypto;
 pub use crypto::HostCrypto;
 mod fp;
+mod sysreg;
 mod vector;
 #[cfg(all(test, feature = "std"))]
 mod regression;
@@ -1278,6 +1279,29 @@ impl<'s, 'b> Gen<'s, 'b> {
     fn dp1(&mut self, sf: bool, op: Dp1Op, rd: u32, rn: u32) -> bool {
         let sz = Sz::from_sf(sf);
         match op {
+            Dp1Op::Rbit => {
+                // Reverse each byte with two nibble lookups, then reverse
+                // byte order. Scratch XMMs keep NZCV and pinned GPRs intact.
+                self.get_into(rn, false, sz, RAX);
+                self.a.vmov_from_gpr(sz, 14, RAX);
+                self.mov_imm(RAX, 0x0e06_0a02_0c04_0800);
+                self.a.vmov_from_gpr(Sz::Q, 15, RAX);
+                self.mov_imm(RAX, 0x0f07_0b03_0d05_0901);
+                self.a.vmov_from_gpr(Sz::Q, 13, RAX);
+                self.a.vex(1, 1, false, false, 0x6c, 15, 15, Rm::R(13));
+                self.mov_imm(RAX, 0x0f0f_0f0f);
+                self.a.vmov_from_gpr(Sz::D, 13, RAX);
+                self.a.vex(2, 1, false, false, 0x58, 13, 0, Rm::R(13));
+                self.a.vex_ib(1, 1, false, false, 0x71, 2, 12, Rm::R(14), 4);
+                self.a.vex(1, 1, false, false, 0xdb, 14, 14, Rm::R(13));
+                self.a.vex(1, 1, false, false, 0xdb, 12, 12, Rm::R(13));
+                self.a.vex(2, 1, false, false, 0x00, 14, 15, Rm::R(14));
+                self.a.vex(2, 1, false, false, 0x00, 12, 15, Rm::R(12));
+                self.a.vex_ib(1, 1, false, false, 0x71, 6, 14, Rm::R(14), 4);
+                self.a.vex(1, 1, false, false, 0xeb, 14, 14, Rm::R(12));
+                self.a.vmov_to_gpr(sz, RAX, 14);
+                self.a.bswap(sz, RAX);
+            }
             Dp1Op::Clz => {
                 self.clobber();
                 let n = self.rm(rn, false, RAX);
@@ -1979,32 +2003,6 @@ impl<'s, 'b> Gen<'s, 'b> {
         self.a.vex(1, 2, false, true, 0x7f, 15, 0, Rm::M(Mem::bd(RDX, 32)));
         true
     }
-
-    fn mrs(&mut self, rt: u32, enc: u32) -> bool {
-        let off = match enc {
-            0xde82 => OFF_TPIDR,
-            0xde83 => OFF_TPIDRRO,
-            _ => return false,
-        };
-        match self.gp(rt, false) {
-            Gp::R(r) => self.a.load(Sz::Q, r, Mem::gs(off)),
-            Gp::M(o) => {
-                self.a.load(Sz::Q, RAX, Mem::gs(off));
-                self.a.store(Sz::Q, Mem::gs(o), RAX);
-            }
-            Gp::Zero => {}
-        }
-        true
-    }
-
-    fn msr(&mut self, rt: u32, enc: u32) -> bool {
-        if enc != 0xde82 {
-            return false;
-        }
-        let v = self.get(rt, false, RAX);
-        self.a.store(Sz::Q, Mem::gs(OFF_TPIDR), v);
-        true
-    }
 }
 
 /// GPR fields of an instruction (conservative: V register numbers in FP
@@ -2370,7 +2368,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
         remapped: false,
         body_off: 0,
         vectors: if cfg.vector_cache && jit_off() & 64 == 0 {
-            vector::choose(&insns[..n.min(MAX_INSNS)])
+            vector::choose(&insns[..n.min(MAX_INSNS)], cfg.crypto.sha)
         } else { [meta::NO_VECTOR; meta::VECTOR_REGS] },
         vlive: false,
         fp_tables: [None; 2],
@@ -2766,7 +2764,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
         g.remapped = false;
         g.point(kind::REMAP, 0, 0);
     }
-    if g.vectors[0] != meta::NO_VECTOR && ne > 0 {
+    if g.vectors.iter().any(|&v| v != meta::NO_VECTOR) && ne > 0 {
         g.vlive = false;
         g.point(kind::VSTATE, 0, 0);
     }
