@@ -795,6 +795,27 @@ impl<'s, 'b> Gen<'s, 'b> {
         true
     }
 
+    pub(super) fn simd_scalar_copy(&mut self, imm5: u32, rd: u32, rn: u32) -> bool {
+        let size = imm5.trailing_zeros();
+        if size > 3 {
+            return false;
+        }
+        let idx = imm5 >> (size + 1);
+        let m = Mem::gs(voff(rn) + (idx << size) as i32);
+        // Scalar DUP/MOV copies one element and zeros the rest of Vd.
+        // MOVZX/VMOV preserve live NZCV and read before any aliased write.
+        match size {
+            0 | 1 => {
+                self.a.movzx(if size == 0 { Sz::B } else { Sz::W }, RAX, Rm::M(m));
+                self.a.vmov_from_gpr(Sz::D, X14, RAX);
+            }
+            2 => self.a.vmovd_load(X14, m),
+            _ => self.a.vmovq_load(X14, m),
+        }
+        self.a.vmovdqu_store(Mem::gs(voff(rd)), X14);
+        true
+    }
+
     pub(super) fn simd_mod_imm(&mut self, q: bool, op: u8, cmode: u8, rd: u32, imm: u64, fp: bool) -> bool {
         // MOVI / MVNI forms only (ORR/BIC immediate use the helper).
         let orr_bic = (cmode & 1 == 1) && cmode < 0b1100;
@@ -815,13 +836,29 @@ impl<'s, 'b> Gen<'s, 'b> {
     }
 
     pub(super) fn simd_shift(&mut self, q: bool, u: bool, immh: u32, immb: u32, opcode: u8, rd: u32, rn: u32, scalar: bool) -> bool {
-        if scalar || immh == 0 {
+        if immh == 0 {
             return false;
         }
         let esize = 31 - immh.leading_zeros(); // log2 bytes
         let ebits = 8u32 << esize;
         let immhb = (immh << 3) | immb;
+        // Scalar SHL Dd,Dn,#imm is used in GHASH reduction. Other scalar
+        // shift families still use the interpreter.
+        if scalar && !(opcode == 0b01010 && !u && esize == 3) {
+            return false;
+        }
         match opcode {
+            0b01010 if !u && esize == 0 => {
+                // Byte SHL: word shifts plus a per-byte mask prevent
+                // bits from spilling into the neighboring lane.
+                let amt = (immhb - ebits) as u8;
+                self.ld_vec(X14, rn);
+                self.a.vex_ib(1, PP_66, false, false, 0x71, 6, X14, Rm::R(X14), amt);
+                self.splat32(X13, ((0xffu32 << amt) & 0xff) * 0x0101_0101);
+                self.a.vex(1, PP_66, false, false, 0xdb, X14, X14, Rm::R(X13));
+                self.st_vec(q, X14, rd);
+                true
+            }
             0b00000 | 0b01010 if esize >= 1 => {
                 // SSHR/USHR (op 0) or SHL (op 01010, u=0)
                 if opcode == 0b01010 && u {
@@ -841,7 +878,7 @@ impl<'s, 'b> Gen<'s, 'b> {
                 // shift-by-immediate forms only take register operands
                 self.ld_vec(X14, rn);
                 self.a.vex_ib(1, PP_66, false, false, g, ext, X14, Rm::R(X14), amt);
-                self.st_vec(q, X14, rd);
+                self.st_vec(q && !scalar, X14, rd);
                 true
             }
             0b10000 if !u && esize <= 2 => {

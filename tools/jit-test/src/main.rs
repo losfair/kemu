@@ -766,7 +766,8 @@ fn crypto_fallback(i: Insn) -> bool {
     }
 }
 
-/// Every AES/SHA1 instruction and both PMULL lane widths/halves. Explicit
+/// Every AES/SHA1 instruction, both PMULL lane widths/halves, and the
+/// scalar moves and shifts used by GHASH. Explicit
 /// alias patterns cover Rd=Rm as well as Rd=Rn and all three equal.
 fn gen_crypto(r: &mut Rng) -> u32 {
     let rd = r.below(32) as u32;
@@ -780,16 +781,25 @@ fn gen_crypto(r: &mut Rng) -> u32 {
         _ => {}
     }
     let regs = (rn << 5) | rd;
-    match r.below(14) {
+    match r.below(17) {
         i @ 0..=3 => 0x4e28_4800 | ((i as u32) << 12) | regs,
         i @ 4..=7 => 0x5e00_0000 | (((i - 4) as u32) << 12) | (rm << 16) | regs,
         8 => 0x5e28_0800 | regs, // SHA1H
         9 => 0x5e28_1800 | regs, // SHA1SU1
-        i => {
+        i @ 10..=13 => {
             let high = ((i - 10) & 1) as u32;
             let size = if i >= 12 { 3 } else { 0 };
             0x0e20_e000 | (high << 30) | (size << 22) | (rm << 16) | regs
         }
+        14 => {
+            let size = r.below(4) as u32;
+            let index = r.below(16 >> size) as u32;
+            let imm5 = (index << (size + 1)) | (1 << size);
+            0x5e00_0400 | (imm5 << 16) | regs // DUP Bd/Hd/Sd/Dd,Vn.T[index]
+        }
+        15 => 0x5f40_5400 | ((r.below(64) as u32) << 16) | regs, // SHL Dd,Dn,#0..63
+        _ => 0x0f08_5400 | ((r.below(2) as u32) << 30)
+            | ((r.below(8) as u32) << 16) | regs, // SHL Vd.8B/16B,Vn.8B/16B,#0..7
     }
 }
 

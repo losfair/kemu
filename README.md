@@ -33,6 +33,8 @@ Working:
   use AES-NI and 64-bit PMULL/PMULL2 use PCLMULQDQ when the host provides
   them; otherwise those instructions use the interpreter. Optional host
   features are detected without changing the x86-64-v3 minimum.
+- Scalar SIMD lane moves and scalar/byte shifts used in GHASH stay in
+  translated code as well, avoiding helpers in OpenSSL's AES-GCM loop.
 - A shared translation cache for file-backed code. Library code translated by
   one process is reused by the next one after re-validating it against the
   bytes in memory.

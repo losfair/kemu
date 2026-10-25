@@ -2206,7 +2206,6 @@ fn is_native(i: &Insn) -> bool {
             | Insn::SimdSmov { .. }
             | Insn::SimdTbl { .. }
             | Insn::SimdIndexed { .. }
-            | Insn::SimdScalarCopy { .. }
             | Insn::Rmif { .. }
             | Insn::SetfFlags { .. }
             | Insn::MsrImm { .. }
@@ -2401,6 +2400,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
                 | Insn::SimdThree { .. }
                 | Insn::SimdMisc { .. }
                 | Insn::SimdDup { .. }
+                | Insn::SimdScalarCopy { .. }
                 | Insn::SimdModImm { .. }
                 | Insn::SimdShift { .. }
                 | Insn::SimdExt { .. }
@@ -2575,6 +2575,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
             Insn::SimdThree { q, u, size, op, rd, rn, rm, scalar } => g.simd_three(q, u, size, op, rd, rn, rm, scalar),
             Insn::SimdMisc { q, u, size, op, rd, rn, scalar } => g.simd_misc(q, u, size, op, rd, rn, scalar),
             Insn::SimdDup { q, imm5, rd, rn, from_gpr } => g.simd_dup(q, imm5, rd, rn, from_gpr),
+            Insn::SimdScalarCopy { imm5, rd, rn } => g.simd_scalar_copy(imm5, rd, rn),
             Insn::SimdModImm { q, op, cmode, rd, imm, fp } => g.simd_mod_imm(q, op, cmode, rd, imm, fp),
             Insn::SimdShift { q, u, immh, immb, opcode, rd, rn, scalar } => g.simd_shift(q, u, immh, immb, opcode, rd, rn, scalar),
             Insn::SimdExt { q, imm4, rd, rn, rm } => g.simd_ext(q, imm4, rd, rn, rm),
