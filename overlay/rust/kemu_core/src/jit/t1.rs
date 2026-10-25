@@ -2671,8 +2671,14 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
         g.exit_to(next, main_off);
     }
 
-    // 4. Exit trampolines.
+    // 4. Exit trampolines. Every path into them has run the remap
+    // epilogue, but the main code may end remapped (a self-loop back-edge),
+    // so tell state recovery that the registers are canonical again.
     let ne = g.ne;
+    if g.nremap > 0 && ne > 0 {
+        g.remapped = false;
+        g.point(kind::REMAP, 0, 0);
+    }
     for k in 0..ne {
         let e = g.s.exits.get(k).copied().unwrap_or_default();
         let t = g.a.pos;
