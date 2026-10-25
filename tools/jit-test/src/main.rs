@@ -6,6 +6,8 @@
 //! the result against the reference interpreter for random instruction
 //! sequences. Stubs reach the harness with `call` instead of `syscall`.
 
+mod fp_all;
+
 use kemu_core::decode::{decode, Insn, SimdOp};
 use kemu_core::env::{Access, Env, Fault};
 use kemu_core::interp::{self, Exit};
@@ -1021,8 +1023,9 @@ fn main() {
     let mut classes: HashMap<String, usize> = HashMap::new();
     for it in 0..iters {
         let mode = only_mode.unwrap_or((it % 3) as u32);
-        let code = gen_case(&mut rng, mode);
+        let mut code = gen_case(&mut rng, mode);
         let mut init = init_state(&mut rng);
+        if mode == 11 { code = fp_all::case(it, &mut rng, &mut init); }
         if mode == 9 {
             init_fp_hot(&mut rng, &mut init, &code, it & 1 != 0);
         }
@@ -1073,7 +1076,7 @@ fn main() {
         }
 
         let mut bad = Vec::new();
-        if mode == 9 && it & 1 == 0 && h().helpers - helpers_before != 1 {
+        if matches!(mode, 9 | 11) && it & 1 == 0 && h().helpers - helpers_before != 1 {
             bad.push(format!("finite FP fallback: {} helpers, expected only BRK", h().helpers - helpers_before));
         }
         if matches!(mode, 6 | 7 | 10) {
@@ -1115,11 +1118,11 @@ fn main() {
         }
         if ref_st.fpsr != jit_st.fpsr {
             fpsr_diffs += 1;
-            if matches!(mode, 6 | 7 | 9 | 10) {
+            if matches!(mode, 6 | 7 | 9 | 10 | 11) {
                 bad.push(format!("FPSR: ref {:#x} jit {:#x}", ref_st.fpsr, jit_st.fpsr));
             }
         }
-        if matches!(mode, 6 | 7 | 9 | 10) && ref_st.fpcr != jit_st.fpcr {
+        if matches!(mode, 6 | 7 | 9 | 10 | 11) && ref_st.fpcr != jit_st.fpcr {
             bad.push(format!("FPCR: ref {:#x} jit {:#x}", ref_st.fpcr, jit_st.fpcr));
         }
         if !bad.is_empty() {
@@ -1139,7 +1142,8 @@ fn main() {
                 for w in &code {
                     println!("  {:08x}  {:?}", w, decode(*w));
                 }
-                println!("  init nzcv {:#x}", init.nzcv);
+                println!("  init nzcv {:#x} fpcr {:#x} fpsr {:#x}", init.nzcv, init.fpcr, init.fpsr);
+                if mode == 11 { println!("  init vectors: {:x?}", init.v); }
                 for b in &bad {
                     println!("  {b}");
                 }

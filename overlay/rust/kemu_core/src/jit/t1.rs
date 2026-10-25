@@ -280,6 +280,7 @@ struct Gen<'s, 'b> {
     body_off: usize,
     vectors: [u8; meta::VECTOR_REGS],
     vlive: bool,
+    fp_tables: [Option<usize>; 2],
 }
 
 pub const MAX_REMAP: usize = 4;
@@ -2215,7 +2216,8 @@ fn defs_flags(i: &Insn) -> bool {
         | Insn::AddSubExt { setflags, .. }
         | Insn::AddSubCarry { setflags, .. } => *setflags,
         Insn::LogicImm { op, .. } | Insn::LogicShift { op, .. } => *op == LogicOp::Ands,
-        Insn::CondCmp { .. } | Insn::FpCmp { .. } => true,
+        Insn::CondCmp { .. } | Insn::FpCmp { .. } | Insn::FpCCmp { .. }
+        | Insn::FpCvt { op: crate::decode::FcvtOp::Fjcvt, .. } => true,
         _ => false,
     }
 }
@@ -2229,8 +2231,6 @@ fn is_native(i: &Insn) -> bool {
             | Insn::Hlt { .. }
             | Insn::Brk { .. }
             | Insn::IcIvau { .. }
-            | Insn::FpCCmp { .. }
-            | Insn::SimdAcross { .. }
             | Insn::SimdSmov { .. }
             | Insn::Rmif { .. }
             | Insn::SetfFlags { .. }
@@ -2373,6 +2373,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
             vector::choose(&insns[..n.min(MAX_INSNS)])
         } else { [meta::NO_VECTOR; meta::VECTOR_REGS] },
         vlive: false,
+        fp_tables: [None; 2],
         live_in0,
     };
     if jit_off() & 32 == 0 {
@@ -2425,9 +2426,11 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
                 | Insn::Fp3 { .. }
                 | Insn::Fp1 { .. }
                 | Insn::FpCmp { .. }
+                | Insn::FpCCmp { .. }
                 | Insn::FpCSel { .. }
                 | Insn::FpCvt { .. }
                 | Insn::SimdThree { .. }
+                | Insn::SimdAcross { .. }
                 | Insn::SimdIndexed { .. }
                 | Insn::SimdMisc { .. }
                 | Insn::SimdDup { .. }
@@ -2602,9 +2605,11 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
             Insn::Fp3 { ftype, neg, sub, rd, rn, rm, ra } => g.fp3(ftype, neg, sub, rd, rn, rm, ra),
             Insn::Fp1 { ftype, op, to, rd, rn } => g.fp1(ftype, op, to, rd, rn),
             Insn::FpCmp { ftype, rn, rm, zero, signal } => g.fp_cmp(ftype, rn, rm, zero, signal),
+            Insn::FpCCmp { ftype, rn, rm, nzcv, cond, signal } => g.fp_ccmp(ftype, rn, rm, nzcv, cond, signal),
             Insn::FpCSel { ftype, rd, rn, rm, cond } => g.fp_csel(ftype, rd, rn, rm, cond),
             Insn::FpCvt { ftype, sf, op, rd, rn } => g.fp_cvt(ftype, sf, op, rd, rn),
             Insn::SimdThree { q, u, size, op, rd, rn, rm, scalar } => g.simd_three(q, u, size, op, rd, rn, rm, scalar),
+            Insn::SimdAcross { q, size, op, rd, rn } => g.fp_across(q, size, op, rd, rn),
             Insn::SimdIndexed { q, u, size, opcode, rd, rn, rm, index, scalar } => g.simd_indexed(q, u, size, opcode, rd, rn, rm, index, scalar),
             Insn::SimdMisc { q, u, size, op, rd, rn, scalar } => g.simd_misc(q, u, size, op, rd, rn, scalar),
             Insn::SimdDup { q, imm5, rd, rn, from_gpr } => g.simd_dup(q, imm5, rd, rn, from_gpr),

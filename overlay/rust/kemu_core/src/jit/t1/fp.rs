@@ -3,14 +3,33 @@
 //! instructions to SSE/AVX2 (VEX-encoded).
 //!
 //! V registers live in the cache or state page. Results use scratch
-//! XMM registers (12..15) and commit in a single host instruction, so
+//! XMM registers (8..15) and commit in a single host instruction, so
 //! every instruction stays restartable. Bit-exactness: whenever a result
 //! could differ from AArch64 semantics (NaN results, out-of-range
 //! conversions), the fast path branches to the helper, which re-executes
 //! the instruction in the exact softfloat interpreter.
 
 use super::*;
-use crate::decode::{FcvtOp, Fp1Op, Fp2Op, Index, Simd2Op, SimdOp};
+use crate::decode::{AcrossOp, FcvtOp, Fp1Op, Fp2Op, Index, Simd2Op, SimdOp};
+
+mod extra;
+mod convert;
+mod precision;
+mod estimate;
+
+struct Slow {
+    branches: [usize; 32],
+    len: usize,
+}
+
+impl Slow {
+    fn new() -> Self { Self { branches: [0; 32], len: 0 } }
+    fn push(&mut self, branch: usize) {
+        self.branches[self.len] = branch;
+        self.len += 1;
+    }
+    fn as_slice(&self) -> &[usize] { &self.branches[..self.len] }
+}
 
 const X13: u8 = 13;
 const X14: u8 = 14;
@@ -239,6 +258,17 @@ impl<'s, 'b> Gen<'s, 'b> {
     }
 
     pub(super) fn fp1(&mut self, ftype: u8, op: Fp1Op, to: u8, rd: u32, rn: u32) -> bool {
+        if op == Fp1Op::Recpx && ftype <= 1 {
+            return self.fp_estimate(false, 2 + ftype, true, Simd2Op::Frecpx, rd, rn);
+        }
+        if op == Fp1Op::Cvt {
+            let from = match ftype { 0 => 2, 1 => 3, 3 => 1, _ => return false };
+            let to = match to { 0 => 2, 1 => 3, 2 => 1, _ => return false };
+            return self.fp_precision(from, to, true, false, false, rd, rn);
+        }
+        if matches!(op, Fp1Op::RintA | Fp1Op::Rint32Z | Fp1Op::Rint32X | Fp1Op::Rint64Z | Fp1Op::Rint64X) && ftype <= 1 {
+            return self.fp_round_insn(ftype == 1, true, false, op, rd, rn);
+        }
         let double = match ftype {
             0 => false,
             1 => true,
@@ -286,16 +316,6 @@ impl<'s, 'b> Gen<'s, 'b> {
                 self.a.vex_ib(3, PP_66, false, false, if double { 0x0b } else { 0x0a }, X14, X14, Rm::R(X14), imm);
                 let s = self.nan_guard_scalar(double, X14);
                 self.st_scalar(double, X14, rd);
-                self.slow_paths(&[s]);
-                true
-            }
-            Fp1Op::Cvt if to <= 1 && to != ftype => {
-                // S <-> D
-                self.fp_prologue();
-                self.ld_scalar(double, X14, rn);
-                self.a.vex(1, if double { PP_F2 } else { PP_F3 }, false, false, 0x5a, X14, X14, Rm::R(X14));
-                let s = self.nan_guard_scalar(!double, X14);
-                self.st_scalar(!double, X14, rd);
                 self.slow_paths(&[s]);
                 true
             }
@@ -400,84 +420,7 @@ impl<'s, 'b> Gen<'s, 'b> {
                 }
                 true
             }
-            FcvtOp::ItoF { unsigned } => {
-                self.fp_prologue();
-                let src = self.get(rn, false, RDX);
-                let mut slow = None;
-                let src64 = if !sf {
-                    // 32-bit source: extend to 64 bits (exact for both).
-                    if unsigned {
-                        self.a.mov_rr(Sz::D, RDX, src);
-                    } else {
-                        self.a.movsx(Sz::D, Sz::Q, RDX, Rm::R(src));
-                    }
-                    RDX
-                } else {
-                    if unsigned {
-                        self.clobber();
-                        self.a.test_rr(Sz::Q, src, src);
-                        slow = Some(self.a.jcc(Cc::S, None));
-                    }
-                    src
-                };
-                self.a.vex(1, PP_66, false, false, 0xef, X14, X14, Rm::R(X14)); // zero
-                // vcvtsi2sd/ss x14, x14, r64
-                self.a.vex(1, if double { PP_F2 } else { PP_F3 }, true, false, 0x2a, X14, X14, Rm::R(src64));
-                self.st_scalar(double, X14, rd);
-                match slow {
-                    Some(s) => self.slow_paths(&[s]),
-                    None => {}
-                }
-                true
-            }
-            FcvtOp::FtoI { round, unsigned } => {
-                if round > 3 {
-                    return false;
-                }
-                self.fp_prologue();
-                self.clobber();
-                self.ld_scalar(double, X14, rn);
-                if round != 3 {
-                    let imm = match round {
-                        0 => 8,
-                        1 => 10,
-                        _ => 9,
-                    };
-                    self.a.vex_ib(3, PP_66, false, false, if double { 0x0b } else { 0x0a }, X14, X14, Rm::R(X14), imm);
-                }
-                // Signed 64-bit conversion, then range checks.
-                let wide = sf || unsigned;
-                self.a.vex(1, if double { PP_F2 } else { PP_F3 }, wide, false, 0x2c, RAX, 0, Rm::R(X14));
-                let mut slow = [0usize; 2];
-                let ns;
-                if !unsigned {
-                    // indefinite = INT_MIN of the destination width
-                    if sf {
-                        self.a.mov_ri(RDX, 1u64 << 63);
-                        self.a.alu_rr(Alu::Cmp, Sz::Q, RAX, RDX);
-                    } else {
-                        self.a.alu_ri(Alu::Cmp, Sz::D, Rm::R(RAX), i32::MIN);
-                    }
-                    slow[0] = self.a.jcc(Cc::E, None);
-                    ns = 1;
-                } else if sf {
-                    self.a.test_rr(Sz::Q, RAX, RAX);
-                    slow[0] = self.a.jcc(Cc::S, None);
-                    ns = 1;
-                } else {
-                    self.a.mov_rr(Sz::Q, RDX, RAX);
-                    self.a.shift_ri(Shift::Shr, Sz::Q, RDX, 32);
-                    slow[0] = self.a.jcc(Cc::Ne, None);
-                    ns = 1;
-                }
-                if !sf {
-                    self.a.mov_rr(Sz::D, RAX, RAX);
-                }
-                self.put(rd, false, RAX);
-                self.slow_paths(&slow[..ns]);
-                true
-            }
-            _ => false,
+            _ => self.fp_cvt_int(double, sf, op, rd, rn),
         }
     }
 
@@ -487,7 +430,7 @@ impl<'s, 'b> Gen<'s, 'b> {
     /// the accumulator, so all source/destination aliases are safe.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn simd_indexed(&mut self, q: bool, u: bool, size: u8, opcode: u8, rd: u32, rn: u32, rm: u32, index: u32, scalar: bool) -> bool {
-        if u || !matches!(size, 2 | 3) || !matches!(opcode, 1 | 5 | 9) || (size == 3 && !q && !scalar) {
+        if (u && opcode != 9) || !matches!(size, 2 | 3) || !matches!(opcode, 1 | 5 | 9) || (size == 3 && !q && !scalar) {
             return false;
         }
         let double = size == 3;
@@ -504,6 +447,8 @@ impl<'s, 'b> Gen<'s, 'b> {
         } else {
             self.ld_vec(X15, rn);
         }
+        let mut exceptional = Slow::new();
+        if u { exceptional.push(self.fp_finite(double, X15)); exceptional.push(self.fp_finite(double, 12)); }
         if opcode == 9 {
             let pp = if scalar { if double { PP_F2 } else { PP_F3 } } else if double { PP_66 } else { PP_NONE };
             self.a.vex(1, pp, false, false, 0x59, X14, X15, Rm::R(12));
@@ -518,13 +463,15 @@ impl<'s, 'b> Gen<'s, 'b> {
             let opc = (if opcode == 1 { 0xb8 } else { 0xbc }) + scalar as u8;
             self.a.vex(2, PP_66, double, false, opc, X14, X15, Rm::R(12));
         }
+        if u { exceptional.push(self.fp_underflow_boundary(double, X14)); }
         let slow = if scalar { self.nan_guard_scalar(double, X14) } else { self.nan_guard_vec(double, X14) };
         if scalar {
             self.st_scalar(double, X14, rd);
         } else {
             self.st_vec(q, X14, rd);
         }
-        self.slow_paths(&[fz, slow]);
+        exceptional.push(fz); exceptional.push(slow);
+        self.slow_paths(exceptional.as_slice());
         true
     }
 
@@ -536,6 +483,15 @@ impl<'s, 'b> Gen<'s, 'b> {
     }
 
     pub(super) fn simd_three(&mut self, q: bool, u: bool, size: u8, op: SimdOp, rd: u32, rn: u32, rm: u32, scalar: bool) -> bool {
+        if matches!(op, SimdOp::FAbd | SimdOp::FMulx | SimdOp::FRecps | SimdOp::FRsqrts) {
+            return self.fp_special(q, size, scalar, op, rd, rn, rm);
+        }
+        if matches!(op, SimdOp::FCmEq | SimdOp::FCmGe | SimdOp::FCmGt | SimdOp::FAcGe | SimdOp::FAcGt) {
+            return self.fp_compare_mask(q, size, op, rd, rn, Some(rm), scalar, false);
+        }
+        if matches!(op, SimdOp::FAddP | SimdOp::FMinP | SimdOp::FMaxP | SimdOp::FMinNmP | SimdOp::FMaxNmP) {
+            return self.fp_pair(q, size, op, rd, rn, rm);
+        }
         if scalar {
             return false;
         }
@@ -877,6 +833,9 @@ impl<'s, 'b> Gen<'s, 'b> {
     }
 
     pub(super) fn simd_misc(&mut self, q: bool, u: bool, size: u8, op: Simd2Op, rd: u32, rn: u32, scalar: bool) -> bool {
+        if let Some(result) = self.fp_misc_extra(q, size, op, rd, rn, scalar) {
+            return result;
+        }
         if scalar {
             return false;
         }
@@ -1005,6 +964,9 @@ impl<'s, 'b> Gen<'s, 'b> {
         let esize = 31 - immh.leading_zeros(); // log2 bytes
         let ebits = 8u32 << esize;
         let immhb = (immh << 3) | immb;
+        if esize >= 2 && matches!(opcode, 28 | 31) {
+            return self.fp_simd_int(q, esize as u8, scalar, opcode == 28, u, 3, 2 * ebits - immhb, rd, rn);
+        }
         // Scalar SHL Dd,Dn,#imm is used in GHASH reduction. Other scalar
         // shift families still use the interpreter.
         if scalar && !(opcode == 0b01010 && !u && esize == 3) {

@@ -1082,7 +1082,7 @@ const fn rsqrt_estimate_exact(a0: u64) -> u64 {
     (b + 1) / 2
 }
 
-const RSQRT_TABLE: [u16; 384] = {
+pub(crate) const RSQRT_TABLE: [u16; 384] = {
     let mut t = [0u16; 384];
     let mut i = 0;
     while i < 384 {
