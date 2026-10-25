@@ -23,6 +23,7 @@ use crate::decode::{
 };
 use crate::env::{Env, Fault};
 
+mod crypto;
 mod fp;
 
 pub const MAX_INSNS: usize = 64;
@@ -2171,7 +2172,6 @@ fn is_native(i: &Insn) -> bool {
             | Insn::Aesmc { .. }
             | Insn::Aesimc { .. }
             | Insn::Sha1 { .. }
-            | Insn::Sha256 { .. }
             | Insn::Rmif { .. }
             | Insn::SetfFlags { .. }
             | Insn::MsrImm { .. }
@@ -2374,6 +2374,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
                 | Insn::SimdInsElt { .. }
                 | Insn::SimdLdSt { .. }
                 | Insn::SimdPermute { .. }
+                | Insn::Sha256 { .. }
         );
         let ok = if (off & 1 != 0 && !branch) || (off & 2 != 0 && simdfp) {
             false
@@ -2547,6 +2548,7 @@ fn translate_n<E: Env>(env: &mut E, pc: u64, out: &mut [u8], cfg: &Cfg, s: &mut 
                 g.simd_ldst(load, q, opcode, rt, rn, rm, single, post)
             }
             Insn::SimdPermute { q, size, opcode, rd, rn, rm } => g.simd_permute(q, size, opcode, rd, rn, rm),
+            Insn::Sha256 { op, rd, rn, rm } => g.sha256(op, rd, rn, rm),
             Insn::MsrReg { rt, enc } => g.msr(rt, enc),
 
             // ---- branches ----

@@ -26,6 +26,8 @@ Working:
 - Threads, futexes, LL/SC and seq_cst atomics, signals, ptrace and
   single-step, core dumps, seccomp/audit as `AUDIT_ARCH_AARCH64`.
 - T1 JIT with superblocks, block chaining, register remapping and lazy flags.
+- SHA-256 rounds and message schedules translated to AVX2, without kernel
+  entries per instruction or a requirement for host SHA extensions.
 - A shared translation cache for file-backed code. Library code translated by
   one process is reused by the next one after re-validating it against the
   bytes in memory.
@@ -157,6 +159,7 @@ x86 applets over the rootfs's binaries.
 cargo test --manifest-path overlay/rust/kemu_core/Cargo.toml --features std
 cargo run --release --manifest-path tools/jit-test/Cargo.toml -- 100000
 INTR=50 RELOC=1 tools/jit-test/target/release/jit-test 50000   # async interrupts + relocation
+INTR=50 RELOC=1 tools/jit-test/target/release/jit-test 20000 1 6 # SHA256, with no interpreter fallback
 scripts/vm-smoke.sh                                            # in-kernel ABI suite etc.
 ```
 

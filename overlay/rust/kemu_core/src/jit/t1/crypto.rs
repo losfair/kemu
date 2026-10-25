@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: GPL-2.0
+//! SHA256 lowering using the AVX2 baseline, without requiring x86 SHA
+//! extensions. Keep intermediate state in scratch XMM registers and
+//! commit Vd once, so an interrupted instruction can restart. Integer
+//! vector operations leave NZCV, FPCR and FPSR untouched.
+
+use super::*;
+use super::fp::voff;
+
+// Guest vectors live in the state page; these host registers are scratch.
+const X: u8 = 8;
+const Y: u8 = 9;
+const W: u8 = 10;
+const T: u8 = 11;
+const U: u8 = 12;
+const V: u8 = 13;
+const S: u8 = 14;
+const R: u8 = 15;
+
+const ADD: u8 = 0xfe;
+const XOR: u8 = 0xef;
+const AND: u8 = 0xdb;
+const OR: u8 = 0xeb;
+
+fn bin(a: &mut Asm<'_>, op: u8, d: u8, n: u8, m: u8) {
+    a.vex(1, 1, false, false, op, d, n, Rm::R(m));
+}
+
+fn shr(a: &mut Asm<'_>, d: u8, n: u8, bits: u8) {
+    a.vex_ib(1, 1, false, false, 0x72, 2, d, Rm::R(n), bits);
+}
+
+fn ror(a: &mut Asm<'_>, d: u8, n: u8, bits: u8, tmp: u8) {
+    a.vex_ib(1, 1, false, false, 0x72, 6, tmp, Rm::R(n), 32 - bits);
+    shr(a, d, n, bits);
+    bin(a, OR, d, d, tmp);
+}
+
+/// ROTR(n, a) ^ ROTR(n, b) ^ (last_shift ? SHR(n, c) : ROTR(n, c)).
+/// The input, output, and two temporaries must be distinct.
+#[allow(clippy::too_many_arguments)]
+fn sigma(a: &mut Asm<'_>, d: u8, n: u8, shifts: [u8; 3], last_shift: bool, t0: u8, t1: u8) {
+    ror(a, d, n, shifts[0], t0);
+    ror(a, t0, n, shifts[1], t1);
+    bin(a, XOR, d, d, t0);
+    if last_shift {
+        shr(a, t0, n, shifts[2]);
+    } else {
+        ror(a, t0, n, shifts[2], t1);
+    }
+    bin(a, XOR, d, d, t0);
+}
+
+fn shuffle(a: &mut Asm<'_>, d: u8, n: u8, lanes: u8) {
+    a.vex_ib(1, 1, false, false, 0x70, d, 0, Rm::R(n), lanes);
+}
+
+fn align(a: &mut Asm<'_>, d: u8, hi: u8, lo: u8, bytes: u8) {
+    a.vex_ib(3, 1, false, false, 0x0f, d, hi, Rm::R(lo), bytes);
+}
+
+fn shift_bytes(a: &mut Asm<'_>, d: u8, n: u8, left: bool, bytes: u8) {
+    a.vex_ib(1, 1, false, false, 0x73, if left { 7 } else { 3 }, d, Rm::R(n), bytes);
+}
+
+fn blend(a: &mut Asm<'_>, d: u8, n: u8, m: u8, lanes: u8) {
+    a.vex_ib(3, 1, false, false, 0x02, d, n, Rm::R(m), lanes);
+}
+
+impl<'s, 'b> Gen<'s, 'b> {
+    pub(super) fn sha256(&mut self, op: u8, rd: u32, rn: u32, rm: u32) -> bool {
+        if !matches!(op, 4 | 5 | 6 | 0x10) {
+            return false;
+        }
+        let a = &mut self.a;
+        // Read every operand before committing, including when they alias.
+        a.vmovdqu_load(X, Mem::gs(voff(if op == 5 { rn } else { rd })));
+        a.vmovdqu_load(Y, Mem::gs(voff(if op == 5 { rd } else { rn })));
+        let result = match op {
+            4 | 5 => {
+                // Four rounds: X = [a,b,c,d], Y = [e,f,g,h], W = Wt+Kt.
+                // Only the low lane of each round's temporaries is used.
+                a.vmovdqu_load(W, Mem::gs(voff(rm)));
+                for _ in 0..4 {
+                    sigma(a, T, Y, [6, 11, 25], false, U, V);
+                    shuffle(a, U, Y, 0x55); // f
+                    shuffle(a, V, Y, 0xaa); // g
+                    bin(a, XOR, U, U, V);
+                    bin(a, AND, U, U, Y);
+                    bin(a, XOR, U, U, V); // Ch(e,f,g)
+                    bin(a, ADD, T, T, U);
+                    shuffle(a, U, Y, 0xff); // h
+                    bin(a, ADD, T, T, U);
+                    bin(a, ADD, T, T, W); // T1 = h + Sigma1(e) + Ch + Wt+Kt
+                    shuffle(a, U, X, 0xff); // d
+                    bin(a, ADD, S, T, U); // new e
+
+                    sigma(a, U, X, [2, 13, 22], false, V, R);
+                    bin(a, ADD, T, T, U);
+                    shuffle(a, U, X, 0x55); // b
+                    shuffle(a, V, X, 0xaa); // c
+                    bin(a, OR, R, X, U);
+                    bin(a, AND, R, R, V);
+                    bin(a, AND, U, X, U);
+                    bin(a, OR, U, U, R); // Maj(a,b,c)
+                    bin(a, ADD, T, T, U); // new a
+
+                    shift_bytes(a, X, X, true, 4);
+                    blend(a, X, X, T, 1);
+                    shift_bytes(a, Y, Y, true, 4);
+                    blend(a, Y, Y, S, 1);
+                    shift_bytes(a, W, W, false, 4);
+                }
+                if op == 4 { X } else { Y }
+            }
+            0x10 => {
+                // SHA256SU0: Vd + sigma0([d1,d2,d3,n0]).
+                align(a, W, Y, X, 4);
+                sigma(a, T, W, [7, 18, 3], true, U, V);
+                bin(a, ADD, X, X, T);
+                X
+            }
+            _ => {
+                // SHA256SU1: the upper two lanes depend on the newly
+                // computed lower lanes, not on the old destination.
+                a.vmovdqu_load(W, Mem::gs(voff(rm)));
+                align(a, T, W, Y, 4); // [n1,n2,n3,m0]
+                bin(a, ADD, X, X, T);
+                shift_bytes(a, Y, W, false, 8); // [m2,m3,0,0]
+                sigma(a, T, Y, [17, 19, 10], true, U, V);
+                bin(a, ADD, Y, X, T); // r0,r1 in low lanes
+                shift_bytes(a, W, Y, true, 8); // [0,0,r0,r1]
+                sigma(a, T, W, [17, 19, 10], true, U, V);
+                bin(a, ADD, X, X, T); // r2,r3 in high lanes
+                blend(a, X, X, Y, 3);
+                X
+            }
+        };
+        a.vmovdqu_store(Mem::gs(voff(rd)), result);
+        true
+    }
+}
