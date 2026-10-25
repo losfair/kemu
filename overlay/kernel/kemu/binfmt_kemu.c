@@ -45,7 +45,7 @@ struct kemu_elf_prstatus {
 #define	ARCH_DLINFO		NEW_AUX_ENT(AT_MINSIGSTKSZ, KEMU_AT_MINSIGSTKSZ)
 
 #undef	SET_PERSONALITY
-#define	SET_PERSONALITY(ex)	set_personality_64bit()
+#define	SET_PERSONALITY(ex)	kemu_set_personality()
 
 #undef	ELF_PLAT_INIT
 #define	ELF_PLAT_INIT(regs, load_addr)	do { } while (0)

@@ -360,23 +360,23 @@ void kemu_enter_op(struct kemu_thread *kt)
 
 static void kemu_host_regs(struct pt_regs *regs, struct kemu_host_regs *h)
 {
-	h->gpr[0] = regs->ax;
-	h->gpr[1] = regs->cx;
-	h->gpr[2] = regs->dx;
-	h->gpr[3] = regs->bx;
-	h->gpr[4] = regs->sp;
-	h->gpr[5] = regs->bp;
-	h->gpr[6] = regs->si;
-	h->gpr[7] = regs->di;
-	h->gpr[8] = regs->r8;
-	h->gpr[9] = regs->r9;
-	h->gpr[10] = regs->r10;
-	h->gpr[11] = regs->r11;
-	h->gpr[12] = regs->r12;
-	h->gpr[13] = regs->r13;
-	h->gpr[14] = regs->r14;
-	h->gpr[15] = regs->r15;
-	h->rflags = regs->flags;
+	h->gpr[0] = kemu_reg(regs, ax);
+	h->gpr[1] = kemu_reg(regs, cx);
+	h->gpr[2] = kemu_reg(regs, dx);
+	h->gpr[3] = kemu_reg(regs, bx);
+	h->gpr[4] = kemu_reg(regs, sp);
+	h->gpr[5] = kemu_reg(regs, bp);
+	h->gpr[6] = kemu_reg(regs, si);
+	h->gpr[7] = kemu_reg(regs, di);
+	h->gpr[8] = kemu_reg(regs, r8);
+	h->gpr[9] = kemu_reg(regs, r9);
+	h->gpr[10] = kemu_reg(regs, r10);
+	h->gpr[11] = kemu_reg(regs, r11);
+	h->gpr[12] = kemu_reg(regs, r12);
+	h->gpr[13] = kemu_reg(regs, r13);
+	h->gpr[14] = kemu_reg(regs, r14);
+	h->gpr[15] = kemu_reg(regs, r15);
+	h->rflags = kemu_reg(regs, flags);
 }
 
 static u32 kemu_stub_info(struct kemu_mm *km, u32 off)
@@ -399,7 +399,7 @@ void kemu_materialize(struct pt_regs *regs)
 	struct kemu_mm *km = current->mm->kemu;
 	struct kemu_cpu *cpu = kt->cpu;
 	struct kemu_host_regs h;
-	unsigned long ip = regs->ip, off;
+	unsigned long ip = kemu_reg(regs, ip), off;
 	u8 *blk;
 	size_t len;
 
@@ -410,7 +410,7 @@ void kemu_materialize(struct pt_regs *regs)
 	if (ip >= km->code_base && ip < km->code_base + KEMU_STUBS_SIZE) {
 		switch (kemu_stub_info(km, ip - km->code_base)) {
 		case KEMU_STUB_PINNED_LIVE_PC_RAX:
-			kt->shadow.pc = regs->ax;
+			kt->shadow.pc = kemu_reg(regs, ax);
 			fallthrough;
 		case KEMU_STUB_PINNED_LIVE:
 			kemu_rs_pinned_from_host(&h, &kt->shadow);
@@ -451,8 +451,8 @@ void kemu_jit_exit_to_user(struct kemu_thread *kt, struct pt_regs *regs)
 	u64 epoch = READ_ONCE(km->epoch);
 
 	if (kt->epoch_seen != epoch) {
-		if (!(kt->flags & KEMU_TF_KSTATE) && regs->ip >= km->code_base &&
-		    regs->ip < km->code_base + KEMU_CODE_SIZE)
+		if (!(kt->flags & KEMU_TF_KSTATE) && kemu_reg(regs, ip) >= km->code_base &&
+		    kemu_reg(regs, ip) < km->code_base + KEMU_CODE_SIZE)
 			kemu_materialize(regs);
 		else
 			kemu_redirect(kt);

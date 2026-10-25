@@ -21,8 +21,6 @@
 #include <linux/highmem.h>
 #include <linux/ptrace.h>
 #include <asm/processor.h>
-#include <asm/proto.h>
-#include <asm/prctl.h>
 
 #include "kemu_internal.h"
 
@@ -412,7 +410,7 @@ void kemu_start_thread(struct pt_regs *regs, unsigned long pc, unsigned long sp)
 	current->kemu = kt;
 
 	start_thread(regs, kemu_stub(km, km->stubs.dispatch), kt->rstack_top);
-	do_arch_prctl_64(current, ARCH_SET_GS, kt->cpu_uaddr);
+	kemu_set_gs(kt->cpu_uaddr);
 	return;
 fail:
 	force_fatal_sig(SIGKILL);
@@ -570,21 +568,17 @@ int kemu_copy_thread(struct task_struct *p, const struct kernel_clone_args *args
 	kt->cpu->x[0] = 0;
 	if (args->stack)
 		kt->cpu->sp = args->stack;
-	if (args->flags & CLONE_SETTLS) {
+	if (args->flags & CLONE_SETTLS)
 		kt->cpu->tpidr = args->tls;
-		p->thread.fsbase = 0;
-		p->thread.fsindex = 0;
-	}
 	kt->cpu->host_rsp_top = kt->rstack_top;
 	kt->cpu->excl_addr = ~0ULL;
 
-	p->thread.gsbase = kt->cpu_uaddr;
-	p->thread.gsindex = 0;
-	childregs->sp = kt->rstack_top;
-	childregs->ip = kemu_stub(km, km->stubs.dispatch);
+	kemu_clone_tls(p, kt->cpu_uaddr, args->flags & CLONE_SETTLS);
+	kemu_reg(childregs, sp) = kt->rstack_top;
+	kemu_reg(childregs, ip) = kemu_stub(km, km->stubs.dispatch);
 	kt->cpu->flags_x86 = kemu_rs_image_from_nzcv(kt->cpu->nzcv);
-	childregs->cx = childregs->ip;
-	childregs->r11 = childregs->flags;
+	kemu_reg(childregs, cx) = kemu_reg(childregs, ip);
+	kemu_reg(childregs, r11) = kemu_reg(childregs, flags);
 	p->kemu = kt;
 	return 0;
 }
@@ -639,9 +633,10 @@ bool kemu_user_fault(struct pt_regs *regs, unsigned long address)
 			      PAGE_SIZE;
 
 	if (address < guard || address >= guard + PAGE_SIZE ||
-	    regs->ip < km->code_base || regs->ip >= km->code_base + KEMU_CODE_SIZE)
+	    kemu_reg(regs, ip) < km->code_base ||
+	    kemu_reg(regs, ip) >= km->code_base + KEMU_CODE_SIZE)
 		return false;
-	regs->sp = kt->rstack_top;
+	kemu_reg(regs, sp) = kt->rstack_top;
 	return true;
 }
 
@@ -655,7 +650,7 @@ unsigned long kemu_current_user_sp(void)
 {
 	if (task_is_kemu(current))
 		return READ_ONCE(current->kemu->cpu->sp);
-	return current_pt_regs()->sp;
+	return kemu_reg(current_pt_regs(), sp);
 }
 
 /* ---- exit to user ---- */
@@ -673,11 +668,11 @@ void kemu_exit_to_user(struct pt_regs *regs)
 		return;
 	km = current->mm->kemu;
 	kt->flags &= ~KEMU_TF_REDIRECT;
-	regs->ip = kemu_stub(km, (kt->flags & KEMU_TF_STEP) ? km->stubs.step :
-						 km->stubs.dispatch);
-	regs->sp = kt->rstack_top;
-	regs->cx = regs->ip;
-	regs->r11 = regs->flags;
+	kemu_reg(regs, ip) = kemu_stub(km, (kt->flags & KEMU_TF_STEP) ?
+				     km->stubs.step : km->stubs.dispatch);
+	kemu_reg(regs, sp) = kt->rstack_top;
+	kemu_reg(regs, cx) = kemu_reg(regs, ip);
+	kemu_reg(regs, r11) = kemu_reg(regs, flags);
 }
 
 unsigned int kemu_hwcap(void)

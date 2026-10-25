@@ -14,7 +14,6 @@
 #include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
-#include <linux/entry-common.h>
 #include <linux/syscalls.h>
 #include <linux/signal.h>
 #include <asm/syscall.h>
@@ -27,14 +26,14 @@
 
 static void kemu_load_syscall_view(struct pt_regs *regs, struct kemu_cpu *cpu)
 {
-	regs->orig_ax = READ_ONCE(cpu->x[8]);
-	regs->di = READ_ONCE(cpu->x[0]);
-	regs->si = READ_ONCE(cpu->x[1]);
-	regs->dx = READ_ONCE(cpu->x[2]);
-	regs->r10 = READ_ONCE(cpu->x[3]);
-	regs->r8 = READ_ONCE(cpu->x[4]);
-	regs->r9 = READ_ONCE(cpu->x[5]);
-	regs->ax = -ENOSYS;
+	kemu_reg(regs, orig_ax) = READ_ONCE(cpu->x[8]);
+	kemu_reg(regs, di) = READ_ONCE(cpu->x[0]);
+	kemu_reg(regs, si) = READ_ONCE(cpu->x[1]);
+	kemu_reg(regs, dx) = READ_ONCE(cpu->x[2]);
+	kemu_reg(regs, r10) = READ_ONCE(cpu->x[3]);
+	kemu_reg(regs, r8) = READ_ONCE(cpu->x[4]);
+	kemu_reg(regs, r9) = READ_ONCE(cpu->x[5]);
+	kemu_reg(regs, ax) = -ENOSYS;
 }
 
 /*
@@ -43,12 +42,12 @@ static void kemu_load_syscall_view(struct pt_regs *regs, struct kemu_cpu *cpu)
  */
 static void kemu_store_syscall_args(struct pt_regs *regs, struct kemu_cpu *cpu)
 {
-	cpu->x[0] = regs->di;
-	cpu->x[1] = regs->si;
-	cpu->x[2] = regs->dx;
-	cpu->x[3] = regs->r10;
-	cpu->x[4] = regs->r8;
-	cpu->x[5] = regs->r9;
+	cpu->x[0] = kemu_reg(regs, di);
+	cpu->x[1] = kemu_reg(regs, si);
+	cpu->x[2] = kemu_reg(regs, dx);
+	cpu->x[3] = kemu_reg(regs, r10);
+	cpu->x[4] = kemu_reg(regs, r8);
+	cpu->x[5] = kemu_reg(regs, r9);
 }
 
 static long kemu_dispatch(struct pt_regs *regs, long nr)
@@ -69,23 +68,23 @@ void kemu_svc(struct pt_regs *regs)
 	kemu_enter_op(kt);
 	next_pc = cpu->pc;
 	kemu_load_syscall_view(regs, cpu);
-	kt->orig_x0 = regs->di;
+	kt->orig_x0 = kemu_reg(regs, di);
 	kt->flags |= KEMU_TF_IN_SVC;
 
-	nr = syscall_enter_from_user_mode_work(regs, regs->orig_ax);
+	nr = kemu_syscall_enter(regs);
 	kemu_store_syscall_args(regs, cpu);
 	if (nr != -1)
-		regs->ax = kemu_dispatch(regs, nr);
+		kemu_reg(regs, ax) = kemu_dispatch(regs, nr);
 	if (kemu_debug >= 2)
 		pr_info("kemu: %s[%d] sys %ld(%lx, %lx, %lx, %lx) = %lx pc %llx\n",
-			current->comm, task_pid_nr(current), nr, regs->di, regs->si,
-			regs->dx, regs->r10, regs->ax, cpu->pc);
+			current->comm, task_pid_nr(current), nr, kemu_reg(regs, di), kemu_reg(regs, si),
+			kemu_reg(regs, dx), kemu_reg(regs, r10), kemu_reg(regs, ax), cpu->pc);
 
 	/* exec may have replaced (or dropped) the kemu state. */
 	if (current->kemu != kt)
 		return;
 	if (kt->flags & KEMU_TF_IN_SVC)
-		WRITE_ONCE(kt->cpu->x[0], regs->ax);
+		WRITE_ONCE(kt->cpu->x[0], kemu_reg(regs, ax));
 	/* The guest PC changed (e.g. rt_sigreturn): resume at dispatch. */
 	if (READ_ONCE(cpu->pc) != next_pc)
 		kemu_redirect(kt);
@@ -145,7 +144,7 @@ unsigned long kemu_interp(struct kemu_thread *kt, struct kemu_mm *km, u32 budget
 	return kemu_stub(km, km->stubs.dispatch);
 }
 
-/* Non-svc kemu operations. regs->ax is the value returned to the stub. */
+/* Non-svc kemu operations. kemu_reg(regs, ax) is the value returned to the stub. */
 void kemu_op(struct pt_regs *regs, unsigned long op)
 {
 	struct kemu_thread *kt = current->kemu;
@@ -153,23 +152,23 @@ void kemu_op(struct pt_regs *regs, unsigned long op)
 
 	kemu_enter_op(kt);
 	if (op == KEMU_OP_STEP) {
-		regs->ax = kemu_op_step(kt, km);
+		kemu_reg(regs, ax) = kemu_op_step(kt, km);
 		return;
 	}
 	if (kemu_jit_enabled) {
-		regs->ax = kemu_jit_op(regs, op);
+		kemu_reg(regs, ax) = kemu_jit_op(regs, op);
 		return;
 	}
 	switch (op) {
 	case KEMU_OP_TRANSLATE:
 	case KEMU_OP_HELPER:
 	case KEMU_OP_CHAIN:
-		regs->ax = kemu_interp(kt, km, KEMU_INTERP_BUDGET);
+		kemu_reg(regs, ax) = kemu_interp(kt, km, KEMU_INTERP_BUDGET);
 		break;
 	default:
 		/* Not something translated code ever does. */
 		force_sig(SIGSYS);
-		regs->ax = kemu_stub(km, km->stubs.dispatch);
+		kemu_reg(regs, ax) = kemu_stub(km, km->stubs.dispatch);
 		kemu_redirect(kt);
 		break;
 	}
