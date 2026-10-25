@@ -1299,6 +1299,8 @@ the code and its commit history are authoritative.
   - 32: no register remapping.
 - `kemu.debug=1` prints per-mm statistics: translations, shared-cache hits,
   translation time, flushes and targeted invalidations.
+- `kemu.stress=<n>` bumps the epoch and kicks every other thread once per n
+  translations. This forces state recovery at arbitrary points in translated code.
 - kemu-user:
   - `KEMU_JIT_STATS` prints a helper-instruction histogram;
   - `KEMU_XLAT_BENCH=<span>` measures translator throughput;

@@ -35,7 +35,13 @@ check() {	# name, then command for JIT on / JIT off as two strings
 java_classes=$tmp/classes
 mkdir -p "$java_classes"
 if command -v javac >/dev/null; then
-	t=$( { time javac -d "$java_classes" Bench.java; } 2>&1 ) && echo "ok   javac ($t)" || { echo "FAIL javac"; fails=$((fails + 1)); }
+	if t=$( { time javac -d "$java_classes" Bench.java > "$tmp/javac" 2>&1; } 2>&1 ); then
+		echo "ok   javac ($t)"
+	else
+		echo "FAIL javac (exit $?)"
+		tail -20 "$tmp/javac" | sed 's/^/    /'
+		fails=$((fails + 1))
+	fi
 fi
 
 check node   "node bench.js $scale"                          "node --jitless bench.js $scale"

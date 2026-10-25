@@ -149,6 +149,7 @@ x86 applets over the rootfs's binaries.
 | `kemu.xcache=0` | disable the shared translation cache |
 | `kemu.xcache_mb=<n>` | shared cache size limit (default 128) |
 | `kemu.debug=1` | per-process translation statistics on exit |
+| `kemu.stress=<n>` | debug: every n translations, interrupt all other threads of the process so their state is recovered mid-block |
 
 ## Testing
 
@@ -164,16 +165,15 @@ PyPy and Ruby inside an arm64 userland, each with the guest's JIT on and off,
 and compares the checksums with each other and with native x86_64 runs:
 
 ```sh
-KEMU_DISK=build/arm64.img KEMU_MEM=4096 scripts/run-vm.sh \
-  '. scripts/chroot-run.sh; chroot /r /bin/bash /mnt/kemu/tests/jit-workloads/run.sh'
+scripts/mkrootfs.sh full            # arm64 rootfs + runtimes, via qemu-user (~20 min)
+scripts/vm-jit-stress.sh 2 2        # 2 rounds, then 2 concurrent copies
+KEMU_APPEND=kemu.stress=50 scripts/vm-jit-stress.sh 1 2   # forced state recovery
 ```
-
-The runtimes aren't part of `mkrootfs.sh`'s package list; install
-`openjdk-21-jdk-headless nodejs luajit pypy3 ruby` into the image first.
 
 CI (`.github/workflows/ci.yml`) runs the userspace tests. It also builds a
 pristine v6.18 kernel with the patch set and boots it under KVM to run the
-in-kernel tests.
+in-kernel tests, then runs `vm-jit-stress.sh` on that kernel. The arm64 rootfs
+for that job is cached, keyed on `scripts/mkrootfs.sh`.
 
 ## License
 

@@ -47,6 +47,19 @@ static int __init kemu_jit_setup(char *str)
 }
 __setup("kemu.jit=", kemu_jit_setup);
 
+/*
+ * Debug: kemu.stress=<n> bumps the epoch and kicks every other thread once
+ * per n translations, so that threads are interrupted and their state is
+ * recovered (kemu_materialize) at arbitrary points in translated code.
+ */
+static unsigned int kemu_stress;
+
+static int __init kemu_stress_setup(char *str)
+{
+	return kstrtouint(str, 0, &kemu_stress) == 0;
+}
+__setup("kemu.stress=", kemu_stress_setup);
+
 /* Debug: kemu.jitoff=<mask> disables JIT features (see t1::JIT_OFF). */
 static u32 kemu_jit_off;
 
@@ -790,6 +803,16 @@ static unsigned long kemu_op_translate(struct kemu_thread *kt, struct kemu_mm *k
 	if (!err && chain && kt->epoch_seen == km->epoch)
 		kemu_chain(km, kt->cpu->exit_info, pc, main, res.ic_entry, res.blk_off);
 	km->lookups++;
+	if (kemu_stress && km->lookups % kemu_stress == 0) {
+		struct kemu_thread *o;
+
+		smp_store_release(&km->epoch, km->epoch + 1);
+		spin_lock(&km->threads_lock);
+		list_for_each_entry(o, &km->threads, node)
+			if (o->task != current)
+				kick_process(o->task);
+		spin_unlock(&km->threads_lock);
+	}
 	km->translate_ns += ktime_get_ns() - t0;
 	mutex_unlock(&km->lock);
 

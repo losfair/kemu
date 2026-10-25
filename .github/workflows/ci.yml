@@ -101,3 +101,54 @@ jobs:
         run: KERNEL=$LINUX/arch/x86/boot/bzImage scripts/vm-smoke.sh
       - name: Boot and test (no chaining, no shared cache)
         run: KERNEL=$LINUX/arch/x86/boot/bzImage KEMU_APPEND="kemu.jitoff=8 kemu.xcache=0" scripts/vm-smoke.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bzImage
+          path: ${{ env.LINUX }}/arch/x86/boot/bzImage
+          retention-days: 7
+
+  # Guest JITs (HotSpot, V8, LuaJIT, PyPy, YJIT) on the kernel built above:
+  # several rounds, then concurrent copies, checksums vs. JIT-off and native.
+  jit-stress:
+    needs: kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            qemu-system-x86 busybox-static libc6-arm64-cross e2fsprogs \
+            debootstrap debian-archive-keyring qemu-user-static
+      - name: Restore arm64 rootfs
+        id: rootfs
+        uses: actions/cache/restore@v4
+        with:
+          path: build/arm64-jit.img
+          key: rootfs-jit-${{ hashFiles('scripts/mkrootfs.sh') }}
+      - name: Build arm64 rootfs (debootstrap + qemu-user)
+        if: steps.rootfs.outputs.cache-hit != 'true'
+        run: |
+          [ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ] || sudo systemctl restart systemd-binfmt
+          cat /proc/sys/fs/binfmt_misc/qemu-aarch64
+          scripts/mkrootfs.sh full
+      - name: Save arm64 rootfs
+        if: steps.rootfs.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build/arm64-jit.img
+          key: rootfs-jit-${{ hashFiles('scripts/mkrootfs.sh') }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: bzImage
+          path: build/kernel
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: JIT workloads (2 rounds, then 2 concurrent copies)
+        run: KERNEL=build/kernel/bzImage scripts/vm-jit-stress.sh 2 2
+      - name: JIT workloads with forced state recovery (kemu.stress=50)
+        run: KERNEL=build/kernel/bzImage KEMU_APPEND="kemu.stress=50" scripts/vm-jit-stress.sh 1 2
