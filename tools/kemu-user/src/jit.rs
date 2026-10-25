@@ -245,7 +245,7 @@ fn xlat_bench(start: u64, span: u64) {
     let j = jit();
     let mut buf = vec![0u8; 256 << 10];
     let reloc = std::env::var("KEMU_RELOC").is_ok();
-    let cfg = Cfg { stubs: j.stubs.addrs(REGION), code_uaddr: REGION + (1 << 20), reloc };
+    let cfg = Cfg { stubs: j.stubs.addrs(REGION), code_uaddr: REGION + (1 << 20), reloc, tbi: false };
     let (mut n, mut bytes, mut insns) = (0u64, 0u64, 0u64);
     let t0 = std::time::Instant::now();
     for _ in 0..5 {
