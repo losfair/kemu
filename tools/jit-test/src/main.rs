@@ -644,11 +644,15 @@ fn gen_case(r: &mut Rng, mode: u32) -> Vec<u32> {
     }
     let n = 1 + r.below(unsafe { MAXLEN }) as usize;
     let mut v = Vec::new();
+    if mode == 6 {
+        v.push(0xeb01_001f); // cmp x0, x1: keep live host flags across SHA256
+    }
     for k in 0..n {
         let w = match mode {
             0 => gen_alu(r),
             1 => gen_mem(r),
             3 => gen_fp(r),
+            6 => gen_sha256(r),
             _ => {
                 // mixed with forward branches
                 match r.below(6) {
@@ -678,6 +682,9 @@ fn gen_case(r: &mut Rng, mode: u32) -> Vec<u32> {
             }
         };
         v.push(w);
+    }
+    if mode == 6 {
+        v.push(0x9a88_00e6 | ((r.below(14) as u32) << 12)); // csel x6,x7,x8,cond
     }
     v.push(0xd420_0000); // brk #0
     v
@@ -713,6 +720,21 @@ fn gen_fp(r: &mut Rng) -> u32 {
         if is_fp(&i) {
             return w;
         }
+    }
+}
+
+/// SHA256H/H2/SU0/SU1, including aliased operands and V31. Mode 6 also
+/// requires native lowering: interpreter fallbacks make hashing large
+/// files spend millions of kernel entries on individual instructions.
+fn gen_sha256(r: &mut Rng) -> u32 {
+    let rd = r.below(32) as u32;
+    let rn = if r.below(3) == 0 { rd } else { r.below(32) as u32 };
+    let rm = if r.below(3) == 0 { rn } else { r.below(32) as u32 };
+    match r.below(4) {
+        0 => 0x5e00_4000 | (rm << 16) | (rn << 5) | rd,
+        1 => 0x5e00_5000 | (rm << 16) | (rn << 5) | rd,
+        2 => 0x5e28_2800 | (rn << 5) | rd,
+        _ => 0x5e00_6000 | (rm << 16) | (rn << 5) | rd,
     }
 }
 
@@ -814,6 +836,7 @@ fn main() {
 
         data.copy_from_slice(&data_init);
         reset_cache();
+        let helpers_before = h().helpers;
         let (jit_st, jit_ex) = run_jit(&init);
         if std::env::var("ONLY").is_ok() {
             for (k, &(b, sz)) in h().blocks.iter().enumerate() {
@@ -824,6 +847,10 @@ fn main() {
         }
 
         let mut bad = Vec::new();
+        if mode == 6 && h().helpers - helpers_before != 1 {
+            // The terminating BRK is the only expected helper.
+            bad.push(format!("SHA256 fallback: {} helper calls", h().helpers - helpers_before));
+        }
         for i in 0..31 {
             if ref_st.x[i] != jit_st.x[i] {
                 bad.push(format!("x{i}: ref {:#x} jit {:#x}", ref_st.x[i], jit_st.x[i]));
@@ -855,6 +882,12 @@ fn main() {
         }
         if ref_st.fpsr != jit_st.fpsr {
             fpsr_diffs += 1;
+            if mode == 6 {
+                bad.push(format!("SHA256 changed FPSR: ref {:#x} jit {:#x}", ref_st.fpsr, jit_st.fpsr));
+            }
+        }
+        if mode == 6 && ref_st.fpcr != jit_st.fpcr {
+            bad.push(format!("SHA256 changed FPCR: ref {:#x} jit {:#x}", ref_st.fpcr, jit_st.fpcr));
         }
         if !bad.is_empty() {
             for w in &code {
