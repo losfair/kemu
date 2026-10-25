@@ -153,19 +153,30 @@ pub fn validate<E: Env>(env: &mut E, b: &[u8], new_pc: u64) -> bool {
     if delta & 0xfff != 0 {
         return false;
     }
-    for i in 0..bl.ndeps {
+    let mut i = 0;
+    while i < bl.ndeps {
         let d = match dep(&bl, i) {
             Some(d) => d,
             None => return false,
         };
-        let now = env.fetch(d.pc.wrapping_add(delta));
-        let same = match now {
-            Ok(w) => d.ok == 1 && w == d.word,
-            Err(_) => d.ok == 0,
-        };
-        if !same {
-            return false;
+        let pc = d.pc.wrapping_add(delta);
+        if d.ok == 0 {
+            if env.fetch(pc).is_ok() { return false; }
+            i += 1;
+            continue;
         }
+        let mut expected = [0u32; 16];
+        expected[0] = d.word;
+        let mut n = 1;
+        while n < expected.len() && i + n < bl.ndeps && (pc & 0xfff) + 4 * (n as u64) < 4096 {
+            let next = match dep(&bl, i + n) { Some(d) => d, None => return false };
+            if next.ok == 0 || next.pc.wrapping_add(delta) != pc.wrapping_add(4 * n as u64) { break; }
+            expected[n] = next.word;
+            n += 1;
+        }
+        let mut words = [0u32; 16];
+        if env.fetch_words(pc, &mut words[..n]).is_err() || words[..n] != expected[..n] { return false; }
+        i += n;
     }
     true
 }

@@ -63,6 +63,22 @@ int kemu_c_fetch(u64 pc, u32 *out)
 	return get_user(*out, (u32 __user *)pc) ? -EFAULT : 0;
 }
 
+/* Adjacent xcache dependencies share one executable page. Check its
+ * permissions once, then copy the remaining words in one uaccess. Every
+ * instruction is still compared with the cached dependency by the core. */
+int kemu_c_fetch_words(u64 pc, u32 *out, size_t n)
+{
+	int ret;
+
+	if (!n || n > 16 || (pc & 3) || n * sizeof(*out) > PAGE_SIZE - offset_in_page(pc))
+		return -EINVAL;
+	ret = kemu_c_fetch(pc, out);
+	if (ret || n == 1)
+		return ret;
+	return copy_from_user(out + 1, (u32 __user *)pc + 1,
+			      (n - 1) * sizeof(*out)) ? -EFAULT : 0;
+}
+
 /* Validate the atomic access before entering the architecture backend. */
 int kemu_c_cmpxchg(u64 addr, u32 size, const u64 *exp, const u64 *new, u64 *old)
 {

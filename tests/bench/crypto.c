@@ -17,6 +17,7 @@ DECLARE(aes_decrypt);
 DECLARE(pmull64);
 DECLARE(pmull8);
 DECLARE(sha1);
+DECLARE(sha256);
 
 static double now(void)
 {
@@ -36,6 +37,15 @@ int main(int argc, char **argv)
         fprintf(stderr, "expected 1..1e9 iterations and 1..100 trials\n");
         return 1;
     }
+    uint64_t dczid;
+    __asm__ volatile("mrs %0, dczid_el0" : "=r"(dczid));
+    void *zero_block = NULL;
+    if (!(dczid & 16)) {
+        size_t size = (size_t)4 << (dczid & 15);
+        if (size < sizeof(void *)) size = sizeof(void *);
+        zero_block = aligned_alloc(size, size);
+        if (!zero_block) { perror("aligned_alloc"); return 1; }
+    }
     const uint64_t seed[6] = {
         0x0123456789abcdef, 0xfedcba9876543210,
         0x3141592653589793, 0x2384626433832795,
@@ -47,11 +57,16 @@ int main(int argc, char **argv)
         {"pmull64", crypto_pmull64, 8},
         {"pmull8", crypto_pmull8, 8},
         {"sha1", crypto_sha1, 12},
+        {"sha256", crypto_sha256, 8},
     };
     for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         uint64_t result[6];
         cases[i].run(256, seed, result); /* Warm the translator/code cache. */
         for (unsigned trial = 0; trial < trials; trial++) {
+            /* DC ZVA uses YMM stores in the JIT. SHA-NI must avoid an
+             * AVX/legacy-SSE transition assist after those stores. */
+            if (zero_block)
+                __asm__ volatile("dc zva, %0" :: "r"(zero_block) : "memory");
             double start = now();
             cases[i].run(iterations, seed, result);
             double seconds = now() - start;
@@ -65,5 +80,6 @@ int main(int argc, char **argv)
             fflush(stdout);
         }
     }
+    free(zero_block);
     return 0;
 }

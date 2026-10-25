@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-//! Crypto lowering using AVX2, with optional AES-NI and PCLMULQDQ.
+//! Crypto lowering using AVX2, with optional AES-NI, PCLMULQDQ and SHA-NI.
 //! Keep intermediate state in scratch XMM registers and
 //! commit Vd once, so an interrupted instruction can restart. Integer
 //! vector operations leave NZCV, FPCR and FPSR untouched.
@@ -12,6 +12,7 @@ use super::*;
 pub struct HostCrypto {
     pub aes: bool,
     pub pclmul: bool,
+    pub sha: bool,
 }
 
 // XMM0..7 cache guest vectors; these host registers are scratch.
@@ -215,6 +216,9 @@ impl<'s, 'b> Gen<'s, 'b> {
         if !matches!(op, 4 | 5 | 6 | 0x10) {
             return false;
         }
+        if self.cfg.crypto.sha {
+            return self.sha256_host(op, rd, rn, rm);
+        }
         // Read every operand before committing, including when they alias.
         self.ld_vec(X, if op == 5 { rn } else { rd });
         self.ld_vec(Y, if op == 5 { rd } else { rn });
@@ -279,6 +283,39 @@ impl<'s, 'b> Gen<'s, 'b> {
             }
         };
         self.store_vec(rd, result);
+        true
+    }
+
+    fn sha256_host(&mut self, op: u8, rd: u32, rn: u32, rm: u32) -> bool {
+        self.ld_vec(X, if op == 5 { rn } else { rd });
+        self.ld_vec(Y, if op == 5 { rd } else { rn });
+        if op != 0x10 { self.ld_vec(W, rm); }
+        let a = &mut self.a;
+        match op {
+            4 | 5 => {
+                // ARM: [a,b,c,d], [e,f,g,h] in low-to-high lane order.
+                // SHA256RNDS2: [f,e,b,a], [h,g,d,c], with W+K in XMM0.
+                // The block allocator reserves XMM0 for these instructions.
+                shuffle(a, T, X, 0xb1);
+                shuffle(a, U, Y, 0xb1);
+                bin(a, 0x6c, X, U, T);
+                bin(a, 0x6d, Y, U, T);
+                a.vex(1, 2, false, false, 0x6f, 0, 0, Rm::R(W));
+                a.sha256(0xcb, Y, X);
+                shuffle(a, 0, W, 0x0e);
+                a.sha256(0xcb, X, Y);
+                shuffle(a, T, X, 0xb1);
+                shuffle(a, U, Y, 0xb1);
+                bin(a, if op == 4 { 0x6d } else { 0x6c }, X, T, U);
+            }
+            0x10 => a.sha256(0xcc, X, Y), // SHA256MSG1 == SHA256SU0
+            _ => {
+                align(a, T, W, Y, 4);
+                bin(a, ADD, X, X, T);
+                a.sha256(0xcd, X, W); // SHA256MSG2 completes SHA256SU1
+            }
+        }
+        self.store_vec(rd, X);
         true
     }
 }

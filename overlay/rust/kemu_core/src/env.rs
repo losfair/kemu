@@ -27,6 +27,16 @@ pub trait Env {
     /// Fetch one instruction word from an executable guest mapping.
     fn fetch(&mut self, pc: u64) -> Result<u32, Fault>;
 
+    /// Fetch 1..=16 instruction words from one executable 4 KiB
+    /// page. Shared-cache validation batches adjacent dependencies here;
+    /// hosts may override this to amortize permission checks and uaccess.
+    fn fetch_words(&mut self, pc: u64, words: &mut [u32]) -> Result<(), Fault> {
+        for (i, word) in words.iter_mut().enumerate() {
+            *word = self.fetch(pc.wrapping_add(4 * i as u64))?;
+        }
+        Ok(())
+    }
+
     fn read_u8(&mut self, addr: u64) -> Result<u8, Fault>;
     fn read_u16(&mut self, addr: u64) -> Result<u16, Fault>;
     fn read_u32(&mut self, addr: u64) -> Result<u32, Fault>;
@@ -69,6 +79,9 @@ pub struct Tbi<'a, E: Env>(pub &'a mut E);
 impl<E: Env> Env for Tbi<'_, E> {
     fn fetch(&mut self, pc: u64) -> Result<u32, Fault> {
         self.0.fetch(pc)
+    }
+    fn fetch_words(&mut self, pc: u64, words: &mut [u32]) -> Result<(), Fault> {
+        self.0.fetch_words(pc, words)
     }
     fn read_u8(&mut self, addr: u64) -> Result<u8, Fault> {
         self.0.read_u8(untag(addr))

@@ -23,6 +23,12 @@ impl Env for TestEnv {
     fn fetch(&mut self, pc: u64) -> Result<u32, Fault> {
         self.read_u32(pc)
     }
+    fn fetch_words(&mut self, pc: u64, words: &mut [u32]) -> Result<(), Fault> {
+        assert!(!words.is_empty() && words.len() <= 16);
+        assert_eq!(pc >> 12, (pc + 4 * words.len() as u64 - 1) >> 12);
+        for (i, word) in words.iter_mut().enumerate() { *word = self.fetch(pc + 4 * i as u64)?; }
+        Ok(())
+    }
     fn read_u8(&mut self, a: u64) -> Result<u8, Fault> {
         self.idx(a).map(|i| self.mem[i]).ok_or(Fault { addr: a, access: crate::env::Access::Read, align: false })
     }
@@ -289,6 +295,36 @@ fn xcache_validate_and_relocate() {
     assert!(!xcache::validate(&mut mk(base2, Some((3, 0xf9400401))), blob, base2));
     assert!(!xcache::validate(&mut mk(base2, Some((7, 0x8b020021))), blob, base2));
     assert!(!xcache::validate(&mut mk(base2 + 4, None), blob, base2 + 4));
+}
+
+/// Batching must still check every word, stop at executable page boundaries,
+/// and preserve negative dependencies on inaccessible instruction addresses.
+#[test]
+fn xcache_batches_preserve_dependencies_and_faults() {
+    use crate::jit::xcache::{self, Dep};
+    let base = 0x40_0ff8;
+    let mut env = TestEnv { mem: std::vec![0; 160], base };
+    let mut deps = std::vec::Vec::new();
+    for i in 0..40 {
+        let word = 0xd503201f ^ i;
+        let pc = base + 4 * i as u64;
+        env.write_u32(pc, word).unwrap();
+        deps.push(Dep { pc, word, ok: 1 });
+    }
+    deps.push(Dep { pc: base + 160, word: 0, ok: 0 });
+    let mut blob = std::vec![0; xcache::blob_size(0, deps.len())];
+    xcache::write_blob(&mut blob, base, 0, &[], &deps).unwrap();
+    assert!(xcache::validate(&mut env, &blob, base));
+    for d in &deps[..40] {
+        env.write_u32(d.pc, !d.word).unwrap();
+        assert!(!xcache::validate(&mut env, &blob, base));
+        env.write_u32(d.pc, d.word).unwrap();
+    }
+    env.mem.pop();
+    assert!(!xcache::validate(&mut env, &blob, base));
+    env.mem.push((deps[39].word >> 24) as u8);
+    env.mem.extend_from_slice(&[0; 4]);
+    assert!(!xcache::validate(&mut env, &blob, base));
 }
 
 /// A thread interrupted in an exit trampoline of a remapped block must be

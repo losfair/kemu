@@ -47,6 +47,8 @@ jobs:
           INTR=50 RELOC=1 $j 50000 4
           $j 20000 5 6
           INTR=50 RELOC=1 $j 20000 6 6
+          NO_SHA=1 INTR=50 RELOC=1 $j 20000 6 6
+          NO_VCACHE=1 INTR=50 RELOC=1 $j 20000 6 6
           $j 20000 7 7
           INTR=50 RELOC=1 $j 20000 8 7
           NO_AES=1 NO_PCLMUL=1 INTR=50 RELOC=1 $j 20000 9 7
@@ -59,6 +61,8 @@ jobs:
           NO_VCACHE=1 INTR=20 RELOC=1 $j 10000 12 10
           INTR=20 RELOC=1 $j 10000 13 11
           NO_VCACHE=1 INTR=20 RELOC=1 $j 10000 13 11
+          INTR=10 RELOC=1 $j 30000 14 12
+          NO_VCACHE=1 INTR=10 RELOC=1 $j 30000 14 12
       - name: kemu-user smoke test
         run: |
           u=tools/kemu-user/target/release/kemu-user

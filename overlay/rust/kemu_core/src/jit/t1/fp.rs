@@ -430,6 +430,20 @@ impl<'s, 'b> Gen<'s, 'b> {
     /// the accumulator, so all source/destination aliases are safe.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn simd_indexed(&mut self, q: bool, u: bool, size: u8, opcode: u8, rd: u32, rn: u32, rm: u32, index: u32, scalar: bool) -> bool {
+        if !scalar && matches!(size, 1 | 2) && matches!((u, opcode), (true, 0 | 4) | (false, 8)) {
+            let elem = self.vector_slice(rm, (index << size) as u8, X15);
+            self.a.vex(2, PP_66, false, false, if size == 1 { 0x79 } else { 0x58 }, X15, 0, elem);
+            self.ld_vec(X14, rn);
+            self.a.vex(if size == 1 { 1 } else { 2 }, PP_66, false, false,
+                       if size == 1 { 0xd5 } else { 0x40 }, X14, X14, Rm::R(X15));
+            if opcode != 8 {
+                self.ld_vec(X15, rd);
+                self.a.vex(1, PP_66, false, false,
+                           if opcode == 0 { 0xfc + size } else { 0xf8 + size }, X14, X15, Rm::R(X14));
+            }
+            self.st_vec(q, X14, rd);
+            return true;
+        }
         if (u && opcode != 9) || !matches!(size, 2 | 3) || !matches!(opcode, 1 | 5 | 9) || (size == 3 && !q && !scalar) {
             return false;
         }
@@ -492,9 +506,10 @@ impl<'s, 'b> Gen<'s, 'b> {
         if matches!(op, SimdOp::FAddP | SimdOp::FMinP | SimdOp::FMaxP | SimdOp::FMinNmP | SimdOp::FMaxNmP) {
             return self.fp_pair(q, size, op, rd, rn, rm);
         }
-        if scalar {
+        if scalar && !(size == 3 && matches!(op, SimdOp::Add | SimdOp::Sub | SimdOp::CmEq | SimdOp::CmGt)) {
             return false;
         }
+        let q = q && !scalar;
         let _ = u;
         // Integer ops: map to a VEX 66 0F opcode by element size.
         let int_op: Option<[u8; 4]> = match op {
@@ -519,16 +534,58 @@ impl<'s, 'b> Gen<'s, 'b> {
             return true;
         }
         match op {
+            SimdOp::UShl if size == 1 => {
+                // AVX2 variable shifts operate on dwords. Widen each half
+                // and sign-extend the low byte of each ARM shift count.
+                for half in 0..=usize::from(q) {
+                    let x = if half == 0 { X14 } else { 11 };
+                    self.widen(x, rn, 1, false, half != 0);
+                    self.widen(X15, rm, 1, true, half != 0);
+                    self.a.vex_ib(1, PP_66, false, false, 0x72, 6, X15, Rm::R(X15), 24);
+                    self.a.vex_ib(1, PP_66, false, false, 0x72, 4, X15, Rm::R(X15), 24);
+                    self.a.vex(2, PP_66, false, false, 0x47, X13, x, Rm::R(X15)); // vpsllvd
+                    self.a.vex(1, PP_66, false, false, 0xef, 12, 12, Rm::R(12));
+                    self.a.vex(1, PP_66, false, false, 0xfa, X15, 12, Rm::R(X15));
+                    self.a.vex(2, PP_66, false, false, 0x45, x, x, Rm::R(X15)); // vpsrlvd
+                    self.a.vex(1, PP_66, false, false, 0xeb, x, x, Rm::R(X13));
+                    self.a.vex_ib(1, PP_66, false, false, 0x72, 6, x, Rm::R(x), 16);
+                    self.a.vex_ib(1, PP_66, false, false, 0x72, 2, x, Rm::R(x), 16);
+                }
+                self.a.vex(2, PP_66, false, false, 0x2b, X14, X14, Rm::R(if q { 11 } else { X14 }));
+                self.st_vec(q, X14, rd);
+                true
+            }
+            SimdOp::Bsl | SimdOp::Bit | SimdOp::Bif => {
+                // Select bits using XOR/AND, with all sources read before
+                // the destination is committed (including aliases).
+                let (base, other, mask) = match op {
+                    SimdOp::Bsl => (rm, rn, rd),
+                    SimdOp::Bit => (rd, rn, rm),
+                    _ => (rn, rd, rm),
+                };
+                self.ld_vec(X14, base);
+                self.ld_vec(X15, other);
+                self.a.vex(1, PP_66, false, false, 0xef, X15, X15, Rm::R(X14));
+                self.a.vex(1, PP_66, false, false, 0xdb, X15, X15, self.v_rm(mask));
+                self.a.vex(1, PP_66, false, false, 0xef, X14, X14, Rm::R(X15));
+                self.st_vec(q, X14, rd);
+                true
+            }
             SimdOp::FMin | SimdOp::FMax | SimdOp::FMinNm | SimdOp::FMaxNm if size >= 2 && (q || size == 2) => {
                 self.fp_minmax(size == 3, false, q, matches!(op, SimdOp::FMin | SimdOp::FMinNm), rd, rn, rm)
             }
             SimdOp::PMull | SimdOp::PMull2 => self.pmull(size, op == SimdOp::PMull2, rd, rn, rm),
-            SimdOp::And | SimdOp::Orr | SimdOp::Eor | SimdOp::Bic => {
+            SimdOp::And | SimdOp::Orr | SimdOp::Eor | SimdOp::Bic | SimdOp::Orn => {
                 self.ld_vec(X14, rn);
                 match op {
                     SimdOp::And => self.a.vex(1, PP_66, false, false, 0xdb, X14, X14, self.v_rm(rm)),
                     SimdOp::Orr => self.a.vex(1, PP_66, false, false, 0xeb, X14, X14, self.v_rm(rm)),
                     SimdOp::Eor => self.a.vex(1, PP_66, false, false, 0xef, X14, X14, self.v_rm(rm)),
+                    SimdOp::Orn => {
+                        self.a.vex(1, PP_66, false, false, 0x76, X15, X15, Rm::R(X15));
+                        self.a.vex(1, PP_66, false, false, 0xef, X15, X15, self.v_rm(rm));
+                        self.a.vex(1, PP_66, false, false, 0xeb, X14, X14, Rm::R(X15));
+                    }
                     _ => {
                         // vpandn x14, x15(rm), x14(rn) : ~rm & rn
                         self.ld_vec(X15, rm);
@@ -627,10 +684,23 @@ impl<'s, 'b> Gen<'s, 'b> {
                 }
                 true
             }
-            SimdOp::AddP if size >= 1 => {
+            SimdOp::AddP => {
                 self.ld_vec(X14, rn);
                 self.ld_vec(X15, rm);
                 match (size, q) {
+                    (0, _) => {
+                        if !q {
+                            self.a.vex(1, PP_66, false, false, 0x6c, X14, X14, Rm::R(X15));
+                        }
+                        self.splat32(X13, 0x00ff_00ff);
+                        self.pairwise_bytes(X14, 0xfd);
+                        self.a.vex(1, PP_66, false, false, 0xdb, X14, X14, Rm::R(X13));
+                        if q {
+                            self.pairwise_bytes(X15, 0xfd);
+                            self.a.vex(1, PP_66, false, false, 0xdb, X15, X15, Rm::R(X13));
+                        }
+                        self.a.vex(1, PP_66, false, false, 0x67, X14, X14, Rm::R(X15));
+                    }
                     (3, true) => {
                         // [n0+n1, m0+m1]
                         self.a.vex(1, PP_66, false, false, 0x6c, X13, X14, Rm::R(X15)); // (n0, m0)
@@ -836,10 +906,56 @@ impl<'s, 'b> Gen<'s, 'b> {
         if let Some(result) = self.fp_misc_extra(q, size, op, rd, rn, scalar) {
             return result;
         }
-        if scalar {
+        if matches!(op, Simd2Op::CmEq0 | Simd2Op::CmGe0 | Simd2Op::CmGt0 | Simd2Op::CmLe0 | Simd2Op::CmLt0) {
+            self.ld_vec(X14, rn);
+            self.a.vex(1, PP_66, false, false, 0xef, X15, X15, Rm::R(X15));
+            let eq = op == Simd2Op::CmEq0;
+            let (map, opc) = if size == 3 { (2, if eq { 0x29 } else { 0x37 }) }
+                else { (1, if eq { [0x74, 0x75, 0x76][size as usize] } else { [0x64, 0x65, 0x66][size as usize] }) };
+            if matches!(op, Simd2Op::CmGe0 | Simd2Op::CmLt0) {
+                self.a.vex(map, PP_66, false, false, opc, X14, X15, Rm::R(X14));
+            } else {
+                self.a.vex(map, PP_66, false, false, opc, X14, X14, Rm::R(X15));
+            }
+            if matches!(op, Simd2Op::CmGe0 | Simd2Op::CmLe0) {
+                self.a.vex(1, PP_66, false, false, 0x76, X15, X15, Rm::R(X15));
+                self.a.vex(1, PP_66, false, false, 0xef, X14, X14, Rm::R(X15));
+            }
+            self.st_vec(q && !scalar, X14, rd);
+            return true;
+        }
+        if scalar && !(size == 3 && op == Simd2Op::Neg) {
             return false;
         }
+        let q = q && !scalar;
         match op {
+            Simd2Op::UaddLp if size == 0 => {
+                self.ld_vec(X14, rn);
+                self.splat32(X15, 0x0101_0101);
+                // Unsigned byte * signed 1, summed in adjacent pairs.
+                // The maximum 510 fits signed words, so saturation is inert.
+                self.a.vex(2, PP_66, false, false, 0x04, X14, X14, Rm::R(X15));
+                self.st_vec(q, X14, rd);
+                return true;
+            }
+            Simd2Op::Cnt if size == 0 => {
+                // Popcount each nibble using PSHUFB, then add byte counts.
+                self.ld_vec(X14, rn);
+                self.mov_imm(RAX, 0x0302_0201_0201_0100);
+                self.a.vmov_from_gpr(Sz::Q, X15, RAX);
+                self.mov_imm(RAX, 0x0403_0302_0302_0201);
+                self.a.vmov_from_gpr(Sz::Q, X13, RAX);
+                self.a.vex(1, PP_66, false, false, 0x6c, X15, X15, Rm::R(X13));
+                self.splat32(X13, 0x0f0f_0f0f);
+                self.a.vex_ib(1, PP_66, false, false, 0x71, 2, 12, Rm::R(X14), 4);
+                self.a.vex(1, PP_66, false, false, 0xdb, X14, X14, Rm::R(X13));
+                self.a.vex(1, PP_66, false, false, 0xdb, 12, 12, Rm::R(X13));
+                self.a.vex(2, PP_66, false, false, 0x00, X14, X15, Rm::R(X14));
+                self.a.vex(2, PP_66, false, false, 0x00, 12, X15, Rm::R(12));
+                self.a.vex(1, PP_66, false, false, 0xfc, X14, X14, Rm::R(12));
+                self.st_vec(q, X14, rd);
+                return true;
+            }
             Simd2Op::Rev16 | Simd2Op::Rev32 | Simd2Op::Rev64 => {
                 let container = match op {
                     Simd2Op::Rev16 => 1,
@@ -869,14 +985,6 @@ impl<'s, 'b> Gen<'s, 'b> {
             }
             Simd2Op::Not => {}
             Simd2Op::NotOrRbit if !u => {}
-            Simd2Op::CmEq0 if size < 3 => {
-                self.ld_vec(X14, rn);
-                self.a.vex(1, PP_66, false, false, 0xef, X15, X15, Rm::R(X15));
-                let opc = [0x74u8, 0x75, 0x76][size as usize];
-                self.a.vex(1, PP_66, false, false, opc, X14, X14, Rm::R(X15));
-                self.st_vec(q, X14, rd);
-                return true;
-            }
             Simd2Op::Abs if size < 3 => {
                 let opc = [0x1cu8, 0x1d, 0x1e][size as usize];
                 self.a.vex(2, PP_66, false, false, opc, X14, 0, self.v_rm(rn));
@@ -939,11 +1047,7 @@ impl<'s, 'b> Gen<'s, 'b> {
     }
 
     pub(super) fn simd_mod_imm(&mut self, q: bool, op: u8, cmode: u8, rd: u32, imm: u64, fp: bool) -> bool {
-        // MOVI / MVNI forms only (ORR/BIC immediate use the helper).
         let orr_bic = (cmode & 1 == 1) && cmode < 0b1100;
-        if orr_bic {
-            return false;
-        }
         let v = if op == 1 && cmode < 0b1110 { !imm } else { imm };
         if fp && op == 1 && cmode == 0b1111 && !q {
             return false;
@@ -952,6 +1056,12 @@ impl<'s, 'b> Gen<'s, 'b> {
         self.a.vmov_from_gpr(Sz::Q, X14, RAX);
         if q {
             self.a.vex(2, PP_66, false, false, 0x59, X14, 0, Rm::R(X14)); // vpbroadcastq
+        }
+        if orr_bic {
+            self.a.vex(1, PP_66, false, false, if op == 1 { 0xdb } else { 0xeb }, X14, X14, self.v_rm(rd));
+            if !q {
+                self.a.vex(1, PP_F3, false, false, 0x7e, X14, 0, Rm::R(X14));
+            }
         }
         self.store_vec(rd, X14);
         true
@@ -967,9 +1077,7 @@ impl<'s, 'b> Gen<'s, 'b> {
         if esize >= 2 && matches!(opcode, 28 | 31) {
             return self.fp_simd_int(q, esize as u8, scalar, opcode == 28, u, 3, 2 * ebits - immhb, rd, rn);
         }
-        // Scalar SHL Dd,Dn,#imm is used in GHASH reduction. Other scalar
-        // shift families still use the interpreter.
-        if scalar && !(opcode == 0b01010 && !u && esize == 3) {
+        if scalar && !(esize == 3 && (opcode == 0 || opcode == 0b01010 && !u)) {
             return false;
         }
         match opcode {
@@ -995,7 +1103,16 @@ impl<'s, 'b> Gen<'s, 'b> {
                     (if u { 2u8 } else { 4u8 }, 2 * ebits - immhb) // psrl / psra
                 };
                 if !u && opcode == 0 && esize == 3 {
-                    return false; // no vpsraq in AVX2
+                    // AVX2 has no VPSRAQ. Combine a logical shift with a
+                    // shifted sign mask, including the shift-by-64 case.
+                    self.ld_vec(X14, rn);
+                    self.a.vex(1, PP_66, false, false, 0xef, X15, X15, Rm::R(X15));
+                    self.a.vex(2, PP_66, false, false, 0x37, X15, X15, Rm::R(X14));
+                    self.a.vex_ib(1, PP_66, false, false, 0x73, 6, X15, Rm::R(X15), (64 - amt) as u8);
+                    self.a.vex_ib(1, PP_66, false, false, 0x73, 2, X14, Rm::R(X14), amt as u8);
+                    self.a.vex(1, PP_66, false, false, 0xeb, X14, X14, Rm::R(X15));
+                    self.st_vec(q && !scalar, X14, rd);
+                    return true;
                 }
                 // group opcode by element size: w 71, d 72, q 73
                 let g = [0u8, 0x71, 0x72, 0x73][esize as usize];

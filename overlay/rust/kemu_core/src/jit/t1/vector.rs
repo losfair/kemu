@@ -7,7 +7,7 @@ use super::*;
 use super::fp::voff;
 use crate::decode::FcvtOp;
 
-pub(super) fn choose(insns: &[Insn]) -> [u8; meta::VECTOR_REGS] {
+pub(super) fn choose(insns: &[Insn], sha: bool) -> [u8; meta::VECTOR_REGS] {
     let mut uses = [0u16; 32];
     let has_loop = insns.iter().enumerate().any(|(idx, i)| match i {
         Insn::B { imm } | Insn::BCond { imm, .. } | Insn::Cbz { imm, .. }
@@ -56,7 +56,10 @@ pub(super) fn choose(insns: &[Insn]) -> [u8; meta::VECTOR_REGS] {
         }
     }
     let mut map = [meta::NO_VECTOR; meta::VECTOR_REGS];
-    for slot in &mut map {
+    // SHA256RNDS2 implicitly reads XMM0. Do not keep a guest value there
+    // in blocks using it, so interrupt recovery needs no special spills.
+    let reserve = usize::from(sha && insns.iter().any(|i| matches!(i, Insn::Sha256 { op: 4 | 5, .. })));
+    for slot in &mut map[reserve..] {
         let mut best = 0;
         for r in 1..32 {
             if uses[r] > uses[best] { best = r; }
@@ -79,15 +82,15 @@ mod tests {
     fn promote_single_use_loop_input() {
         let mut insns = [decode::decode(0x4ee18400), decode::decode(0xb5ffffe0)];
         // add v0.2d,v0.2d,v1.2d; cbnz x0,pc0. V1 is read just once.
-        assert_eq!(choose(&insns)[..3], [0, 1, meta::NO_VECTOR]);
+        assert_eq!(choose(&insns, false)[..3], [0, 1, meta::NO_VECTOR]);
         insns[1] = Insn::Ret { rn: 30 };
-        assert_eq!(choose(&insns), [meta::NO_VECTOR; meta::VECTOR_REGS]);
+        assert_eq!(choose(&insns, false), [meta::NO_VECTOR; meta::VECTOR_REGS]);
     }
 }
 
 impl<'s, 'b> Gen<'s, 'b> {
     pub(super) fn vector_prologue(&mut self) {
-        if self.vlive || self.vectors[0] == meta::NO_VECTOR { return; }
+        if self.vlive || self.vectors.iter().all(|&v| v == meta::NO_VECTOR) { return; }
         for (x, &g) in self.vectors.iter().enumerate() {
             if g < 32 { self.a.vmovdqu_load(x as u8, Mem::gs(voff(g as u32))); }
         }
