@@ -11,6 +11,68 @@ thread_local! {
     static SYSROOT: RefCell<Option<String>> = RefCell::new(std::env::var("KEMU_SYSROOT").ok());
     // Keep rewritten CStrings alive for the duration of the syscall.
     static REWRITE_BUF: RefCell<Vec<CString>> = RefCell::new(Vec::new());
+    static HEAP: RefCell<GuestHeap> = RefCell::new(GuestHeap::new());
+}
+
+// Forwarding brk lets guest malloc overwrite Rust/glibc's own heap. Reserve
+// a separate anonymous range; Linux brk returns the old break on failure.
+const HEAP_SIZE: usize = 1 << 30;
+const PAGE: u64 = 4096;
+struct GuestHeap {
+    base: u64,
+    current: u64,
+}
+
+impl GuestHeap {
+    fn new() -> Self {
+        let p = unsafe {
+            libc::mmap(std::ptr::null_mut(), HEAP_SIZE, libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0)
+        };
+        assert_ne!(p, libc::MAP_FAILED, "reserve guest heap");
+        Self { base: p as u64, current: p as u64 }
+    }
+
+    fn brk(&mut self, addr: u64) -> u64 {
+        if addr < self.base || addr > self.base + HEAP_SIZE as u64 {
+            return self.current;
+        }
+        let old = (self.current + PAGE - 1) & !(PAGE - 1);
+        let new = (addr + PAGE - 1) & !(PAGE - 1);
+        if new != old {
+            let start = old.min(new) as *mut libc::c_void;
+            let len = old.abs_diff(new) as usize;
+            let prot = if new > old { libc::PROT_READ | libc::PROT_WRITE } else { libc::PROT_NONE };
+            if unsafe { libc::mprotect(start, len, prot) } != 0 {
+                return self.current;
+            }
+            if new < old {
+                unsafe { libc::madvise(start, len, libc::MADV_DONTNEED) };
+            }
+        }
+        self.current = addr;
+        addr
+    }
+}
+
+impl Drop for GuestHeap {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.base as *mut libc::c_void, HEAP_SIZE) };
+    }
+}
+
+#[test]
+fn guest_brk_grow_shrink_and_bounds() {
+    let mut heap = GuestHeap::new();
+    let base = heap.brk(0);
+    assert_eq!(heap.brk(base + PAGE + 1), base + PAGE + 1);
+    unsafe { ((base + PAGE) as *mut u8).write(0xab) };
+    assert_eq!(heap.brk(base + 1), base + 1);
+    assert_eq!(heap.brk(base + PAGE + 1), base + PAGE + 1);
+    assert_eq!(unsafe { ((base + PAGE) as *const u8).read() }, 0);
+    assert_eq!(heap.brk(base - 1), base + PAGE + 1);
+    assert_eq!(heap.brk(base + HEAP_SIZE as u64 + 1), base + PAGE + 1);
+    assert_eq!(heap.brk(u64::MAX), base + PAGE + 1);
 }
 
 /// If `KEMU_SYSROOT` is set and `pathptr` is an absolute path whose
@@ -122,7 +184,6 @@ mod hx {
     pub const MMAP: i64 = 9;
     pub const MPROTECT: i64 = 10;
     pub const MUNMAP: i64 = 11;
-    pub const BRK: i64 = 12;
     pub const RT_SIGACTION: i64 = 13;
     pub const RT_SIGPROCMASK: i64 = 14;
     pub const IOCTL: i64 = 16;
@@ -214,7 +275,7 @@ pub fn dispatch(cpu: &mut CpuState, trace: bool) -> Option<i32> {
         nr::READLINKAT => { let mut a = a; a[1] = rewrite_path(a[1]); unsafe { host(hx::READLINKAT, a) } }
         nr::FACCESSAT => { let mut a = a; a[1] = rewrite_path(a[1]); unsafe { host(hx::FACCESSAT, a) } }
         nr::FACCESSAT2 => { let mut a = a; a[1] = rewrite_path(a[1]); unsafe { host(hx::FACCESSAT2, a) } }
-        nr::BRK => unsafe { host(hx::BRK, a) },
+        nr::BRK => HEAP.with(|h| h.borrow_mut().brk(a[0])) as i64,
         nr::MMAP => unsafe { host(hx::MMAP, a) },
         nr::MUNMAP => unsafe { host(hx::MUNMAP, a) },
         nr::MPROTECT => unsafe { host(hx::MPROTECT, a) },

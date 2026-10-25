@@ -690,7 +690,7 @@ void kemu_enter_op(struct kemu_thread *kt)
 	kt->flags |= KEMU_TF_KSTATE;
 }
 
-static void kemu_host_regs(struct pt_regs *regs, struct kemu_host_regs *h)
+static u32 kemu_host_regs(struct pt_regs *regs, struct kemu_host_regs *h)
 {
 	h->gpr[0] = kemu_reg(regs, ax);
 	h->gpr[1] = kemu_reg(regs, cx);
@@ -710,9 +710,10 @@ static void kemu_host_regs(struct pt_regs *regs, struct kemu_host_regs *h)
 	h->gpr[15] = kemu_reg(regs, r15);
 	h->rflags = kemu_reg(regs, flags);
 #if KEMU_ARCH_VECTOR_CACHE
-	kemu_arch_read_xmm(h->xmm);
+	return kemu_arch_read_fpu(h->xmm);
 #else
 	memset(h->xmm, 0, sizeof(h->xmm));
+	return 0;
 #endif
 }
 
@@ -739,14 +740,20 @@ void kemu_materialize(struct pt_regs *regs)
 	unsigned long ip = kemu_reg(regs, ip), off, c;
 	u8 *blk;
 	size_t len;
+	u32 mxcsr;
 
 	if (kt->flags & KEMU_TF_KSTATE)
 		goto out;
-	kemu_host_regs(regs, &h);
+	mxcsr = kemu_host_regs(regs, &h);
 	kt->shadow = *cpu;
 	if (ip >= km->code_base && ip < km->code_base + KEMU_STUBS_SIZE) {
-		kemu_rs_recover_stub(kemu_stub_info(km, ip - km->code_base),
-				     &h, &kt->shadow);
+		u32 info = kemu_stub_info(km, ip - km->code_base);
+
+		kemu_rs_recover_stub(info, &h, &kt->shadow);
+		/* During reload (or after rt_sigreturn), live MXCSR can still
+		 * describe the previous state. Use the page when authoritative. */
+		if (info == KEMU_STUB_PAGE_STATE || info == KEMU_STUB_PAGE_STATE_SVC)
+			mxcsr = cpu->scratch[KEMU_MXCSR_SLOT];
 	} else if (ip >= km->code_base && ip < km->code_base + KEMU_CODE_SIZE) {
 		u64 retired;
 
@@ -774,7 +781,11 @@ void kemu_materialize(struct pt_regs *regs)
 	} else {
 		/* Interpreter mode keeps the page authoritative at all times. */
 		kt->shadow.nzcv = kemu_rs_nzcv_from_image(kt->shadow.flags_x86);
+		mxcsr = cpu->scratch[KEMU_MXCSR_SLOT];
 	}
+	/* Stubs may not have spilled MXCSR yet. Preserve live cumulative
+	 * exceptions before exit_to_user rebuilds MXCSR from FPSR. */
+	kt->shadow.fpsr = kemu_rs_fpsr_merge(kt->shadow.fpsr, mxcsr);
 	*cpu = kt->shadow;
 	kt->flags |= KEMU_TF_KSTATE;
 out:

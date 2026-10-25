@@ -48,6 +48,10 @@ pub(super) fn choose(insns: &[Insn]) -> [u8; meta::VECTOR_REGS] {
                 for j in 0..n { add(rt + j); }
             }
             Insn::SimdLdSt { rt, replicate: true, .. } => add(rt),
+            Insn::SimdTbl { rd, rn, rm, len, .. } => {
+                add(rd); add(rm);
+                for j in 0..=len as u32 { add(rn + j); }
+            }
             _ => {}
         }
     }

@@ -9,9 +9,9 @@
 #include <asm/prctl.h>
 #include <asm/proto.h>
 
-/* Opt in only when asynchronous recovery can capture user XMM0..7. */
+/* Capture user XMM0..7 and return MXCSR for asynchronous recovery. */
 #define KEMU_ARCH_VECTOR_CACHE 1
-void kemu_arch_read_xmm(u64 xmm[8][2]);
+u32 kemu_arch_read_fpu(u64 xmm[8][2]);
 
 #define kemu_reg(regs, name) ((regs)->name)
 
