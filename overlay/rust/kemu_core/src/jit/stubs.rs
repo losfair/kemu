@@ -167,13 +167,16 @@ pub fn gen_stubs(out: &mut [u8], mode: ExitMode, table_base: u64, table_mask8: u
     o.push(s2, a.pos, STUB_PINNED_LIVE);
     let _ = s;
 
-    // miss: %rax = guest PC (already stored), pinned live.
+    // Once spill_all completes, recover from the page even before the
+    // host exit. A runtime can restart a syscall at its instruction with
+    // RCX/R11 already clobbered; those are no longer valid pinned values.
+    // miss: %rax = guest PC (already stored), pinned live until spilled.
     a.align(16);
     o.miss = a.pos as u32;
     let s = a.pos;
     spill_all(&mut a);
-    exit(&mut a, mode, OP_TRANSLATE, slot);
     o.push(s, a.pos, STUB_PINNED_LIVE);
+    exit(&mut a, mode, OP_TRANSLATE, slot);
     reload_all(&mut a);
     a.jmp_rm(Rm::R(RAX));
 
@@ -186,8 +189,8 @@ pub fn gen_stubs(out: &mut [u8], mode: ExitMode, table_base: u64, table_mask8: u
     let s = a.pos;
     a.store(Sz::Q, Mem::gs(OFF_EXIT_INFO), RDX);
     spill_all(&mut a);
-    exit(&mut a, mode, OP_CHAIN, slot);
     o.push(s, a.pos, STUB_PINNED_LIVE);
+    exit(&mut a, mode, OP_CHAIN, slot);
     reload_all(&mut a);
     a.jmp_rm(Rm::R(RAX));
 
@@ -196,8 +199,8 @@ pub fn gen_stubs(out: &mut [u8], mode: ExitMode, table_base: u64, table_mask8: u
     o.helper = a.pos as u32;
     let s = a.pos;
     spill_all(&mut a);
-    exit(&mut a, mode, OP_HELPER, slot);
     o.push(s, a.pos, STUB_PINNED_LIVE);
+    exit(&mut a, mode, OP_HELPER, slot);
     reload_all(&mut a);
     a.ret();
 
@@ -206,8 +209,10 @@ pub fn gen_stubs(out: &mut [u8], mode: ExitMode, table_base: u64, table_mask8: u
     o.svc = a.pos as u32;
     let s = a.pos;
     spill_all(&mut a);
-    exit(&mut a, mode, OP_SVC, slot);
     o.push(s, a.pos, STUB_PINNED_LIVE_SVC);
+    let s = a.pos;
+    exit(&mut a, mode, OP_SVC, slot);
+    o.push(s, a.pos, STUB_PAGE_STATE_SVC);
     reload_all(&mut a);
     a.ret();
 
@@ -240,6 +245,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recover_spilled_stubs_with_clobbered_syscall_registers() {
+        let mut page = [0u8; 4096];
+        let o = gen_stubs(&mut page, ExitMode::Syscall, 0x7000_1000_0000, 0xfff8).unwrap();
+        for (start, end, svc) in [
+            (o.miss, o.chain, false),
+            (o.chain, o.helper, false),
+            (o.helper, o.svc, false),
+            (o.svc, o.interp_svc, true),
+        ] {
+            let bytes = &page[start as usize..end as usize];
+            let syscall = start + bytes.windows(2).position(|b| b == [0x0f, 0x05]).unwrap() as u32;
+            let mut saved = CpuState::new();
+            for (r, v) in saved.x.iter_mut().enumerate() { *v = 0x1000 + r as u64; }
+            saved.sp = 0x8000;
+            saved.pc = 0x4008c8;
+            saved.flags_x86 = image_from_nzcv(0xa000_0000);
+            let mut host = HostRegs::default();
+            host.gpr.fill(0xdead_beef);
+            // A restarted host syscall can expose the syscall return
+            // address and flags in the registers that pin X1 and X5.
+            host.gpr[RCX as usize] = 0x4000_0000 + syscall as u64 + 2;
+            host.gpr[R11 as usize] = 0x207;
+            for off in syscall - 5..end {
+                let mut st = saved;
+                recover(o.info(off), &host, &mut st);
+                assert_eq!(st.x, saved.x, "GPRs at stub offset {off:#x}");
+                assert_eq!(st.sp, saved.sp, "SP at stub offset {off:#x}");
+                assert_eq!(st.pc, saved.pc - if svc && off < syscall + 2 { 4 } else { 0 });
+                assert_eq!(st.nzcv, 0xa000_0000);
+            }
+        }
+    }
+
+    #[test]
     fn recover_svc_entry_and_return_boundaries() {
         let mut page = [0u8; 4096];
         let o = gen_stubs(&mut page, ExitMode::Syscall, 0x7000_1000_0000, 0xfff8).unwrap();
@@ -249,24 +288,32 @@ mod tests {
             let mut st = CpuState::new();
             st.pc = pc;
             st.x[0] = 0x1234;
+            st.x[1] = 0x1111;
+            st.x[5] = 0x5555;
             st.v[0] = [0x5678, 0x9abc];
             st.flags_x86 = image_from_nzcv(0xa000_0000);
             st
         };
-        for (start, end, pending, pinned) in [
-            (o.svc, o.interp_svc, STUB_PINNED_LIVE_SVC, true),
-            (o.interp_svc, o.step, STUB_PAGE_STATE_SVC, false),
+        for (start, end, pinned) in [
+            (o.svc, o.interp_svc, true),
+            (o.interp_svc, o.step, false),
         ] {
             let bytes = &page[start as usize..end as usize];
             let syscall = start + bytes.windows(2).position(|b| b == [0x0f, 0x05]).unwrap() as u32;
             // Include the syscall instruction itself: an interrupt at
             // its IP is still before the guest syscall takes effect.
             for off in start..syscall + 2 {
+                // exit() starts with a five-byte mov eax,OP_SVC; all
+                // guest registers have been spilled before that point.
+                let live = pinned && off < syscall - 5;
+                let pending = if live { STUB_PINNED_LIVE_SVC } else { STUB_PAGE_STATE_SVC };
                 assert_eq!(o.info(off), pending, "at {off:#x}");
                 let mut st = state(0x6404_0008);
                 recover(o.info(off), &host, &mut st);
                 assert_eq!(st.pc, 0x6404_0004, "pending SVC at {off:#x}");
-                assert_eq!(st.x[0], if pinned { 0xdead_beef } else { 0x1234 });
+                assert_eq!(st.x[0], if live { 0xdead_beef } else { 0x1234 });
+                assert_eq!(st.x[1], if live { 0xdead_beef } else { 0x1111 });
+                assert_eq!(st.x[5], if live { 0xdead_beef } else { 0x5555 });
                 assert_eq!(st.v[0], [0x5678, 0x9abc]);
                 assert_eq!(st.nzcv, 0xa000_0000);
             }

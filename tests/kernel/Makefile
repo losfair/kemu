@@ -3,12 +3,12 @@
 CC := aarch64-linux-gnu-gcc
 CFLAGS := -O2 -Wall -Wno-unused-result
 
-STATIC := abi auxv cat crash hello-static tbi vector-state
+STATIC := abi auxv cat crash hello-static tbi vector-state syscall-state
 DYN := hello-dyn mtstress
 
 all: $(STATIC) $(DYN) ../bench/intbench.arm64
 
-abi: abi.c
+abi syscall-state: %: %.c
 	$(CC) $(CFLAGS) -static -pthread -o $@ $<
 auxv cat crash tbi vector-state: %: %.c
 	$(CC) $(CFLAGS) -static -o $@ $<
