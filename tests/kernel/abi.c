@@ -227,6 +227,9 @@ static void test_epoll(void)
 	CHECK("epoll", n == 1 && out[0].events == EPOLLIN && out[0].data.u64 == 0x1122334455667788ULL,
 	      "n %d events %x data %llx", n, n > 0 ? out[0].events : 0,
 	      n > 0 ? (unsigned long long)out[0].data.u64 : 0ULL);
+	/* io_uring is not offered to guests (it reads native structs). */
+	long r = syscall(425 /* io_uring_setup */, 8, calloc(1, 128));
+	CHECK("io_uring disabled", r == -1 && errno == ENOSYS, "r %ld errno %d", r, errno);
 }
 
 static void test_ptrace(void)

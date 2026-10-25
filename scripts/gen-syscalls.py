@@ -15,6 +15,11 @@ overrides = {
     "fcntl", "pipe2", "open_by_handle_at", "fanotify_init",
 }
 
+# Not offered to guests (ENOSYS; programs fall back): io_uring reads and
+# writes native structs (e.g. struct epoll_event for IORING_OP_EPOLL_CTL)
+# behind kemu's back, so the guest ABI can't be guaranteed.
+disabled = {"io_uring_setup", "io_uring_enter", "io_uring_register"}
+
 syms = set()
 for line in open(sysmap):
     parts = line.split()
@@ -44,6 +49,9 @@ for nr, name, entry in rows:
         decls.append(f"long {fn}(struct pt_regs *regs);")
     elif entry is None or entry == "sys_ni_syscall":
         continue
+    elif name in disabled:
+        missing.append((nr, name, "disabled"))
+        continue
     elif f"__x64_{entry}" in syms:
         fn = f"__x64_{entry}"
         decls.append(f"asmlinkage long {fn}(const struct pt_regs *regs);")
@@ -58,7 +66,7 @@ lines += ["", f"#define KEMU_NR_SYSCALLS {maxnr + 1}", "",
           "{", "\tswitch (nr) {"]
 lines += cases
 lines += ["\tdefault: return -ENOSYS;", "\t}", "}", ""]
-lines += ["/* arm64 syscalls without an x86_64 entry point (ENOSYS): */"]
+lines += ["/* arm64 syscalls without an x86_64 entry point, or disabled (ENOSYS): */"]
 lines += [f"/*   {nr} {name} ({entry}) */" for nr, name, entry in missing]
 open(out, "w").write("\n".join(lines) + "\n")
 print(f"{len(cases)} syscalls, {len(missing)} missing:", " ".join(n for _, n, _ in missing))

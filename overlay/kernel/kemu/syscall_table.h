@@ -103,9 +103,6 @@ asmlinkage long __x64_sys_io_getevents(const struct pt_regs *regs);
 asmlinkage long __x64_sys_io_pgetevents(const struct pt_regs *regs);
 asmlinkage long __x64_sys_io_setup(const struct pt_regs *regs);
 asmlinkage long __x64_sys_io_submit(const struct pt_regs *regs);
-asmlinkage long __x64_sys_io_uring_enter(const struct pt_regs *regs);
-asmlinkage long __x64_sys_io_uring_register(const struct pt_regs *regs);
-asmlinkage long __x64_sys_io_uring_setup(const struct pt_regs *regs);
 asmlinkage long __x64_sys_ioctl(const struct pt_regs *regs);
 asmlinkage long __x64_sys_ioprio_get(const struct pt_regs *regs);
 asmlinkage long __x64_sys_ioprio_set(const struct pt_regs *regs);
@@ -608,9 +605,6 @@ static long kemu_syscall_table(struct pt_regs *regs, unsigned long nr)
 	case 293: return __x64_sys_rseq(regs);	/* rseq */
 	case 294: return __x64_sys_kexec_file_load(regs);	/* kexec_file_load */
 	case 424: return __x64_sys_pidfd_send_signal(regs);	/* pidfd_send_signal */
-	case 425: return __x64_sys_io_uring_setup(regs);	/* io_uring_setup */
-	case 426: return __x64_sys_io_uring_enter(regs);	/* io_uring_enter */
-	case 427: return __x64_sys_io_uring_register(regs);	/* io_uring_register */
 	case 428: return __x64_sys_open_tree(regs);	/* open_tree */
 	case 429: return __x64_sys_move_mount(regs);	/* move_mount */
 	case 430: return __x64_sys_fsopen(regs);	/* fsopen */
@@ -657,4 +651,7 @@ static long kemu_syscall_table(struct pt_regs *regs, unsigned long nr)
 	}
 }
 
-/* arm64 syscalls without an x86_64 entry point (ENOSYS): */
+/* arm64 syscalls without an x86_64 entry point, or disabled (ENOSYS): */
+/*   425 io_uring_setup (disabled) */
+/*   426 io_uring_enter (disabled) */
+/*   427 io_uring_register (disabled) */
