@@ -730,17 +730,8 @@ void kemu_materialize(struct pt_regs *regs)
 	kemu_host_regs(regs, &h);
 	kt->shadow = *cpu;
 	if (ip >= km->code_base && ip < km->code_base + KEMU_STUBS_SIZE) {
-		switch (kemu_stub_info(km, ip - km->code_base)) {
-		case KEMU_STUB_PINNED_LIVE_PC_RAX:
-			kt->shadow.pc = kemu_reg(regs, ax);
-			fallthrough;
-		case KEMU_STUB_PINNED_LIVE:
-			kemu_rs_pinned_from_host(&h, &kt->shadow);
-			break;
-		default:
-			break;
-		}
-		kt->shadow.nzcv = kemu_rs_nzcv_from_image(kt->shadow.flags_x86);
+		kemu_rs_recover_stub(kemu_stub_info(km, ip - km->code_base),
+				     &h, &kt->shadow);
 	} else if (ip >= km->code_base && ip < km->code_base + KEMU_CODE_SIZE) {
 		off = ip - km->code_base;
 		blk = kemu_find_block(km, off, &len);

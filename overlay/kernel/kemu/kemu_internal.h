@@ -93,8 +93,6 @@ struct kemu_stubs {
 };
 
 #define KEMU_STUB_PAGE_STATE		0
-#define KEMU_STUB_PINNED_LIVE		1
-#define KEMU_STUB_PINNED_LIVE_PC_RAX	2
 
 struct kemu_mm {
 	struct mutex lock;		/* translation, chunks, block map */
@@ -336,7 +334,7 @@ int kemu_xc_init(void);
 extern atomic_long_t kemu_xc_hits, kemu_xc_misses, kemu_xc_stale;
 bool kemu_rs_recover(const u8 *blk, size_t len, u32 host_off,
 		     const struct kemu_host_regs *h, struct kemu_cpu *cpu);
-void kemu_rs_pinned_from_host(const struct kemu_host_regs *h, struct kemu_cpu *cpu);
+void kemu_rs_recover_stub(u32 info, const struct kemu_host_regs *h, struct kemu_cpu *cpu);
 size_t kemu_rs_block_info(const u8 *blk, size_t len, u64 *guest_pc, u32 *main_off);
 bool kemu_rs_find_exit(const u8 *blk, size_t len, u32 site_off, u64 *target,
 		       u32 *kind);
