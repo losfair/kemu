@@ -27,6 +27,8 @@ emit kemu-x86-fault         arch/x86/mm/fault.c arch/x86/kernel/traps.c
 emit kemu-mm                mm/vma.c mm/mprotect.c mm/mremap.c mm/mmap.c mm/memory.c
 emit kemu-proc              fs/proc/ arch/x86/kernel/cpu/proc.c fs/coredump.c
 emit kemu-ptrace            kernel/ptrace.c arch/x86/kernel/ptrace.c arch/x86/kernel/step.c
+emit kemu-seccomp           kernel/seccomp.c
+emit kemu-ipc               ipc/sem.c
 emit kemu-rseq              kernel/rseq.c
 emit kemu-perf              kernel/events/ arch/x86/events/
 # Anything else touched must be listed above.

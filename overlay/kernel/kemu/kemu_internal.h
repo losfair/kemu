@@ -251,6 +251,7 @@ long kemu_sys_epoll_pwait(struct pt_regs *regs);
 long kemu_sys_epoll_pwait2(struct pt_regs *regs);
 long kemu_sys_uname(struct pt_regs *regs);
 long kemu_sys_clone(struct pt_regs *regs);
+long kemu_sys_semctl(struct pt_regs *regs);
 
 /* env.c: host services for the Rust core. */
 int kemu_c_read(u64 addr, void *buf, size_t len);

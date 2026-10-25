@@ -61,6 +61,7 @@ static long kemu_dispatch(struct pt_regs *regs, long nr)
 void kemu_svc(struct pt_regs *regs)
 {
 	struct kemu_thread *kt = current->kemu;
+	struct mm_struct *old_mm = current->mm;
 	struct kemu_cpu *cpu = kt->cpu;
 	u64 next_pc;
 	long nr;
@@ -75,16 +76,35 @@ void kemu_svc(struct pt_regs *regs)
 	kemu_store_syscall_args(regs, cpu);
 	if (nr != -1)
 		kemu_reg(regs, ax) = kemu_dispatch(regs, nr);
+
+	/*
+	 * A successful execve frees this thread's kemu state and its state
+	 * page (kemu_exec_release + the old mm's teardown). The new kemu_thread
+	 * can reuse the same slab object, so compare the mm too before touching
+	 * anything behind @kt or @cpu.
+	 */
+	if (current->kemu != kt || current->mm != old_mm)
+		return;
+
 	if (kemu_debug >= 2)
 		pr_info("kemu: %s[%d] sys %ld(%lx, %lx, %lx, %lx) = %lx pc %llx\n",
 			current->comm, task_pid_nr(current), nr, kemu_reg(regs, di), kemu_reg(regs, si),
 			kemu_reg(regs, dx), kemu_reg(regs, r10), kemu_reg(regs, ax), cpu->pc);
 
-	/* exec may have replaced (or dropped) the kemu state. */
-	if (current->kemu != kt)
-		return;
-	if (kt->flags & KEMU_TF_IN_SVC)
-		WRITE_ONCE(kt->cpu->x[0], kemu_reg(regs, ax));
+	/*
+	 * Guest x0 gets the return value, except when seccomp/syscall-user-
+	 * dispatch rolled the syscall back (RET_TRAP, RET_KILL). x86 rollback
+	 * writes orig_ax (here the arm64 syscall nr) into ax, but arm64 restores
+	 * orig_x0; a SIGSYS broker (Chromium, Firefox) reads orig_x0 from the
+	 * frame. A rollback is the skip (nr == -1) whose ax equals orig_ax; an
+	 * errno skip (RET_ERRNO) has ax = -errno and is written normally.
+	 */
+	if (kt->flags & KEMU_TF_IN_SVC) {
+		if (nr == -1 && kemu_reg(regs, ax) == kemu_reg(regs, orig_ax))
+			WRITE_ONCE(kt->cpu->x[0], kt->orig_x0);
+		else
+			WRITE_ONCE(kt->cpu->x[0], kemu_reg(regs, ax));
+	}
 	/* The guest PC changed (e.g. rt_sigreturn): resume at dispatch. */
 	if (READ_ONCE(cpu->pc) != next_pc)
 		kemu_redirect(kt);

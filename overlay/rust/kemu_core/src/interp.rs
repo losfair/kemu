@@ -14,7 +14,9 @@ use crate::sysregs;
 /// Reason the interpreter returned to its caller.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Exit {
-    /// Instruction budget exhausted. `pc` points at the next instruction.
+    /// Instruction budget exhausted. `pc` points at the next instruction,
+    /// which may be one that gave up before completing (a contended
+    /// atomic) and must simply be executed again.
     Budget,
     /// `SVC` executed. `pc` already advanced past the `svc`.
     Svc,

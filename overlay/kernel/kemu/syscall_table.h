@@ -207,7 +207,6 @@ asmlinkage long __x64_sys_renameat(const struct pt_regs *regs);
 asmlinkage long __x64_sys_renameat2(const struct pt_regs *regs);
 asmlinkage long __x64_sys_request_key(const struct pt_regs *regs);
 asmlinkage long __x64_sys_restart_syscall(const struct pt_regs *regs);
-asmlinkage long __x64_sys_rseq(const struct pt_regs *regs);
 asmlinkage long __x64_sys_rt_sigaction(const struct pt_regs *regs);
 asmlinkage long __x64_sys_rt_sigpending(const struct pt_regs *regs);
 asmlinkage long __x64_sys_rt_sigprocmask(const struct pt_regs *regs);
@@ -228,7 +227,6 @@ asmlinkage long __x64_sys_sched_setparam(const struct pt_regs *regs);
 asmlinkage long __x64_sys_sched_setscheduler(const struct pt_regs *regs);
 asmlinkage long __x64_sys_sched_yield(const struct pt_regs *regs);
 asmlinkage long __x64_sys_seccomp(const struct pt_regs *regs);
-asmlinkage long __x64_sys_semctl(const struct pt_regs *regs);
 asmlinkage long __x64_sys_semget(const struct pt_regs *regs);
 asmlinkage long __x64_sys_semop(const struct pt_regs *regs);
 asmlinkage long __x64_sys_semtimedop(const struct pt_regs *regs);
@@ -320,6 +318,7 @@ long kemu_sys_openat(struct pt_regs *regs);
 long kemu_sys_openat2(struct pt_regs *regs);
 long kemu_sys_pipe2(struct pt_regs *regs);
 long kemu_sys_rt_sigreturn(struct pt_regs *regs);
+long kemu_sys_semctl(struct pt_regs *regs);
 long kemu_sys_uname(struct pt_regs *regs);
 
 #define KEMU_NR_SYSCALLS 470
@@ -516,7 +515,7 @@ static long kemu_syscall_table(struct pt_regs *regs, unsigned long nr)
 	case 188: return __x64_sys_msgrcv(regs);	/* msgrcv */
 	case 189: return __x64_sys_msgsnd(regs);	/* msgsnd */
 	case 190: return __x64_sys_semget(regs);	/* semget */
-	case 191: return __x64_sys_semctl(regs);	/* semctl */
+	case 191: return kemu_sys_semctl(regs);	/* semctl */
 	case 192: return __x64_sys_semtimedop(regs);	/* semtimedop */
 	case 193: return __x64_sys_semop(regs);	/* semop */
 	case 194: return __x64_sys_shmget(regs);	/* shmget */
@@ -602,7 +601,6 @@ static long kemu_syscall_table(struct pt_regs *regs, unsigned long nr)
 	case 290: return __x64_sys_pkey_free(regs);	/* pkey_free */
 	case 291: return __x64_sys_statx(regs);	/* statx */
 	case 292: return __x64_sys_io_pgetevents(regs);	/* io_pgetevents */
-	case 293: return __x64_sys_rseq(regs);	/* rseq */
 	case 294: return __x64_sys_kexec_file_load(regs);	/* kexec_file_load */
 	case 424: return __x64_sys_pidfd_send_signal(regs);	/* pidfd_send_signal */
 	case 428: return __x64_sys_open_tree(regs);	/* open_tree */
@@ -652,6 +650,7 @@ static long kemu_syscall_table(struct pt_regs *regs, unsigned long nr)
 }
 
 /* arm64 syscalls without an x86_64 entry point, or disabled (ENOSYS): */
+/*   293 rseq (disabled) */
 /*   425 io_uring_setup (disabled) */
 /*   426 io_uring_enter (disabled) */
 /*   427 io_uring_register (disabled) */

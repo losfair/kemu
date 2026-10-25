@@ -1,5 +1,5 @@
 diff --git a/arch/x86/include/asm/syscall.h b/arch/x86/include/asm/syscall.h
-index c10dbb74c..6df5e99fa 100644
+index c10dbb74c..e3794ee7d 100644
 --- a/arch/x86/include/asm/syscall.h
 +++ b/arch/x86/include/asm/syscall.h
 @@ -11,6 +11,7 @@
@@ -10,7 +10,7 @@ index c10dbb74c..6df5e99fa 100644
  #include <linux/sched.h>
  #include <linux/err.h>
  #include <asm/thread_info.h>	/* for TS_COMPAT */
-@@ -111,6 +112,10 @@ static inline void syscall_set_arguments(struct task_struct *task,
+@@ -166,6 +167,10 @@ static inline void syscall_set_arguments(struct task_struct *task,
  
  static inline int syscall_get_arch(struct task_struct *task)
  {
@@ -18,6 +18,6 @@ index c10dbb74c..6df5e99fa 100644
 +	if (task_is_kemu(task))
 +		return AUDIT_ARCH_AARCH64;
 +#endif
- 	return AUDIT_ARCH_I386;
- }
- 
+ 	/* x32 tasks should be considered AUDIT_ARCH_X86_64. */
+ 	return (IS_ENABLED(CONFIG_IA32_EMULATION) &&
+ 		task->thread_info.status & TS_COMPAT)

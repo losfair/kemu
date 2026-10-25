@@ -1,0 +1,52 @@
+diff --git a/kernel/seccomp.c b/kernel/seccomp.c
+index 25f62867a..519ab3e3f 100644
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@ -18,6 +18,7 @@
+ #include <linux/refcount.h>
+ #include <linux/audit.h>
+ #include <linux/compat.h>
++#include <linux/kemu.h>
+ #include <linux/coredump.h>
+ #include <linux/kmemleak.h>
+ #include <linux/nospec.h>
+@@ -370,6 +371,16 @@ static inline bool seccomp_cache_check_allow(const struct seccomp_filter *sfilte
+ 	int syscall_nr = sd->nr;
+ 	const struct action_cache *cache = &sfilter->cache;
+ 
++#ifdef CONFIG_KEMU
++	/*
++	 * kemu tasks present arm64 syscall numbers under AUDIT_ARCH_AARCH64.
++	 * The cache bitmaps are built from the x86 (native/compat) tables, so
++	 * they must never be consulted: run the full filter instead.
++	 */
++	if (task_is_kemu(current))
++		return false;
++#endif
++
+ #ifndef SECCOMP_ARCH_COMPAT
+ 	/* A native-only architecture doesn't need to check sd->arch. */
+ 	return seccomp_cache_check_allow_bitmap(cache->allow_native,
+@@ -1064,12 +1075,22 @@ static const int mode1_syscalls[] = {
+ 	-1, /* negative terminated */
+ };
+ 
++#ifdef CONFIG_KEMU
++/* arm64 read(63)/write(64)/exit(93)/rt_sigreturn(139), negative terminated. */
++static const int kemu_mode1_syscalls[] = { 63, 64, 93, 139, -1 };
++#endif
++
+ static void __secure_computing_strict(int this_syscall)
+ {
+ 	const int *allowed_syscalls = mode1_syscalls;
+ #ifdef CONFIG_COMPAT
+ 	if (in_compat_syscall())
+ 		allowed_syscalls = get_compat_mode1_syscalls();
++#endif
++#ifdef CONFIG_KEMU
++	/* kemu tasks are never compat, so this does not collide with the above. */
++	if (task_is_kemu(current))
++		allowed_syscalls = kemu_mode1_syscalls;
+ #endif
+ 	do {
+ 		if (*allowed_syscalls == this_syscall)

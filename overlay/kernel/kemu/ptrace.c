@@ -16,12 +16,21 @@
 
 #define KEMU_PSR_NZCV	0xf0000000ULL
 
+/*
+ * User workers (e.g. vhost) in a kemu thread group have no kemu state but
+ * are still visited with the group's regset view, e.g. by core dumps.
+ * Their arm64 registers read as zero and can't be written.
+ */
+
 /* arm64 user_pt_regs: x0-x30, sp, pc, pstate. */
 static int kemu_gpr_get(struct task_struct *target, const struct user_regset *regset,
 			struct membuf to)
 {
-	struct kemu_cpu *cpu = target->kemu->cpu;
+	struct kemu_cpu *cpu;
 
+	if (!target->kemu)
+		return membuf_zero(&to, to.left);
+	cpu = target->kemu->cpu;
 	membuf_write(&to, cpu->x, sizeof(cpu->x));
 	membuf_store(&to, cpu->sp);
 	membuf_store(&to, cpu->pc);
@@ -52,6 +61,8 @@ static int kemu_gpr_set(struct task_struct *target, const struct user_regset *re
 	u64 r[34];
 	int err;
 
+	if (!target->kemu)
+		return -EIO;
 	memcpy(r, kt->cpu->x, sizeof(kt->cpu->x));
 	r[31] = kt->cpu->sp;
 	r[32] = kt->cpu->pc;
@@ -75,9 +86,12 @@ static int kemu_gpr_set(struct task_struct *target, const struct user_regset *re
 static int kemu_fpr_get(struct task_struct *target, const struct user_regset *regset,
 			struct membuf to)
 {
-	struct kemu_cpu *cpu = target->kemu->cpu;
+	struct kemu_cpu *cpu;
 	u32 rsv[2] = { 0, 0 };
 
+	if (!target->kemu)
+		return membuf_zero(&to, to.left);
+	cpu = target->kemu->cpu;
 	membuf_write(&to, cpu->v, sizeof(cpu->v));
 	membuf_store(&to, cpu->fpsr);
 	membuf_store(&to, cpu->fpcr);
@@ -88,13 +102,16 @@ static int kemu_fpr_set(struct task_struct *target, const struct user_regset *re
 			unsigned int pos, unsigned int count, const void *kbuf,
 			const void __user *ubuf)
 {
-	struct kemu_cpu *cpu = target->kemu->cpu;
+	struct kemu_cpu *cpu;
 	struct {
 		u64 v[32][2];
 		u32 fpsr, fpcr, rsv[2];
 	} f;
 	int err;
 
+	if (!target->kemu)
+		return -EIO;
+	cpu = target->kemu->cpu;
 	memcpy(f.v, cpu->v, sizeof(f.v));
 	f.fpsr = cpu->fpsr;
 	f.fpcr = cpu->fpcr;
@@ -111,6 +128,8 @@ static int kemu_fpr_set(struct task_struct *target, const struct user_regset *re
 static int kemu_tls_get(struct task_struct *target, const struct user_regset *regset,
 			struct membuf to)
 {
+	if (!target->kemu)
+		return membuf_zero(&to, to.left);
 	return membuf_store(&to, target->kemu->cpu->tpidr);
 }
 
@@ -118,9 +137,13 @@ static int kemu_tls_set(struct task_struct *target, const struct user_regset *re
 			unsigned int pos, unsigned int count, const void *kbuf,
 			const void __user *ubuf)
 {
-	u64 tls = target->kemu->cpu->tpidr;
-	int err = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &tls, 0, sizeof(tls));
+	u64 tls;
+	int err;
 
+	if (!target->kemu)
+		return -EIO;
+	tls = target->kemu->cpu->tpidr;
+	err = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &tls, 0, sizeof(tls));
 	if (!err)
 		target->kemu->cpu->tpidr = tls;
 	return err;
@@ -129,9 +152,12 @@ static int kemu_tls_set(struct task_struct *target, const struct user_regset *re
 static int kemu_syscall_get(struct task_struct *target, const struct user_regset *regset,
 			    struct membuf to)
 {
-	int nr = (target->kemu->flags & KEMU_TF_IN_SVC) ?
-		 (int)kemu_reg(task_pt_regs(target), orig_ax) : -1;
+	int nr;
 
+	if (!target->kemu)
+		return membuf_zero(&to, to.left);
+	nr = (target->kemu->flags & KEMU_TF_IN_SVC) ?
+	     (int)kemu_reg(task_pt_regs(target), orig_ax) : -1;
 	return membuf_store(&to, nr);
 }
 
@@ -139,10 +165,13 @@ static int kemu_syscall_set(struct task_struct *target, const struct user_regset
 			    unsigned int pos, unsigned int count, const void *kbuf,
 			    const void __user *ubuf)
 {
-	int nr = (target->kemu->flags & KEMU_TF_IN_SVC) ?
-		 (int)kemu_reg(task_pt_regs(target), orig_ax) : -1;
-	int err = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &nr, 0, sizeof(nr));
+	int nr, err;
 
+	if (!target->kemu)
+		return -EIO;
+	nr = (target->kemu->flags & KEMU_TF_IN_SVC) ?
+	     (int)kemu_reg(task_pt_regs(target), orig_ax) : -1;
+	err = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &nr, 0, sizeof(nr));
 	if (err)
 		return err;
 	if (target->kemu->flags & KEMU_TF_IN_SVC)
@@ -222,6 +251,8 @@ void kemu_user_step(struct task_struct *child, bool on)
 {
 	struct kemu_thread *kt = child->kemu;
 
+	if (!kt)
+		return;
 	if (on)
 		kt->flags |= KEMU_TF_STEP;
 	else
