@@ -468,7 +468,11 @@ static int kemu_chunk_new(struct kemu_mm *km)
 			kemu_jit_flush(km);
 		return -EAGAIN;
 	}
-	mem = __vmalloc(KEMU_CHUNK_SIZE, GFP_KERNEL_ACCOUNT);
+	/*
+	 * Zeroed: kemu_code_fault() maps every page of a live chunk, including
+	 * the unused tail and the padding between blocks.
+	 */
+	mem = __vmalloc(KEMU_CHUNK_SIZE, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
 	bm = kvzalloc(BITS_TO_LONGS(KEMU_BLOCKMAP_BITS) * sizeof(long),
 		      GFP_KERNEL_ACCOUNT);
 	if (!mem || !bm) {
@@ -733,13 +737,23 @@ void kemu_materialize(struct pt_regs *regs)
 		kemu_rs_recover_stub(kemu_stub_info(km, ip - km->code_base),
 				     &h, &kt->shadow);
 	} else if (ip >= km->code_base && ip < km->code_base + KEMU_CODE_SIZE) {
+		u64 retired;
+
 		off = ip - km->code_base;
-		blk = kemu_find_block(km, off, &len);
+		c = off >> KEMU_CHUNK_SHIFT;
+		/*
+		 * A chunk retired in an epoch this thread has already
+		 * acknowledged is not pinned by it (kemu_min_epoch_seen), so
+		 * another thread's kemu_reclaim() may free it under us. Correct
+		 * code never runs there: acknowledging an epoch resets the host
+		 * return stack. Only a forged return address gets here.
+		 */
+		retired = READ_ONCE(km->chunk_retired[c]);
+		blk = retired && retired <= kt->epoch_seen ? NULL : kemu_find_block(km, off, &len);
 		if (!blk || !kemu_rs_recover(blk, len,
 					     ((u8 *)km->chunks[off >> KEMU_CHUNK_SHIFT] +
 					      (off & (KEMU_CHUNK_SIZE - 1))) - blk,
 					     &h, &kt->shadow)) {
-			c = off >> KEMU_CHUNK_SHIFT;
 			pr_warn_ratelimited("kemu: %s[%d]: cannot recover state at %lx (chunk %lu %s retired %llu used %x; epoch %llu seen %llu flags %lx)\n",
 					    current->comm, task_pid_nr(current), ip, c,
 					    km->chunks[c] ? "live" : "freed", km->chunk_retired[c],
@@ -996,7 +1010,7 @@ int kemu_jit_dup(struct kemu_mm *okm, struct kemu_mm *km)
 	for (c = 1; c < KEMU_MAX_CHUNKS; c++) {
 		if (!okm->chunks[c] || okm->chunk_retired[c])
 			continue;
-		km->chunks[c] = __vmalloc(KEMU_CHUNK_SIZE, GFP_KERNEL_ACCOUNT);
+		km->chunks[c] = __vmalloc(KEMU_CHUNK_SIZE, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
 		km->blockmap[c] = kvmalloc(BITS_TO_LONGS(KEMU_BLOCKMAP_BITS) * sizeof(long),
 					   GFP_KERNEL_ACCOUNT);
 		if (!km->chunks[c] || !km->blockmap[c])

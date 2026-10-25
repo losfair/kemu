@@ -484,7 +484,8 @@ int kemu_dup_mm(struct mm_struct *oldmm, struct mm_struct *mm)
 	km->vdso_base = okm->vdso_base;
 	err = -ENOMEM;
 	km->chunks[0] = vzalloc(KEMU_STUBS_SIZE);
-	km->table = vmalloc(KEMU_TABLE_SIZE);
+	/* Zeroed: the whole table is mapped, but only part of it is written. */
+	km->table = vzalloc(KEMU_TABLE_SIZE);
 	if (!km->chunks[0] || !km->table)
 		goto out_unlock;
 	memcpy(km->chunks[0], okm->chunks[0], KEMU_STUBS_SIZE);

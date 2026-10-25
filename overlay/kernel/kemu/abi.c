@@ -18,6 +18,9 @@
 #include <linux/highuid.h>
 #include <linux/kdev_t.h>
 #include <linux/openat2.h>
+#include <linux/audit.h>
+#include <linux/sem.h>
+#include <linux/ipc.h>
 
 #include "kemu_internal.h"
 
@@ -28,6 +31,7 @@ asmlinkage long __x64_sys_open_by_handle_at(const struct pt_regs *regs);
 asmlinkage long __x64_sys_fanotify_init(const struct pt_regs *regs);
 asmlinkage long __x64_sys_newuname(const struct pt_regs *regs);
 asmlinkage long __x64_sys_clone(const struct pt_regs *regs);
+asmlinkage long __x64_sys_semctl(const struct pt_regs *regs);
 asmlinkage long __x64_sys_epoll_pwait(const struct pt_regs *regs);
 asmlinkage long __x64_sys_epoll_pwait2(const struct pt_regs *regs);
 int do_sys_openat2(int dfd, const char __user *filename, struct open_how *how);
@@ -103,6 +107,10 @@ long kemu_sys_openat2(struct pt_regs *regs)
 		return err;
 	/* Bits outside the translated set are validated by the core. */
 	how.flags = (how.flags & ~(u64)U32_MAX) | kemu_oflags_to_host((u32)how.flags);
+	audit_openat2_how(&how);
+	/* O_LARGEFILE is forced on 64-bit (non-O_PATH), as in native openat2. */
+	if (!(how.flags & O_PATH) && force_o_largefile())
+		how.flags |= O_LARGEFILE;
 	return do_sys_openat2((int)kemu_reg(regs, di), (const char __user *)kemu_reg(regs, si), &how);
 }
 
@@ -294,4 +302,82 @@ long kemu_sys_clone(struct pt_regs *regs)
 {
 	swap(kemu_reg(regs, r10), kemu_reg(regs, r8));
 	return __x64_sys_clone(regs);
+}
+
+/* ---- semctl ----
+ *
+ * The x86_64 semid64_ds inserts two padding words (__unused1/__unused2)
+ * that asm-generic (arm64) doesn't, so its layout is 104 bytes where the
+ * guest's is 88. Only IPC_STAT/SEM_STAT/SEM_STAT_ANY (out) and IPC_SET (in)
+ * carry the struct; every other command is layout-agnostic and passes
+ * through. cmd never has the IPC_64 bit here (the entry fixes the version),
+ * matching the native switch; anything else falls through to the native
+ * handler, which rejects it exactly as arm64 would.
+ */
+struct kemu_ipc64_perm {
+	s32 key;
+	u32 uid, gid, cuid, cgid;
+	u32 mode;
+	u16 seq, __pad2;
+	u64 __unused1, __unused2;
+};
+
+struct kemu_semid64_ds {
+	struct kemu_ipc64_perm sem_perm;
+	s64 sem_otime;
+	s64 sem_ctime;
+	u64 sem_nsems;
+	u64 __unused3;
+	u64 __unused4;
+};
+static_assert(sizeof(struct kemu_semid64_ds) == 88);
+static_assert(sizeof(struct kemu_ipc64_perm) == sizeof(struct ipc64_perm));
+
+/* Copy the shared fields between the native and guest layouts. */
+static void kemu_semid_to_guest(const struct semid64_ds *k, struct kemu_semid64_ds *g)
+{
+	memset(g, 0, sizeof(*g));
+	memcpy(&g->sem_perm, &k->sem_perm, sizeof(g->sem_perm));
+	g->sem_otime = k->sem_otime;
+	g->sem_ctime = k->sem_ctime;
+	g->sem_nsems = k->sem_nsems;
+}
+
+static void kemu_semid_from_guest(const struct kemu_semid64_ds *g, struct semid64_ds *k)
+{
+	memset(k, 0, sizeof(*k));
+	memcpy(&k->sem_perm, &g->sem_perm, sizeof(g->sem_perm));
+	k->sem_otime = g->sem_otime;
+	k->sem_ctime = g->sem_ctime;
+	k->sem_nsems = g->sem_nsems;
+}
+
+long kemu_sys_semctl(struct pt_regs *regs)
+{
+	int semid = (int)kemu_reg(regs, di);
+	int cmd = (int)kemu_reg(regs, dx);
+	void __user *p = (void __user *)kemu_reg(regs, r10);
+	struct kemu_semid64_ds g;
+	struct semid64_ds k;
+	int err;
+
+	switch (cmd) {
+	case IPC_STAT:
+	case SEM_STAT:
+	case SEM_STAT_ANY:
+		err = kemu_semctl_stat(semid, cmd, &k);
+		if (err < 0)
+			return err;
+		kemu_semid_to_guest(&k, &g);
+		if (copy_to_user(p, &g, sizeof(g)))
+			return -EFAULT;
+		return err;	/* SEM_STAT* returns the semid */
+	case IPC_SET:
+		if (copy_from_user(&g, p, sizeof(g)))
+			return -EFAULT;
+		kemu_semid_from_guest(&g, &k);
+		return kemu_semctl_set(semid, cmd, &k);
+	default:
+		return __x64_sys_semctl(regs);
+	}
 }

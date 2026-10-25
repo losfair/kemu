@@ -418,3 +418,56 @@ fn recover_cached_vectors() {
         assert!(bodies >= 2 && (!enabled || helpers > 0) && exits > 0, "enabled={enabled} bodies={bodies} helpers={helpers} exits={exits}");
     }
 }
+
+/// Env whose cmpxchg never succeeds: models an atomic word another CPU keeps
+/// changing between our load and our store.
+struct ContendedEnv {
+    mem: std::vec::Vec<u8>,
+    base: u64,
+    attempts: u32,
+}
+impl Env for ContendedEnv {
+    fn fetch(&mut self, pc: u64) -> Result<u32, Fault> { self.read_u32(pc) }
+    fn read_u8(&mut self, a: u64) -> Result<u8, Fault> {
+        let i = (a - self.base) as usize;
+        self.mem.get(i).copied().ok_or(Fault { addr: a, access: crate::env::Access::Read, align: false })
+    }
+    fn read_u16(&mut self, a: u64) -> Result<u16, Fault> { Ok(u16::from_le_bytes([self.read_u8(a)?, self.read_u8(a+1)?])) }
+    fn read_u32(&mut self, a: u64) -> Result<u32, Fault> { let mut b=[0u8;4]; for (i,x) in b.iter_mut().enumerate(){*x=self.read_u8(a+i as u64)?;} Ok(u32::from_le_bytes(b)) }
+    fn read_u64(&mut self, a: u64) -> Result<u64, Fault> { let mut b=[0u8;8]; for (i,x) in b.iter_mut().enumerate(){*x=self.read_u8(a+i as u64)?;} Ok(u64::from_le_bytes(b)) }
+    fn write_u8(&mut self, a: u64, v: u8) -> Result<(), Fault> { let i=(a-self.base) as usize; self.mem[i]=v; Ok(()) }
+    fn write_u16(&mut self, a: u64, v: u16) -> Result<(), Fault> { for (i,b) in v.to_le_bytes().iter().enumerate(){self.write_u8(a+i as u64,*b)?;} Ok(()) }
+    fn write_u32(&mut self, a: u64, v: u32) -> Result<(), Fault> { for (i,b) in v.to_le_bytes().iter().enumerate(){self.write_u8(a+i as u64,*b)?;} Ok(()) }
+    fn write_u64(&mut self, a: u64, v: u64) -> Result<(), Fault> { for (i,b) in v.to_le_bytes().iter().enumerate(){self.write_u8(a+i as u64,*b)?;} Ok(()) }
+    fn cmpxchg(&mut self, a: u64, size: u32, _e: [u64;2], _n: [u64;2]) -> Result<[u64;2], Fault> {
+        // Always report an "old" value that differs from what was expected,
+        // so the RMW never commits.
+        self.attempts += 1;
+        let cur = match size { 1 => self.read_u8(a)? as u64, 2 => self.read_u16(a)? as u64, 4 => self.read_u32(a)? as u64, _ => self.read_u64(a)? };
+        Ok([cur ^ 1, 0])
+    }
+    fn cntvct(&mut self) -> u64 { 0 }
+    fn cntfrq(&mut self) -> u64 { 1 }
+    fn random(&mut self) -> Option<u64> { None }
+}
+
+/// #12: a perpetually-contended LSE atomic must not spin forever in the
+/// kernel. The interpreter gives up after a bounded number of tries,
+/// returning Exit::Budget with pc left on the instruction so it restarts.
+#[test]
+fn contended_atomic_is_bounded() {
+    // ldadd x0, x1, [x2]  (0xf82000c1 decodes to Insn::Atomic Add)
+    let base = 0x2000;
+    let mut mem = std::vec![0u8; 0x1000];
+    mem[..4].copy_from_slice(&0xf820_0041u32.to_le_bytes());
+    let mut env = ContendedEnv { mem, base, attempts: 0 };
+    let mut cpu = CpuState::new();
+    cpu.pc = base;
+    cpu.x[0] = 1;              // addend
+    cpu.x[2] = base + 0x100;   // aligned data address
+    let (e, n) = run(&mut cpu, &mut env, 1000);
+    assert_eq!(e, Exit::Budget, "contended atomic should yield, not loop");
+    assert_eq!(cpu.pc, base, "pc must stay on the atomic for restart");
+    assert_eq!(n, 0, "the atomic did not retire");
+    assert!(env.attempts <= super::mem::ATOMIC_RETRIES, "retries not bounded: {}", env.attempts);
+}

@@ -6,6 +6,10 @@ use crate::decode::{Index, Insn, Order, RmwOp};
 use crate::env::{Access, Env, Fault};
 use crate::state::CpuState;
 
+/// Attempts of an LSE read-modify-write before the instruction is handed
+/// back unexecuted (`Exit::Budget` with `pc` unchanged).
+pub(crate) const ATOMIC_RETRIES: u32 = 64;
+
 /// Read `size` (log2 bytes) from guest memory, zero-extended into u64.
 fn load_mem(env: &mut dyn DynEnv, addr: u64, size: u8) -> Result<u64, Fault> {
     Ok(match size {
@@ -343,8 +347,12 @@ pub(super) fn exec_atomic<E: Env>(cpu: &mut CpuState, env: &mut E, insn: Insn) -
             return Step::Exit(Exit::Fault(Fault { addr, access: Access::Write, align: true }));
         }
         let operand = cpu.xr(rs);
-        // Read-modify-write via a cmpxchg loop on `size` bytes.
-        loop {
+        // Read-modify-write via a cmpxchg loop on `size` bytes. Other
+        // threads can make every attempt fail; after a bounded number of
+        // retries give up with nothing committed and `pc` still at this
+        // instruction, so the host gets a preemption/signal point and the
+        // instruction is restarted from scratch.
+        for _ in 0..ATOMIC_RETRIES {
             let old = match load_mem(env, addr, size) {
                 Ok(v) => v,
                 Err(f) => return Step::Exit(Exit::Fault(f)),
@@ -367,10 +375,10 @@ pub(super) fn exec_atomic<E: Env>(cpu: &mut CpuState, env: &mut E, insn: Insn) -
             if got == truncsz(old, size) {
                 // Return the pre-op value (zero-extended) to rt (unless XZR).
                 cpu.set_xr(rt, truncsz(old, size));
-                break;
+                return Step::Next;
             }
         }
-        Step::Next
+        Step::Exit(Exit::Budget)
     } else {
         Step::Exit(Exit::Undefined(0))
     }

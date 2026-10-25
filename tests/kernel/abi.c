@@ -24,13 +24,24 @@
 #include <sys/utsname.h>
 #include <sys/syscall.h>
 #include <sys/auxv.h>
+#include <stddef.h>
 #include <stdatomic.h>
 #include <sys/ptrace.h>
 #include <sys/uio.h>
+#include <sys/sem.h>
+#include <sys/prctl.h>
 #include <elf.h>
 #include <asm/ptrace.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <linux/openat2.h>
 
 static int failures;
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
 
 #define CHECK(name, cond, ...) do { \
 	if (cond) printf("PASS %s\n", name); \
@@ -322,6 +333,111 @@ static void test_misc(void)
 	CHECK("cntvct", cnt2 >= cnt1 && frq > 1000000, "cnt %lu %lu frq %lu", cnt1, cnt2, frq);
 }
 
+/* ---- ABI fixes (kemu audit 2026-10) ---- */
+
+/*
+ * semctl IPC_STAT must use the arm64 semid64_ds layout (88 bytes), not the
+ * x86_64 one (104): the x86 handler would write 16 bytes past the buffer
+ * and land the ctime in sem_nsems.
+ */
+static void test_semctl(void)
+{
+	union semun { int val; struct semid_ds *buf; unsigned short *array; } arg;
+	struct { struct semid_ds ds; unsigned long canary; } s;
+	int id = semget(IPC_PRIVATE, 3, IPC_CREAT | 0600);
+
+	if (id < 0) {
+		CHECK("semctl-stat", 0, "semget errno %d", errno);
+		return;
+	}
+	s.canary = 0xfeedface;
+	arg.buf = &s.ds;
+	int r = semctl(id, 0, IPC_STAT, arg);
+	CHECK("semctl-stat", r == 0 && s.ds.sem_nsems == 3 && s.canary == 0xfeedface,
+	      "r %d nsems %lu canary %lx", r, (unsigned long)s.ds.sem_nsems, s.canary);
+	semctl(id, 0, IPC_RMID);
+}
+
+/*
+ * openat2 must force O_LARGEFILE on 64-bit like native: without it a write
+ * past 2 GiB fails with EFBIG.
+ */
+static void test_openat2(void)
+{
+	struct open_how how = { .flags = O_RDWR | O_CREAT | O_TRUNC, .mode = 0600 };
+	int fd = syscall(__NR_openat2, AT_FDCWD, "/tmp/kemu-of2", &how, sizeof(how));
+
+	if (fd < 0) {
+		CHECK("openat2-largefile", 0, "openat2 errno %d", errno);
+		return;
+	}
+	off_t big = (off_t)3 << 30;	/* 3 GiB */
+	ssize_t w = pwrite(fd, "x", 1, big);
+	CHECK("openat2-largefile", w == 1, "pwrite %zd errno %d", w, errno);
+	close(fd);
+	unlink("/tmp/kemu-of2");
+}
+
+/*
+ * seccomp/audit must see AUDIT_ARCH_AARCH64 with arm64 syscall numbers. A
+ * filter that matches arch==AARCH64 && nr==getpid returns errno 42; if the
+ * arch were reported as x86_64 the match would fail and getpid would run.
+ */
+static void test_seccomp_arch(void)
+{
+	struct sock_filter prog[] = {
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 3),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 172 /* arm64 getpid */, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 42),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+	};
+	struct sock_fprog fp = { .len = ARRAY_SIZE(prog), .filter = prog };
+	pid_t p = fork();
+
+	if (p == 0) {
+		if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) ||
+		    syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, &fp))
+			_exit(100 + (errno & 0x7f));
+		long r = syscall(172);	/* getpid */
+		_exit(r == -1 && errno == 42 ? 0 : 1);
+	}
+	int st;
+	waitpid(p, &st, 0);
+	CHECK("seccomp-arch", WIFEXITED(st) && WEXITSTATUS(st) == 0,
+	      "exit %d (100+=setup errno)", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+}
+
+/* SECCOMP_MODE_STRICT must allow arm64 read/write/exit/rt_sigreturn. */
+static void test_seccomp_strict(void)
+{
+	pid_t p = fork();
+
+	if (p == 0) {
+		if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT, 0, 0, 0))
+			_exit(2);
+		/* read/write of the pipe below and exit must be permitted. */
+		char c = 'k';
+		write(2, &c, 0);	/* zero-length write: just the syscall */
+		_exit(0);		/* exit_group */
+	}
+	int st;
+	waitpid(p, &st, 0);
+	/* Killed by SIGKILL (wrong allow-list) vs clean exit 0. */
+	CHECK("seccomp-strict", WIFEXITED(st) && WEXITSTATUS(st) == 0,
+	      "%s %d", WIFSIGNALED(st) ? "signal" : "exit",
+	      WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st));
+}
+
+static void test_abi_fixes(void)
+{
+	test_semctl();
+	test_openat2();
+	test_seccomp_arch();
+	test_seccomp_strict();
+}
+
 int main(int argc, char **argv)
 {
 	if (argc > 1 && !strcmp(argv[1], "child")) {
@@ -336,6 +452,7 @@ int main(int argc, char **argv)
 	test_epoll();
 	test_ptrace();
 	test_misc();
+	test_abi_fixes();
 	printf("%s: %d failures\n", failures ? "FAILED" : "ALL PASSED", failures);
 	return failures != 0;
 }

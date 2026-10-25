@@ -60,6 +60,13 @@ long kemu_arch_ptrace(struct task_struct *child, long request,
 		      unsigned long addr, unsigned long data);
 void kemu_user_step(struct task_struct *child, bool on);
 
+/* ipc/sem.c: semctl on a kernel struct (kemu marshals the user layout,
+ * whose x86_64 and arm64 forms differ). Called from kemu and defined in
+ * ipc/sem.c, which reuses the static semctl_stat/semctl_down helpers. */
+struct semid64_ds;
+int kemu_semctl_stat(int semid, int cmd, struct semid64_ds *out);
+int kemu_semctl_set(int semid, int cmd, struct semid64_ds *in);
+
 /* mm / proc */
 void kemu_unmapped(struct mm_struct *mm, unsigned long start, unsigned long end);
 bool kemu_vma_hidden(struct vm_area_struct *vma);

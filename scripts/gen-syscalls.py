@@ -12,13 +12,17 @@ abis = {"common", "64", "renameat", "rlimit", "memfd_secret"}
 overrides = {
     "rt_sigreturn", "clone", "uname", "newfstatat", "fstat",
     "epoll_ctl", "epoll_pwait", "epoll_pwait2", "openat", "openat2",
-    "fcntl", "pipe2", "open_by_handle_at", "fanotify_init",
+    "fcntl", "pipe2", "open_by_handle_at", "fanotify_init", "semctl",
 }
 
-# Not offered to guests (ENOSYS; programs fall back): io_uring reads and
-# writes native structs (e.g. struct epoll_event for IORING_OP_EPOLL_CTL)
-# behind kemu's back, so the guest ABI can't be guaranteed.
-disabled = {"io_uring_setup", "io_uring_enter", "io_uring_register"}
+# Not offered to guests (ENOSYS; programs fall back):
+# - io_uring reads and writes native structs (e.g. struct epoll_event for
+#   IORING_OP_EPOLL_CTL) behind kemu's back, so the guest ABI can't be
+#   guaranteed.
+# - rseq compares the host (code-cache) PC against the guest rseq_cs range,
+#   so critical sections never abort and a crafted abort_ip would redirect
+#   host execution; it is unimplemented (DESIGN §11.2 is aspirational here).
+disabled = {"io_uring_setup", "io_uring_enter", "io_uring_register", "rseq"}
 
 syms = set()
 for line in open(sysmap):

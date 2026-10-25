@@ -21,12 +21,14 @@ use crate::decode::{
     self, BfOp, CselOp, Dp1Op, Dp2Op, Ext, Index, Insn, LogicOp, MulOp, Order, RmwOp,
     Shift as AShift,
 };
-use crate::env::{Env, Fault};
+use crate::env::{Access, Env, Fault};
 
 mod crypto;
 pub use crypto::HostCrypto;
 mod fp;
 mod vector;
+#[cfg(all(test, feature = "std"))]
+mod regression;
 
 pub const MAX_INSNS: usize = 64;
 
@@ -167,7 +169,22 @@ impl Scratch {
 
 /// Instruction fetch for the translator: records the page, and the word as
 /// a dependency in relocatable mode.
+///
+/// In relocatable mode a word is read from guest memory at most once per
+/// translation; later fetches of the same PC (flag look-ahead into exit
+/// targets) reuse the recorded value. The shared cache validates a block
+/// against these records only, so no decision may depend on a re-read that
+/// could differ (another thread rewriting the word mid-translation).
 fn fetch<E: Env>(env: &mut E, s: &mut Scratch, rec: bool, pc: u64) -> Result<u32, Fault> {
+    if rec {
+        if let Some(d) = s.deps.iter().take(s.ndeps as usize).find(|d| d.pc == pc) {
+            return if d.ok != 0 {
+                Ok(d.word)
+            } else {
+                Err(Fault { addr: pc, access: Access::Exec, align: false })
+            };
+        }
+    }
     let r = env.fetch(pc);
     s.record_page(pc);
     if rec {
