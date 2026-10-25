@@ -886,7 +886,7 @@ the unified table since v6.11). Each entry has one of these kinds:
 
 | Kind | Handling | Examples |
 |---|---|---|
-| **passthrough** | Build an x86_64 `pt_regs` (`di, si, dx, r10, r8, r9` = guest X0–X5) and call the existing `__x64_sys_*` for the equivalent syscall | `read`, `write`, `openat`, `close`, `mmap`, `futex`, `ppoll`, `pselect6`, `io_uring_*`, `bpf`, `getdents64`, `statx`, `faccessat2`, ~85% of the table |
+| **passthrough** | Build an x86_64 `pt_regs` (`di, si, dx, r10, r8, r9` = guest X0–X5) and call the existing `__x64_sys_*` for the equivalent syscall | `read`, `write`, `openat`, `close`, `mmap`, `futex`, `ppoll`, `pselect6`, `bpf`, `getdents64`, `statx`, `faccessat2`, ~85% of the table |
 | **marshalled** | Rust `sysabi` converts layouts, then calls an inner kernel helper (`vfs_fstatat`, `do_epoll_ctl`, …) | `newfstatat`/`fstat` (asm-generic `struct stat` ≠ x86_64 `struct stat`), `epoll_ctl`/`epoll_pwait`/`epoll_pwait2` (x86_64 `epoll_event` is packed: 12 vs 16 bytes) |
 | **reordered** | Argument order differs | `clone` (asm-generic: `flags, stack, ptid, tls, ctid`; x86_64: `…, ctid, tls`) |
 | **kemu-semantic** | Needs guest-state awareness | `rt_sigreturn`, `rt_sigaction` (flag sanity), `sigaltstack`, `clone`/`clone3` (`CLONE_SETTLS` sets the child's guest `TPIDR_EL0`, not the FS base; the child's guest SP/PC come from guest state), `execve*`, `prctl` (arm64 options), `ptrace`, `personality`, `uname`, `mprotect`/`mmap` (`PROT_BTI` accepted and ignored, `PROT_MTE` → `EINVAL`), `rseq`, `riscv_*`-style arch-specific stubs |
@@ -926,8 +926,12 @@ Both ABIs are LP64 little-endian with the asm-generic ioctl encoding, so nearly 
 structures are byte-identical. The known differences are handled explicitly and
 covered by selftests:
 
-- `struct stat` (fstat family), `struct epoll_event` (epoll syscalls and
-  `IORING_OP_EPOLL_CTL`; io_uring rings created by kemu tasks are tagged with a guest-ABI flag).
+- `struct stat` (fstat family), `struct epoll_event` (epoll syscalls).
+- io_uring is not offered to guests: `io_uring_setup`, `io_uring_enter` and
+  `io_uring_register` return `ENOSYS`, and programs fall back to ordinary syscalls
+  (libuv, liburing users, glibc). Ring operations read and write native structs
+  directly, for example `struct epoll_event` for `IORING_OP_EPOLL_CTL`, which
+  bypasses this translation layer.
 - `clone`/`clone3` TLS semantics; `struct user_regs_struct` and regsets (ptrace, core dumps).
 - Signal frames, `MINSIGSTKSZ`, `AT_MINSIGSTKSZ`.
 - `prctl`: `PR_SVE_*`, `PR_SME_*`, `PR_PAC_*`, `PR_MTE_*`, `PR_SET_TAGGED_ADDR_CTRL`
@@ -1235,6 +1239,9 @@ the code and its commit history are authoritative.
   sqlite3, hashlib, zlib), gcc/as/ld, make, perl, git, coreutils, strace and
   multithreaded xz all run correctly.
 - Shared translation cache (§10.4). See "Deviations" for the keying.
+- Guest JITs: OpenJDK 21 (HotSpot C1/C2), Node.js 20 (V8, including wasm and
+  irregexp), LuaJIT, PyPy and Ruby YJIT run `tests/jit-workloads` with output
+  identical to their interpreter modes and to native x86_64 runs.
 
 **Performance** (kemu-user `--jit` on the same host, noisy machine):
 
@@ -1265,6 +1272,19 @@ the code and its commit history are authoritative.
   is tested by translating every block at two guest bases (`KEMU_RELOC_CHECK`).
   Defaults: `kemu.xcache_mb=128` (LRU, plus a shrinker); `kemu.xcache=0` disables
   the cache.
+- **Invalidation (§10.3).** Every block records the guest pages it read (its own
+  page, since blocks never cross one, plus flag look-ahead into exit targets). A
+  per-mm page index finds the blocks to remove on `IC IVAU` or when an executable
+  mapping goes away. Removing a block takes it out of the lookup table and block
+  index and restores the chained jumps into it; its code stays until the next
+  capacity flush, so threads still inside it are safe, and an epoch bump sends
+  every thread back through the dispatcher at its next kernel exit. Only running
+  out of code space flushes everything. A flush retires chunks, which are freed
+  once no thread can be executing in them: threads that are off-CPU with their
+  state in the state page, or current, don't hold chunks (otherwise a thread
+  sleeping in `futex()` pins all of them). The epoch is published after the table
+  reset, so a thread that sees it can't pick up a stale table entry.
+- **io_uring is disabled for guests** (§11.2).
 - **Oversized superblocks.** When exit slots or recovery points run out, the
   translation is retried with half the instruction limit instead of failing.
 
@@ -1278,7 +1298,7 @@ the code and its commit history are authoritative.
   - 8: no chaining;
   - 32: no register remapping.
 - `kemu.debug=1` prints per-mm statistics: translations, shared-cache hits,
-  translation time.
+  translation time, flushes and targeted invalidations.
 - kemu-user:
   - `KEMU_JIT_STATS` prints a helper-instruction histogram;
   - `KEMU_XLAT_BENCH=<span>` measures translator throughput;

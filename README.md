@@ -20,6 +20,9 @@ Working:
 
 - A full Debian trixie arm64 userland: debootstrap's second stage, dpkg, bash,
   python3, gcc/binutils, make, perl, git, coreutils, strace and multithreaded xz.
+- Guest JITs: OpenJDK 21 (HotSpot), Node.js 20 (V8 with wasm), LuaJIT, PyPy and
+  Ruby YJIT. kemu invalidates translations per guest page when a guest JIT
+  rewrites its code (`IC IVAU`).
 - Threads, futexes, LL/SC and seq_cst atomics, signals, ptrace and
   single-step, core dumps, seccomp/audit as `AUDIT_ARCH_AARCH64`.
 - T1 JIT with superblocks, block chaining, register remapping and lazy flags.
@@ -40,6 +43,10 @@ Performance, measured against native x86_64 builds of the same C source
 | qsort | ~84% |
 | matmul (NEON) | ~65% |
 
+io_uring isn't offered to arm64 programs (the syscalls return `ENOSYS` and
+libraries fall back to plain syscalls), because ring operations use native
+struct layouts behind kemu's back.
+
 Not done yet: a real vDSO, rseq, perf callchains through translated code, the
 optimizing tier (T2), host-register allocation for NEON, the LSM hook and the
 code-cache verifier.
@@ -54,6 +61,7 @@ overlay/            new files copied into the kernel tree
 patches/            changes to existing kernel files, one patch per hook area
 scripts/            apply/build/boot helpers
 tests/kernel/       AArch64 test programs (ABI suite, threading stress, ...)
+tests/jit-workloads/ JIT-heavy guest programs (HotSpot, V8, LuaJIT, PyPy, YJIT)
 tests/bench/        intbench
 tools/kemu-user/    run arm64 binaries in userspace on kemu_core (fast iteration, perf)
 tools/jit-test/     random differential test: JIT vs interpreter, incl. async interrupts
@@ -150,6 +158,18 @@ cargo run --release --manifest-path tools/jit-test/Cargo.toml -- 100000
 INTR=50 RELOC=1 tools/jit-test/target/release/jit-test 50000   # async interrupts + relocation
 scripts/vm-smoke.sh                                            # in-kernel ABI suite etc.
 ```
+
+`tests/jit-workloads/run.sh` runs JIT-heavy programs for Java, Node, LuaJIT,
+PyPy and Ruby inside an arm64 userland, each with the guest's JIT on and off,
+and compares the checksums with each other and with native x86_64 runs:
+
+```sh
+KEMU_DISK=build/arm64.img KEMU_MEM=4096 scripts/run-vm.sh \
+  '. scripts/chroot-run.sh; chroot /r /bin/bash /mnt/kemu/tests/jit-workloads/run.sh'
+```
+
+The runtimes aren't part of `mkrootfs.sh`'s package list; install
+`openjdk-21-jdk-headless nodejs luajit pypy3 ruby` into the image first.
 
 CI (`.github/workflows/ci.yml`) runs the userspace tests. It also builds a
 pristine v6.18 kernel with the patch set and boots it under KVM to run the
