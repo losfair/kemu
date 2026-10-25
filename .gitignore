@@ -6,3 +6,4 @@ tests/kernel/lzmat
 __pycache__/
 tests/kernel/tbi
 tests/kernel/vector-state
+tests/kernel/syscall-state
