@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  RUST_TOOLCHAIN: "1.88.0"
+  LINUX_VERSION: "6.18"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Translator core and userspace harnesses: no kernel needed.
+  userspace:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install $RUST_TOOLCHAIN --profile minimal
+          rustup default $RUST_TOOLCHAIN
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            overlay/rust/kemu_core/target
+            tools/*/target
+          key: cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('overlay/rust/kemu_core/src/**', 'tools/*/src/**', 'tools/*/Cargo.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+      - name: kemu_core unit tests
+        run: cargo test --manifest-path overlay/rust/kemu_core/Cargo.toml --features std
+      - name: Build tools
+        run: |
+          for t in kemu-user jit-test difftest isa-audit; do
+            cargo build --release --manifest-path tools/$t/Cargo.toml
+          done
+      - name: JIT vs interpreter differential test
+        run: |
+          j=tools/jit-test/target/release/jit-test
+          $j 100000 1
+          INTR=50 $j 50000 2
+          RELOC=1 $j 50000 3
+          INTR=50 RELOC=1 $j 50000 4
+      - name: kemu-user smoke test
+        run: |
+          u=tools/kemu-user/target/release/kemu-user
+          $u tests/hello.aarch64
+          $u --jit tests/hello.aarch64
+          $u --jit tests/bench/intbench.arm64
+
+  # Pristine Linux + kemu patch set, booted under KVM with AArch64 tests.
+  kernel:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            clang lld llvm libelf-dev libssl-dev bc flex bison rsync cpio \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-system-x86 busybox-static
+      - name: Install Rust
+        run: |
+          rustup toolchain install $RUST_TOOLCHAIN --profile minimal --component rust-src
+          rustup default $RUST_TOOLCHAIN
+      - uses: actions/cache@v4
+        id: bindgen
+        with:
+          path: ~/.cargo/bin/bindgen
+          key: bindgen-0.71.1-${{ runner.os }}
+      - name: Install bindgen
+        if: steps.bindgen.outputs.cache-hit != 'true'
+        run: cargo install --locked bindgen-cli --version 0.71.1
+      - name: Fetch Linux ${{ env.LINUX_VERSION }}
+        run: |
+          curl -sSfL https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$LINUX_VERSION.tar.xz | tar -xJ -C $RUNNER_TEMP
+          echo "LINUX=$RUNNER_TEMP/linux-$LINUX_VERSION" >> $GITHUB_ENV
+      - name: Apply kemu
+        run: scripts/apply.sh $LINUX
+      - name: Configure
+        working-directory: ${{ env.LINUX }}
+        run: |
+          make LLVM=1 rustavailable
+          make LLVM=1 defconfig kvm_guest.config
+          scripts/kconfig/merge_config.sh -m .config $GITHUB_WORKSPACE/ci/kemu.config
+          make LLVM=1 olddefconfig
+          grep -q '^CONFIG_KEMU=y' .config
+      - name: Build kernel
+        working-directory: ${{ env.LINUX }}
+        run: make LLVM=1 -j$(nproc) bzImage
+      - name: Build AArch64 tests
+        run: make -C tests/kernel -j$(nproc)
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Boot and test (default)
+        run: KERNEL=$LINUX/arch/x86/boot/bzImage scripts/vm-smoke.sh
+      - name: Boot and test (no chaining, no shared cache)
+        run: KERNEL=$LINUX/arch/x86/boot/bzImage KEMU_APPEND="kemu.jitoff=8 kemu.xcache=0" scripts/vm-smoke.sh
