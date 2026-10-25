@@ -272,3 +272,63 @@ fn xcache_validate_and_relocate() {
     assert!(!xcache::validate(&mut mk(base2, Some((5, 0x8b020021))), blob, base2));
     assert!(!xcache::validate(&mut mk(base2 + 4, None), blob, base2 + 4));
 }
+
+/// A thread interrupted in an exit trampoline of a remapped block must be
+/// recovered with the canonical register map: every path into the
+/// trampolines has run the remap epilogue, even if the block's main code
+/// ends in the remapped state (here: a self-loop back-edge).
+#[test]
+fn recover_in_exit_trampoline_of_remapped_block() {
+    use crate::jit::{meta, regmap, stubs, t1};
+    let code: [u32; 6] = [
+        0x91000718, // add  x24, x24, #1
+        0x91000718, // add  x24, x24, #1
+        0x91000718, // add  x24, x24, #1
+        0xeb09031f, // cmp  x24, x9
+        0x54000800, // b.eq +0x100 (exit through a trampoline)
+        0x17fffffb, // b    pc0 (back-edge: the main code ends remapped)
+    ];
+    let mut mem = std::vec![0u8; 0x2000];
+    for (i, w) in code.iter().enumerate() {
+        mem[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    let mut env = TestEnv { mem, base: 0x40_0000 };
+    let mut page = std::vec![0u8; 4096];
+    let so = stubs::gen_stubs(&mut page, stubs::ExitMode::Syscall, 0x7000_1000_0000, 0xfff8).expect("stubs");
+    let cfg = t1::Cfg { stubs: so.addrs(0x7000_0000_0000), code_uaddr: 0x7000_0000_0000 + (1 << 20), reloc: false };
+    let mut s = std::boxed::Box::new(t1::Scratch::new());
+    let mut out = std::vec![0u8; 8192];
+    let r = t1::translate(&mut env, 0x40_0000, &mut out, &cfg, &mut s).expect("translate");
+    let blk = &out[..r.size];
+
+    // Trampolines: "lea rdx, [rip + site]" right before the jump to the chain stub.
+    let mut tramps = std::vec::Vec::new();
+    for o in 0..blk.len().saturating_sub(3) {
+        if blk[o..o + 3] == [0x48, 0x8d, 0x15] {
+            tramps.push(o as u32);
+        }
+    }
+    assert!(!tramps.is_empty(), "no exit trampolines found");
+
+    let mut h = meta::HostRegs { gpr: [0; 16], rflags: 0x202 };
+    for (i, g) in h.gpr.iter_mut().enumerate() {
+        *g = 0x1000 + i as u64;
+    }
+    for off in tramps {
+        let mut st = CpuState::new();
+        for n in 0..31 {
+            st.set_xr(n, 0x9000 + n as u64);
+        }
+        st.sp = 0x9999;
+        assert!(meta::recover(blk, off, &h, &mut st), "recover at {off:#x}");
+        // Canonical: pinned registers from their host registers, the rest
+        // from the state page.
+        for (g, hr) in regmap::PINNED.iter() {
+            let want = h.gpr[(*hr & 15) as usize];
+            let got = if *g == regmap::GUEST_SP { st.sp } else { st.xr(*g) };
+            assert_eq!(got, want, "pinned guest reg {g} at trampoline offset {off:#x}");
+        }
+        assert_eq!(st.xr(24), 0x9000 + 24, "x24 at trampoline offset {off:#x}");
+        assert_eq!(st.xr(9), 0x9000 + 9, "x9 at trampoline offset {off:#x}");
+    }
+}
