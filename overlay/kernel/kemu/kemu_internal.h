@@ -166,6 +166,7 @@ struct kemu_pgvec {
 #define KEMU_TF_KSTATE		BIT(2)	/* state page authoritative (in kernel) */
 #define KEMU_TF_STEP		BIT(3)	/* ptrace single-step */
 #define KEMU_TF_STEP_SVC	BIT(4)	/* trap after the stepped svc */
+#define KEMU_TF_ROLLBACK	BIT(5)	/* syscall_rollback() undid this svc */
 
 struct kemu_thread {
 	struct task_struct *task;

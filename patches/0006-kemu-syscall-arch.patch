@@ -1,5 +1,5 @@
 diff --git a/arch/x86/include/asm/syscall.h b/arch/x86/include/asm/syscall.h
-index c10dbb74c..e3794ee7d 100644
+index c10dbb74c..8c9172ffb 100644
 --- a/arch/x86/include/asm/syscall.h
 +++ b/arch/x86/include/asm/syscall.h
 @@ -11,6 +11,7 @@
@@ -10,7 +10,18 @@ index c10dbb74c..e3794ee7d 100644
  #include <linux/sched.h>
  #include <linux/err.h>
  #include <asm/thread_info.h>	/* for TS_COMPAT */
-@@ -166,6 +167,10 @@ static inline void syscall_set_arguments(struct task_struct *task,
+@@ -48,6 +49,10 @@ static inline void syscall_set_nr(struct task_struct *task,
+ static inline void syscall_rollback(struct task_struct *task,
+ 				    struct pt_regs *regs)
+ {
++#ifdef CONFIG_KEMU
++	if (task_is_kemu(task))
++		kemu_syscall_rollback(task);
++#endif
+ 	regs->ax = regs->orig_ax;
+ }
+ 
+@@ -166,6 +171,10 @@ static inline void syscall_set_arguments(struct task_struct *task,
  
  static inline int syscall_get_arch(struct task_struct *task)
  {

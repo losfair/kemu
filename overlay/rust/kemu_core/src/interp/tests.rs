@@ -456,7 +456,7 @@ impl Env for ContendedEnv {
 /// returning Exit::Budget with pc left on the instruction so it restarts.
 #[test]
 fn contended_atomic_is_bounded() {
-    // ldadd x0, x1, [x2]  (0xf82000c1 decodes to Insn::Atomic Add)
+    // ldadd x0, x1, [x2]  (0xf8200041 decodes to Insn::Atomic Add)
     let base = 0x2000;
     let mut mem = std::vec![0u8; 0x1000];
     mem[..4].copy_from_slice(&0xf820_0041u32.to_le_bytes());
