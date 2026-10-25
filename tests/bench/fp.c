@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Common FP kernels; build identically at -O3 for AArch64 and x86-64. */
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +48,25 @@ __attribute__((noinline)) static double range(void)
 	return count;
 }
 
+/* -fno-math-errno permits SIMD sqrt on both targets. Inputs are positive. */
+__attribute__((noinline)) static double square_roots(void)
+{
+	for (int i = 0; i < N; i++) z[i] = sqrtf(x[i] + 2.0f);
+	return z[0] + z[N/2] + z[N-1];
+}
+
+__attribute__((noinline)) static double quantize(void)
+{
+	for (int i = 0; i < N; i++) z[i] = (float)(int32_t)(x[i] * 1024.0f) / 1024.0f;
+	return z[0] + z[N/2] + z[N-1];
+}
+
+__attribute__((noinline)) static double rounding(void)
+{
+	for (int i = 0; i < N; i++) z[i] = nearbyintf(x[i] * 1024.0f);
+	return z[0] + z[N/2] + z[N-1];
+}
+
 __attribute__((noinline)) static double mandelbrot(void)
 {
 	unsigned total = 0;
@@ -77,6 +97,7 @@ int main(int argc, char **argv)
 	static const struct { const char *name; double (*fn)(void); } tests[] = {
 		{ "saxpy", saxpy }, { "dot", dot }, { "matmul", matmul },
 		{ "clamp", clamp }, { "range", range }, { "mandelbrot", mandelbrot },
+		{ "sqrt", square_roots }, { "quantize", quantize }, { "round", rounding },
 	};
 	unsigned rounds = argc > 2 ? strtoul(argv[2], NULL, 0) : 50;
 	if (!rounds) return 2;

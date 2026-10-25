@@ -188,6 +188,7 @@ INTR=50 RELOC=1 tools/jit-test/target/release/jit-test 20000 1 7 # AES, PMULL, S
 NO_AES=1 NO_PCLMUL=1 tools/jit-test/target/release/jit-test 20000 1 7 # optional-feature fallback
 INTR=20 RELOC=1 tools/jit-test/target/release/jit-test 10000 1 9 # FP min/max and indexed multiply/FMA
 INTR=20 RELOC=1 tools/jit-test/target/release/jit-test 10000 1 10 # TBL/TBX and byte/halfword ZIP/UZP
+INTR=20 RELOC=1 tools/jit-test/target/release/jit-test 10000 1 11 # full FP catalog, exact status and native-path checks
 scripts/vm-smoke.sh                                            # in-kernel ABI suite etc.
 ```
 
@@ -210,14 +211,15 @@ instruction including loop/operand overhead, and prints deterministic
 checksums. It is not a complete cipher or hash throughput test.
 
 `tests/bench/fp.c` exercises SAXPY, a double dot product, 48×48 matrix
-multiplication, clamping, range counting, and Mandelbrot. `tests/bench/zlib.c`
+multiplication, clamping, range counting, Mandelbrot, SIMD square roots,
+quantization, and rounding. `tests/bench/zlib.c`
 measures compression (level 6), decompression, Adler-32, and CRC-32 over
 deterministic mixed text/random data, and verifies the compression round trip.
 Both accept a case name (or `all`) and iteration count; zlib also accepts the
 buffer size in bytes (up to its 1 MiB default).
 
 ```sh
-aarch64-linux-gnu-gcc -O3 -static tests/bench/fp.c -lm -o build/fp.arm64
+aarch64-linux-gnu-gcc -O3 -fno-math-errno -static tests/bench/fp.c -lm -o build/fp.arm64
 # ZLIB_ARM64 is an extracted arm64 zlib development package or sysroot.
 aarch64-linux-gnu-gcc -O3 -static tests/bench/zlib.c -I$ZLIB_ARM64/usr/include \
   $ZLIB_ARM64/usr/lib/aarch64-linux-gnu/libz.a -o build/zlib.arm64
@@ -232,9 +234,26 @@ against QEMU. For a native comparison, compile the same sources with host GCC
 and the same optimization level, linking the same zlib version, and run them
 in the same VM. Compiler vectorization can differ across architectures.
 Run helper profiling separately with `KEMU_JIT_STATS=1`; its per-helper
-formatting and counters distort timings. FP min/max and indexed multiply/FMA
-retain softfloat fallbacks for NaNs and FPCR.FZ, preserving their exact results
-and exception flags.
+formatting and counters distort timings.
+
+T1 lowers every currently decoded S/D FP instruction family: scalar and SIMD
+arithmetic, comparisons (including conditional comparisons), rounding,
+pairwise/across-lane reductions, integer/fixed-point conversions, precision
+conversions, reciprocal estimates, and reciprocal refinement steps. Half
+precision **storage conversions** are lowered; FP16 arithmetic is unsupported.
+Packed signed int32 conversions stay packed on AVX2; 64-bit/unsigned conversion
+forms use native scalar lanes and commit the vector once. Reciprocal estimates
+use ARM's exact tables embedded in the translated block. Unusual inputs use
+softfloat where host behavior differs: NaN propagation, FPCR.FZ/AHP,
+saturation/modulo cases, and underflow/overflow boundaries. FCVTXN also uses the
+helper outside its normal-result fast range. Thus instruction coverage does
+not imply every input executes without a helper.
+
+Mode 11 iterates the readable opcode catalog in `tools/jit-test/src/fp-catalog.txt`.
+It checks all four rounding modes, scalar/vector arrangements, aliasing, exact
+FPCR/FPSR/NZCV, exceptional inputs and inactive lanes. Ordinary-input cases
+must execute without helper calls (apart from the terminating BRK). Run with
+`NO_VCACHE=1` as well to check state-page and cached-vector paths.
 
 `tests/jit-workloads/run.sh` runs JIT-heavy programs for Java, Node, LuaJIT,
 PyPy and Ruby inside an arm64 userland, each with the guest's JIT on and off,
