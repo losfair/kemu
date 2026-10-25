@@ -15,7 +15,7 @@ emit() {
 	git -C "$linux" diff HEAD -- "$@" > "$f"
 	[ -s "$f" ] || { rm -f "$f"; n=$((n - 1)); }
 }
-emit kemu-build             kernel/Makefile arch/x86/Kbuild fs/Kconfig.binfmt
+emit kemu-build             kernel/Makefile arch/x86/Kbuild arch/x86/Kconfig fs/Kconfig.binfmt
 emit kemu-task-mm-fields    include/linux/sched.h include/linux/mm_types.h
 emit kemu-x86-entry         arch/x86/entry/syscall_64.c arch/x86/entry/syscall_32.c arch/x86/entry/vsyscall/vsyscall_64.c arch/x86/include/asm/entry-common.h
 emit kemu-x86-signal        arch/x86/kernel/signal.c

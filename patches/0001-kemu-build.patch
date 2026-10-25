@@ -9,6 +9,18 @@ index 36b985d0e..6325492d9 100644
 +
 +# kemu: AArch64 user-mode emulation
 +obj-$(CONFIG_KEMU) += kemu/
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index fa3b616af..7dc396bd4 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -249,6 +249,7 @@ config X86
+ 	select HAVE_IRQ_EXIT_ON_IRQ_STACK	if X86_64
+ 	select HAVE_IRQ_TIME_ACCOUNTING
+ 	select HAVE_JUMP_LABEL_HACK		if HAVE_OBJTOOL
++	select HAVE_KEMU				if X86_64
+ 	select HAVE_KERNEL_BZIP2
+ 	select HAVE_KERNEL_GZIP
+ 	select HAVE_KERNEL_LZ4
 diff --git a/fs/Kconfig.binfmt b/fs/Kconfig.binfmt
 index 1949e25c7..303e9c271 100644
 --- a/fs/Kconfig.binfmt
@@ -34,14 +46,3 @@ index 9fe722305..8882d1088 100644
  obj-y += unwind/
  obj-$(CONFIG_MODULES) += module/
  
-diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
---- a/arch/x86/Kconfig
-+++ b/arch/x86/Kconfig
-@@ -250,6 +250,7 @@ config X86
- 	select HAVE_IRQ_TIME_ACCOUNTING
- 	select HAVE_JUMP_LABEL_HACK		if HAVE_OBJTOOL
-+	select HAVE_KEMU				if X86_64
- 	select HAVE_KERNEL_BZIP2
- 	select HAVE_KERNEL_GZIP
- 	select HAVE_KERNEL_LZ4
- 	select HAVE_KERNEL_LZMA
