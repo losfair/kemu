@@ -149,6 +149,27 @@ impl<'s, 'b> Gen<'s, 'b> {
                 self.fp_power(X15, false, -(fbits as i32));
                 self.a.vex(1, PP_NONE, false, false, 0x59, X14, X14, Rm::R(X15));
             }
+        } else if round == 3 {
+            // CVTTPS2DQ already supplies the exact IOC/IXC behavior for
+            // truncation. Fixed-point scaling is exact inside this range;
+            // reject larger inputs before multiplying to avoid spurious OFC.
+            if fbits != 0 {
+                self.fp_bits(12, false, 0x7fff_ffff);
+                self.a.vex(1, PP_66, false, false, 0xdb, 12, X14, Rm::R(12));
+                self.fp_power(X15, false, 31 - fbits as i32);
+                self.a.vex_ib(1, PP_NONE, false, false, 0xc2, X13, 12, Rm::R(X15), 5); // >= or NaN
+                slow.push(self.fp_test_mask(X13));
+                self.fp_power(X15, false, fbits as i32);
+                self.a.vex(1, PP_NONE, false, false, 0x59, X14, X14, Rm::R(X15));
+            }
+            self.a.vex(1, PP_F3, false, false, 0x5b, X14, 0, Rm::R(X14));
+            if fbits == 0 {
+                // x86 returns INT_MIN for every invalid conversion. ARM
+                // saturates instead; also send exact INT_MIN to the helper.
+                self.fp_bits(12, false, 0x8000_0000);
+                self.a.vex(1, PP_66, false, false, 0x76, X13, X14, Rm::R(12));
+                slow.push(self.fp_test_mask(X13));
+            }
         } else {
             slow.push(self.nan_guard_vec(false, X14));
             if fbits != 0 {
