@@ -364,6 +364,9 @@ impl<'s, 'b> Gen<'s, 'b> {
     }
 
     pub(in super::super) fn fp_across(&mut self, q: bool, size: u8, op: AcrossOp, rd: u32, rn: u32) -> bool {
+        if op == AcrossOp::UMinV && size < 3 {
+            return self.simd_uminv(q, size, rd, rn);
+        }
         if op == AcrossOp::AddP && size == 3 {
             self.ld_vec(X14, rn);
             self.a.vex_ib(1, PP_66, false, false, 0x73, 3, X15, Rm::R(X14), 8);

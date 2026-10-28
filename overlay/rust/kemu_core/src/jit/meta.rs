@@ -62,8 +62,9 @@ pub mod kind {
     /// Vector cache location: 0 = state page, 1 = XMM0..7. The metadata
     /// header maps each host register to a guest vector (or NO_VECTOR).
     pub const VSTATE: u8 = 9;
-    /// MSR has loaded the new live MXCSR. Finish the state-page write
-    /// from host GPR `b`: `a` = 0 for FPCR, 1 for FPSR, then advance PC.
+    /// An FP/SIMD instruction has committed its first side effect (MSR's
+    /// live MXCSR or a saturating vector result). Finish the state-page
+    /// write from GPR `b`: `a` = 0 for FPCR, 1 for FPSR, then advance PC.
     pub const ROLL_FP: u8 = 10;
 }
 

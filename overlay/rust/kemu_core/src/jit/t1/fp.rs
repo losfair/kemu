@@ -16,6 +16,7 @@ mod extra;
 mod convert;
 mod precision;
 mod estimate;
+mod integer;
 
 struct Slow {
     branches: [usize; 32],
@@ -497,6 +498,12 @@ impl<'s, 'b> Gen<'s, 'b> {
     }
 
     pub(super) fn simd_three(&mut self, q: bool, u: bool, size: u8, op: SimdOp, rd: u32, rn: u32, rm: u32, scalar: bool) -> bool {
+        match op {
+            SimdOp::CmTst if !scalar || size == 3 => return self.simd_cmtst(q && !scalar, size, rd, rn, rm),
+            SimdOp::UQSub if !scalar && size < 2 => return self.simd_uqsub(q, size, rd, rn, rm),
+            SimdOp::UShl if size >= 2 && (!scalar || size == 3) => return self.simd_ushl(q && !scalar, size, rd, rn, rm),
+            _ => {}
+        }
         if matches!(op, SimdOp::FAbd | SimdOp::FMulx | SimdOp::FRecps | SimdOp::FRsqrts) {
             return self.fp_special(q, size, scalar, op, rd, rn, rm);
         }
@@ -1074,6 +1081,18 @@ impl<'s, 'b> Gen<'s, 'b> {
         let esize = 31 - immh.leading_zeros(); // log2 bytes
         let ebits = 8u32 << esize;
         let immhb = (immh << 3) | immb;
+        if opcode == 0b10100 && !scalar && esize < 3 {
+            // SSHLL/USHLL (including SXTL/UXTL); Q selects the source half,
+            // and the result always occupies the full destination vector.
+            self.widen(X14, rn, esize as u8, !u, q);
+            let shift = (immhb - ebits) as u8;
+            if shift != 0 {
+                self.a.vex_ib(1, PP_66, false, false, 0x71 + esize as u8,
+                              6, X14, Rm::R(X14), shift);
+            }
+            self.store_vec(rd, X14);
+            return true;
+        }
         if esize >= 2 && matches!(opcode, 28 | 31) {
             return self.fp_simd_int(q, esize as u8, scalar, opcode == 28, u, 3, 2 * ebits - immhb, rd, rn);
         }

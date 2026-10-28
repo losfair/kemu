@@ -250,6 +250,26 @@ For complete hash throughput use
 Always use elapsed time: in-kernel emulation contributes to
 system CPU time, which OpenSSL's default user-time measurement excludes.
 
+`tests/bench/bun.mjs` reproduces the Bun JSON and gzip workloads. Each sample
+runs 20 JSON parse/stringify round trips over 10,000 objects, or eight level-6
+compressions of a deterministic 1 MiB buffer followed by decompression and
+SHA-256 verification. It prints elapsed milliseconds and checksums after
+untimed warmups; process startup is excluded. With the matching Bun binaries
+and their libc loaders installed in the guest, run both architectures inside
+the same QEMU/KVM VM, then repeat on the other kernel:
+
+```sh
+KERNEL=/path/to/bzImage scripts/run-vm.sh '
+  /path/in/guest/bun-x64 tests/bench/bun.mjs json 7 3 native
+  /path/in/guest/bun-arm64 tests/bench/bun.mjs json 7 3 kemu
+  /path/in/guest/bun-x64 tests/bench/bun.mjs gzip 7 3 native
+  /path/in/guest/bun-arm64 tests/bench/bun.mjs gzip 7 3 kemu
+'
+```
+
+Use the same Bun release (tested with 1.4.4), repeat with reversed run order,
+and compare medians and checksums. Keep helper profiling disabled for timings.
+
 T1 lowers every currently decoded S/D FP instruction family: scalar and SIMD
 arithmetic, comparisons (including conditional comparisons), rounding,
 pairwise/across-lane reductions, integer/fixed-point conversions, precision
@@ -268,6 +288,12 @@ It checks all four rounding modes, scalar/vector arrangements, aliasing, exact
 FPCR/FPSR/NZCV, exceptional inputs and inactive lanes. Ordinary-input cases
 must execute without helper calls (apart from the terminating BRK). Run with
 `NO_VCACHE=1` as well to check state-page and cached-vector paths.
+
+Mode 12 also covers the integer NEON paths used by Bun's JSON parser and
+zlib: CMTST, UMINV, SSHLL/USHLL, byte/halfword UQSUB, and 32/64-bit USHL.
+It checks operand aliasing, inactive lanes, signed low-byte shift counts,
+sticky FPSR.QC, and exact FPCR/FPSR/NZCV, allowing only the terminating BRK
+to use an instruction helper.
 
 `tests/jit-workloads/run.sh` runs JIT-heavy programs for Java, Node, LuaJIT,
 PyPy and Ruby inside an arm64 userland, each with the guest's JIT on and off,

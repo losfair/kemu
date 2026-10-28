@@ -60,7 +60,11 @@ fn f(a: u64) -> Fault {
 }
 
 fn xlate(env: &mut Racy) -> (Vec<u8>, Vec<u8>) {
-    let cfg = t1::Cfg { stubs: stub_addrs(), code_uaddr: 0x7e00_0010_0000, reloc: true, tbi: false, vector_cache: true, crypto: t1::HostCrypto::default() };
+    xlate_vectors(env, true)
+}
+
+fn xlate_vectors(env: &mut Racy, vector_cache: bool) -> (Vec<u8>, Vec<u8>) {
+    let cfg = t1::Cfg { stubs: stub_addrs(), code_uaddr: 0x7e00_0010_0000, reloc: true, tbi: false, vector_cache, crypto: t1::HostCrypto::default() };
     let mut s = Box::new(t1::Scratch::new());
     let mut out = vec![0u8; 1 << 16];
     let r = t1::translate(env, PC0, &mut out, &cfg, &mut s).unwrap();
@@ -115,6 +119,46 @@ fn fp_sysreg_recovery_commits_the_loaded_control_or_status() {
         } else {
             assert_eq!(state.fpcr, value);
             assert_eq!(state.fpsr, 0x1f);
+        }
+    }
+}
+
+/// UQSUB commits an aliased vector before FPSR. Recovery must roll QC
+/// forward, keep live FP exceptions, and never re-execute the subtraction.
+#[test]
+fn saturating_vector_recovery_commits_qc_with_the_result() {
+    use crate::jit::{meta, regmap};
+    use crate::state::CpuState;
+    for cache in [false, true] {
+        let mut env = Racy {
+            // Three uses ensure V0 is cached when the cache is enabled.
+            words: vec![0x6e612c00, 0x6e612c00, 0x6e612c00, 0xd65f03c0],
+            flip_at: 0, first: 0, second: 0, seen: false,
+        };
+        let (code, _) = xlate_vectors(&mut env, cache);
+        let hdr = meta::Header::read(&code).unwrap();
+        let m = &code[hdr.meta_off as usize..(hdr.meta_off + hdr.meta_len) as usize];
+        let (np, _) = meta::meta_counts(m).unwrap();
+        let p = (0..np).map(|i| meta::read_point(m, i).unwrap())
+            .find(|p| p.kind == meta::kind::ROLL_FP).unwrap();
+        let result = [0x0000_0123_0000_0456; 2];
+        for qc in [0, 1 << 27] {
+            let mut host = meta::HostRegs::default();
+            host.gpr[p.b as usize] = (qc | 0x10) as u64;
+            let mut state = CpuState::new();
+            state.fpsr = 0x10;
+            state.flags_x86 = regmap::image_from_nzcv(0xa000_0000);
+            let slot = m[8..16].iter().position(|&g| g == 0);
+            assert_eq!(slot.is_some(), cache);
+            if let Some(slot) = slot { host.xmm[slot] = result; }
+            else { state.v[0] = result; }
+            assert!(meta::recover(&code, p.off, &host, &mut state));
+            assert_eq!(state.pc, PC0 + 4);
+            assert_eq!(state.v[0], result);
+            assert_eq!(state.fpsr, qc | 0x10);
+            assert_eq!(state.nzcv, 0xa000_0000);
+            // A pending live divide-by-zero exception is merged afterward.
+            assert_eq!(regmap::fpsr_merge(state.fpsr, 4), qc | 0x12);
         }
     }
 }
