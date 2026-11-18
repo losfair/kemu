@@ -48,10 +48,38 @@ index b6e68ea98..e852b32d1 100644
  	nr = syscall_enter_from_user_mode(regs, nr);
  
 diff --git a/arch/x86/entry/vsyscall/vsyscall_64.c b/arch/x86/entry/vsyscall/vsyscall_64.c
-index 6e6c0a740..3ebc15c7b 100644
+index 6e6c0a740..183e8a92d 100644
 --- a/arch/x86/entry/vsyscall/vsyscall_64.c
 +++ b/arch/x86/entry/vsyscall/vsyscall_64.c
-@@ -303,6 +303,11 @@ static struct vm_area_struct gate_vma __ro_after_init = {
+@@ -31,6 +31,7 @@
+ #include <linux/sched/signal.h>
+ #include <linux/mm_types.h>
+ #include <linux/syscalls.h>
++#include <linux/kemu.h>
+ #include <linux/ratelimit.h>
+ 
+ #include <asm/vsyscall.h>
+@@ -124,6 +125,19 @@ bool emulate_vsyscall(unsigned long error_code,
+ 	if ((error_code & (X86_PF_WRITE | X86_PF_USER)) != X86_PF_USER)
+ 		return false;
+ 
++#ifdef CONFIG_KEMU
++	/*
++	 * AArch64 processes have no x86 vsyscall page (get_gate_vma() returns
++	 * NULL for them). Never emulate the x86 vsyscall ABI for a kemu task:
++	 * doing so would run an x86_64 syscall with syscall_get_arch() reporting
++	 * AUDIT_ARCH_AARCH64, confusing seccomp, and bypass guest syscall
++	 * translation entirely. Let the fault fall through to SIGSEGV, which is
++	 * what arm64 does for this address (audit H-02).
++	 */
++	if (task_is_kemu(current))
++		return false;
++#endif
++
+ 	/*
+ 	 * Assume that faults at regs->ip are because of an
+ 	 * instruction fetch. Return early and avoid
+@@ -303,6 +317,11 @@ static struct vm_area_struct gate_vma __ro_after_init = {
  
  struct vm_area_struct *get_gate_vma(struct mm_struct *mm)
  {

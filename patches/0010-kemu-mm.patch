@@ -1,3 +1,89 @@
+diff --git a/mm/madvise.c b/mm/madvise.c
+index fb1c86e63..14b27b8d3 100644
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <linux/mman.h>
++#include <linux/kemu.h>
+ #include <linux/pagemap.h>
+ #include <linux/syscalls.h>
+ #include <linux/mempolicy.h>
+@@ -957,6 +958,15 @@ static long madvise_dontneed_free(struct madvise_behavior *madv_behavior)
+ 		VM_WARN_ON(range->start > range->end);
+ 	}
+ 
++	/*
++	 * Discarding pages of an executable mapping (MADV_DONTNEED refaults from
++	 * the backing file/zero; MADV_FREE may drop dirty COW pages) can change
++	 * the instructions the guest sees, so invalidate any kemu translations
++	 * of this range before the pages go away (audit M-02).
++	 */
++	if (madv_behavior->vma->vm_flags & VM_EXEC)
++		kemu_unmapped(mm, range->start, range->end);
++
+ 	if (behavior == MADV_DONTNEED || behavior == MADV_DONTNEED_LOCKED)
+ 		return madvise_dontneed_single_vma(madv_behavior);
+ 	else if (behavior == MADV_FREE)
+diff --git a/mm/memory.c b/mm/memory.c
+index b59ae7ce4..f59d28c2d 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -47,6 +47,7 @@
+ #include <linux/sched/task.h>
+ #include <linux/hugetlb.h>
+ #include <linux/mman.h>
++#include <linux/kemu.h>
+ #include <linux/swap.h>
+ #include <linux/highmem.h>
+ #include <linux/pagemap.h>
+@@ -6887,6 +6888,14 @@ static int __access_remote_vm(struct mm_struct *mm, unsigned long addr,
+ 				copy_to_user_page(vma, page, addr,
+ 						  maddr + offset, buf, bytes);
+ 				folio_mark_dirty_lock(folio);
++				/*
++				 * A FOLL_FORCE write to an executable mapping
++				 * (ptrace POKETEXT, /proc/<pid>/mem, software
++				 * breakpoints) changes guest instructions behind
++				 * kemu's back: drop stale translations (M-02).
++				 */
++				if (vma->vm_flags & VM_EXEC)
++					kemu_unmapped(mm, addr, addr + bytes);
+ 			} else {
+ 				copy_from_user_page(vma, page, addr,
+ 						    buf, maddr + offset, bytes);
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 5fd3b80fd..7039b0832 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -16,6 +16,7 @@
+ #include <linux/mm_inline.h>
+ #include <linux/shm.h>
+ #include <linux/mman.h>
++#include <linux/kemu.h>
+ #include <linux/pagemap.h>
+ #include <linux/swap.h>
+ #include <linux/syscalls.h>
+@@ -88,6 +89,18 @@ void vma_set_page_prot(struct vm_area_struct *vma)
+ 		vm_flags &= ~VM_SHARED;
+ 		vm_page_prot = vm_pgprot_modify(vm_page_prot, vm_flags);
+ 	}
++#ifdef CONFIG_KEMU
++	/*
++	 * Guest VMAs of a kemu process are never executed natively (only read
++	 * for translation), so drop host executability from them while keeping
++	 * VM_EXEC as the semantic flag. kemu's own region (translated code and
++	 * trampoline) is excluded and stays host-executable (DESIGN §6.1,
++	 * audit H-02).
++	 */
++	if ((vm_flags & VM_EXEC) && vma->vm_mm && vma->vm_mm->kemu_guest &&
++	    !kemu_vma_is_region(vma))
++		vm_page_prot = vm_pgprot_modify(vm_page_prot, vm_flags & ~VM_EXEC);
++#endif
+ 	/* remove_protection_ptes reads vma->vm_page_prot without mmap_lock */
+ 	WRITE_ONCE(vma->vm_page_prot, vm_page_prot);
+ }
 diff --git a/mm/mprotect.c b/mm/mprotect.c
 index 113b48985..a94b1ab94 100644
 --- a/mm/mprotect.c

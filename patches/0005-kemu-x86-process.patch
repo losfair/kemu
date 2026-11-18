@@ -16,7 +16,7 @@ index 50f75467f..8d2142a8e 100644
  
  static __always_inline bool ip_within_syscall_gap(struct pt_regs *regs)
 diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
-index 4c718f8ad..eb47297f5 100644
+index 4c718f8ad..d33405d9f 100644
 --- a/arch/x86/kernel/process.c
 +++ b/arch/x86/kernel/process.c
 @@ -9,6 +9,7 @@
@@ -35,8 +35,18 @@ index 4c718f8ad..eb47297f5 100644
  }
  
  static int set_new_tls(struct task_struct *p, unsigned long tls)
-@@ -266,6 +268,10 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
- 	if (clone_flags & CLONE_SETTLS)
+@@ -263,9 +265,19 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+ 	}
+ 
+ 	/* Set a new TLS for the child thread? */
+-	if (clone_flags & CLONE_SETTLS)
++	/*
++	 * For kemu tasks the TLS is the guest TPIDR_EL0, which arm64 allows to
++	 * be any 64-bit value (including a tagged/non-canonical pointer).
++	 * set_new_tls() would reject it as a bad x86 FS base, so skip it and let
++	 * kemu_copy_thread() store it in the guest state instead (audit L-05).
++	 */
++	if ((clone_flags & CLONE_SETTLS) && !task_is_kemu(current))
  		ret = set_new_tls(p, tls);
  
 +	/* kemu: stack and TLS are guest values; set up the guest thread. */

@@ -24,7 +24,7 @@ emit kemu-syscall-arch      arch/x86/include/asm/syscall.h
 emit kemu-fork-exit-exec    kernel/fork.c kernel/exit.c fs/exec.c
 emit kemu-openat2           fs/open.c fs/internal.h
 emit kemu-x86-fault         arch/x86/mm/fault.c arch/x86/kernel/traps.c
-emit kemu-mm                mm/vma.c mm/mprotect.c mm/mremap.c mm/mmap.c mm/memory.c
+emit kemu-mm                mm/vma.c mm/mprotect.c mm/mremap.c mm/mmap.c mm/memory.c mm/madvise.c
 emit kemu-proc              fs/proc/ arch/x86/kernel/cpu/proc.c fs/coredump.c
 emit kemu-ptrace            kernel/ptrace.c arch/x86/kernel/ptrace.c arch/x86/kernel/step.c
 emit kemu-seccomp           kernel/seccomp.c

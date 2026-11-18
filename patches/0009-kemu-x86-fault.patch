@@ -1,5 +1,5 @@
 diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
-index 6b22611e6..e28641933 100644
+index 6b22611e6..e50247966 100644
 --- a/arch/x86/kernel/traps.c
 +++ b/arch/x86/kernel/traps.c
 @@ -43,6 +43,7 @@
@@ -10,7 +10,18 @@ index 6b22611e6..e28641933 100644
  
  #include <asm/stacktrace.h>
  #include <asm/processor.h>
-@@ -819,6 +820,10 @@ DEFINE_IDTENTRY_ERRORCODE(exc_general_protection)
+@@ -286,6 +287,10 @@ static __always_inline void __user *error_get_trap_addr(struct pt_regs *regs)
+ 
+ DEFINE_IDTENTRY(exc_divide_error)
+ {
++	/* kemu: a raced guest divisor in translated code (audit M-03). */
++	if (user_mode(regs) && task_is_kemu(current) && kemu_user_de(regs))
++		return;
++
+ 	do_error_trap(regs, 0, "divide error", X86_TRAP_DE, SIGFPE,
+ 		      FPE_INTDIV, error_get_trap_addr(regs));
+ }
+@@ -819,6 +824,10 @@ DEFINE_IDTENTRY_ERRORCODE(exc_general_protection)
  		if (fixup_vdso_exception(regs, X86_TRAP_GP, error_code, 0))
  			goto exit;
  

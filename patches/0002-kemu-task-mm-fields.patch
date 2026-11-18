@@ -1,13 +1,15 @@
 diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
-index 90e5790c3..dec211cb5 100644
+index 90e5790c3..4875ae680 100644
 --- a/include/linux/mm_types.h
 +++ b/include/linux/mm_types.h
-@@ -1146,6 +1146,9 @@ struct mm_struct {
+@@ -1146,6 +1146,11 @@ struct mm_struct {
  		struct task_struct __rcu *owner;
  #endif
  		struct user_namespace *user_ns;
 +#ifdef CONFIG_KEMU
 +		struct kemu_mm *kemu;
++		/* AArch64 guest: set at exec before any VMA, gates host-NX. */
++		bool kemu_guest;
 +#endif
  
  		/* store ref to file /proc/<pid>/exe symlink points to */
