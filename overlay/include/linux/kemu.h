@@ -54,6 +54,7 @@ void kemu_exec_release(struct task_struct *tsk, struct mm_struct *old_mm);
 
 /* Guest view helpers used by generic code. */
 unsigned long kemu_user_sp(struct task_struct *tsk);
+unsigned long kemu_user_pc(struct task_struct *tsk);
 
 /* ptrace */
 struct user_regset_view;
@@ -72,15 +73,18 @@ int kemu_semctl_set(int semid, int cmd, struct semid64_ds *in);
 /* mm / proc */
 void kemu_unmapped(struct mm_struct *mm, unsigned long start, unsigned long end);
 bool kemu_vma_hidden(struct vm_area_struct *vma);
+bool kemu_vma_is_region(struct vm_area_struct *vma);
 int kemu_show_cpuinfo(struct seq_file *m, unsigned int cpu);
 bool kemu_user_fault(struct pt_regs *regs, unsigned long address);
 bool kemu_user_gp(struct pt_regs *regs);
+bool kemu_user_de(struct pt_regs *regs);
 
 #else /* !CONFIG_KEMU */
 
 #define task_is_kemu(t) false
 
 static inline bool kemu_user_gp(struct pt_regs *regs) { return false; }
+static inline bool kemu_user_de(struct pt_regs *regs) { return false; }
 
 static inline void kemu_exit_to_user(struct pt_regs *regs) { }
 static inline void kemu_do_signal(struct pt_regs *regs) { }

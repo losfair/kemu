@@ -118,6 +118,7 @@ struct kemu_mm {
 	atomic_t flush_pending;		/* executable mapping went away */
 	spinlock_t pend_lock;
 	u64 pend_lo, pend_hi;		/* ... this guest range */
+	atomic64_t unmap_seq;		/* bumped whenever a mapping is torn down */
 	void *scratch;			/* translator scratch (kemu_rs_scratch_size) */
 	struct kemu_stubs stubs;
 	spinlock_t threads_lock;
@@ -207,6 +208,9 @@ static inline unsigned long kemu_stub(struct kemu_mm *km, u32 off)
 
 extern bool kemu_jit_enabled;
 extern int kemu_debug;
+extern bool kemu_host_ok;	/* host CPU supports the JIT; set at init */
+extern bool kemu_enabled;	/* kernel.kemu.enabled sysctl */
+extern bool kemu_restrict;	/* kernel.kemu.restrict sysctl */
 
 /* core.c */
 int kemu_setup_mm(struct linux_binprm *bprm);
@@ -254,6 +258,9 @@ long kemu_sys_epoll_pwait2(struct pt_regs *regs);
 long kemu_sys_uname(struct pt_regs *regs);
 long kemu_sys_clone(struct pt_regs *regs);
 long kemu_sys_semctl(struct pt_regs *regs);
+long kemu_sys_sigaltstack(struct pt_regs *regs);
+long kemu_sys_mmap(struct pt_regs *regs);
+long kemu_sys_prctl(struct pt_regs *regs);
 
 /* env.c: host services for the Rust core. */
 int kemu_c_read(u64 addr, void *buf, size_t len);
@@ -353,6 +360,7 @@ u32 kemu_rs_mxcsr_from(u32 fpcr, u32 fpsr);
 u32 kemu_rs_fpsr_merge(u32 fpsr, u32 mxcsr);
 void kemu_rs_crc_table(u32 *out);
 void kemu_rs_set_jit_off(u32 mask);
+void kemu_rs_set_host_features(bool aes, bool pclmul, bool sha, bool rndr);
 
 #define KEMU_CPU_CRC_TABLE	2048	/* offset in the state page (jit/regmap.rs) */
 

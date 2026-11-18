@@ -54,6 +54,13 @@ static inline unsigned long kemu_fault_error(void)
 static inline void kemu_set_personality(void)
 {
 	set_personality_64bit();
+	/*
+	 * Mark the (freshly installed, still empty) mm as an AArch64 guest
+	 * before any stack/ELF VMA is created, so vma_set_page_prot() strips
+	 * host executability from every guest mapping from birth -- no PTE is
+	 * ever created host-executable (audit H-02a).
+	 */
+	current->mm->kemu_guest = true;
 }
 
 #endif

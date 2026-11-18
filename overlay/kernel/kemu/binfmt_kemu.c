@@ -6,13 +6,24 @@
 
 #include <linux/elf.h>
 #include <linux/kemu.h>
+#include <linux/capability.h>
+#include <linux/cred.h>
+#include <linux/user_namespace.h>
 #include "kemu_internal.h"
-
-static bool kemu_enabled_sysctl = true;
 
 static inline bool kemu_elf_check_arch(const struct elf64_hdr *x)
 {
-	return READ_ONCE(kemu_enabled_sysctl) && x->e_machine == EM_AARCH64 &&
+	if (!kemu_host_ok || !READ_ONCE(kemu_enabled))
+		return false;
+	/*
+	 * kernel.kemu.restrict=1 limits the translator to the initial user
+	 * namespace / CAP_SYS_ADMIN, shrinking the attack surface reachable by
+	 * unprivileged users in containers (audit M-04).
+	 */
+	if (READ_ONCE(kemu_restrict) && current_user_ns() != &init_user_ns &&
+	    !capable(CAP_SYS_ADMIN))
+		return false;
+	return x->e_machine == EM_AARCH64 &&
 	       x->e_ident[EI_CLASS] == ELFCLASS64 &&
 	       x->e_ident[EI_DATA] == ELFDATA2LSB;
 }

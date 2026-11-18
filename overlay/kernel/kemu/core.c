@@ -20,13 +20,30 @@
 #include <linux/elf.h>
 #include <linux/highmem.h>
 #include <linux/ptrace.h>
+#include <linux/sysctl.h>
 #include <asm/processor.h>
+#include <asm/cpufeature.h>
 
 #include "kemu_internal.h"
 
 DEFINE_STATIC_KEY_FALSE(kemu_active_key);
 
 static struct kmem_cache *kemu_thread_cache;
+
+/*
+ * Set once at init: the host CPU provides every instruction the translator
+ * and the kernel glue emit unconditionally (x86-64-v3 plus CX16/FSGSBASE,
+ * AES-NI and PCLMULQDQ). If false, kemu refuses to run any guest, so that
+ * translated code (or kemu_arch_cmpxchg's LOCK CMPXCHG16B) can never raise
+ * a #UD in the kernel. See DESIGN.md §14.
+ */
+bool kemu_host_ok __ro_after_init;
+/* kernel.kemu.* sysctls (DESIGN.md §13). */
+bool kemu_enabled = true;
+bool kemu_restrict;
+
+/* arm64 HWCAP2 bit for RNDR/RNDRRS (uapi/asm/hwcap.h HWCAP2_RNG). */
+#define HWCAP2_RNG	(1u << 16)
 
 /* ---- fault handlers ---- */
 
@@ -208,7 +225,7 @@ static int kemu_slot_get(struct kemu_mm *km)
 	struct kemu_slot *s;
 	int idx, err;
 
-	idx = ida_alloc_max(&km->slot_ida, KEMU_MAX_THREADS - 1, GFP_KERNEL);
+	idx = ida_alloc_max(&km->slot_ida, KEMU_MAX_THREADS - 1, GFP_KERNEL_ACCOUNT);
 	if (idx < 0)
 		return idx;
 	if (xa_load(&km->slots, idx))
@@ -218,7 +235,7 @@ static int kemu_slot_get(struct kemu_mm *km)
 		ida_free(&km->slot_ida, idx);
 		return -ENOMEM;
 	}
-	err = xa_err(xa_store(&km->slots, idx, s, GFP_KERNEL));
+	err = xa_err(xa_store(&km->slots, idx, s, GFP_KERNEL_ACCOUNT));
 	if (err) {
 		int i;
 
@@ -265,12 +282,22 @@ static struct kemu_thread *kemu_thread_new(struct kemu_mm *km, int slot,
 	kt->rstack_top = kemu_slot_base(km, slot) + KEMU_SLOT_RSTACK_TOP_PG * PAGE_SIZE - 64;
 	kt->cpu->host_rsp_top = kt->rstack_top;
 	kemu_rs_crc_table((u32 *)((u8 *)kt->cpu + KEMU_CPU_CRC_TABLE));
-	/* Return-stack underflow sentinels: "return" into dispatch_rax. */
+	/*
+	 * Clear the host return-stack pages before use. On a reused slot (an
+	 * exited thread's, see kemu_slot_get) they would otherwise hold that
+	 * thread's return addresses; the entries are only prediction hints, but
+	 * a stale one sends the thread through kemu_materialize for no reason
+	 * and must not leak another thread's control flow into this one.
+	 */
 	{
 		struct kemu_slot *s = xa_load(&km->slots, slot);
-		u64 *top = page_address(s->pages[KEMU_SLOT_USED_PAGES - 1]) + PAGE_SIZE - 64;
+		u64 *top;
 		int i;
 
+		for (i = 1; i < KEMU_SLOT_USED_PAGES; i++)
+			clear_page(page_address(s->pages[i]));
+		/* Return-stack underflow sentinels: "return" into dispatch_rax. */
+		top = page_address(s->pages[KEMU_SLOT_USED_PAGES - 1]) + PAGE_SIZE - 64;
 		for (i = 0; i < 8; i++)
 			top[i] = kemu_stub(km, km->stubs.dispatch_rax);
 	}
@@ -302,7 +329,7 @@ void kemu_redirect(struct kemu_thread *kt)
 int kemu_setup_mm(struct linux_binprm *bprm)
 {
 	struct mm_struct *mm = current->mm;
-	struct vm_area_struct *vma;
+	struct vm_area_struct *vma, *vma_code, *vma_table, *vma_slots;
 	struct kemu_mm *km;
 	unsigned long addr;
 	int ret;
@@ -310,8 +337,8 @@ int kemu_setup_mm(struct linux_binprm *bprm)
 	km = kemu_mm_alloc();
 	if (!km)
 		return -ENOMEM;
-	km->chunks[0] = vzalloc(KEMU_STUBS_SIZE);
-	km->table = vzalloc(KEMU_TABLE_SIZE);
+	km->chunks[0] = __vmalloc(KEMU_STUBS_SIZE, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+	km->table = __vmalloc(KEMU_TABLE_SIZE, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
 	if (!km->chunks[0] || !km->table) {
 		kemu_mm_free(km);
 		return -ENOMEM;
@@ -342,6 +369,7 @@ int kemu_setup_mm(struct linux_binprm *bprm)
 		ret = PTR_ERR(vma);
 		goto fail;
 	}
+	vma_code = vma;
 	vma = _install_special_mapping(mm, km->table_base, KEMU_TABLE_SIZE,
 				       VM_READ | VM_MAYREAD |
 				       VM_PFNMAP | VM_DONTDUMP | VM_IO,
@@ -350,6 +378,7 @@ int kemu_setup_mm(struct linux_binprm *bprm)
 		ret = PTR_ERR(vma);
 		goto fail_unmap;
 	}
+	vma_table = vma;
 	vma = _install_special_mapping(mm, km->slots_base, KEMU_SLOTS_SIZE,
 				       VM_READ | VM_WRITE | VM_MAYREAD | VM_MAYWRITE |
 				       VM_SHARED | VM_MAYSHARE |
@@ -359,6 +388,7 @@ int kemu_setup_mm(struct linux_binprm *bprm)
 		ret = PTR_ERR(vma);
 		goto fail_unmap;
 	}
+	vma_slots = vma;
 	addr = get_unmapped_area(NULL, 0, PAGE_SIZE, 0, 0);
 	if (IS_ERR_VALUE(addr)) {
 		ret = addr;
@@ -372,6 +402,21 @@ int kemu_setup_mm(struct linux_binprm *bprm)
 		goto fail_unmap;
 	}
 	km->vdso_base = addr;
+
+	/*
+	 * Seal (mseal) all four mappings only now that they all exist: the
+	 * guest must never munmap, mprotect, mremap or mmap(MAP_FIXED) over any
+	 * part of the region. Without it a guest could split a VMA so that
+	 * fork's PTE copy (kemu_dup_mm) or chunk reclaim (kemu_reclaim) leaves
+	 * live Ring-3 PTEs on pages the kernel then frees -- a physical-page
+	 * UAF (audit C-01). Sealing last keeps the fail_unmap path able to tear
+	 * the region down: do_munmap() on a sealed VMA returns -EPERM.
+	 */
+	vm_flags_set(vma_code, VM_SEALED);
+	vm_flags_set(vma_table, VM_SEALED);
+	vm_flags_set(vma_slots, VM_SEALED);
+	vm_flags_set(vma, VM_SEALED);
+
 	mm->kemu = km;
 	mmap_write_unlock(mm);
 	return 0;
@@ -483,9 +528,9 @@ int kemu_dup_mm(struct mm_struct *oldmm, struct mm_struct *mm)
 	km->slots_base = okm->slots_base;
 	km->vdso_base = okm->vdso_base;
 	err = -ENOMEM;
-	km->chunks[0] = vzalloc(KEMU_STUBS_SIZE);
+	km->chunks[0] = __vmalloc(KEMU_STUBS_SIZE, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
 	/* Zeroed: the whole table is mapped, but only part of it is written. */
-	km->table = vzalloc(KEMU_TABLE_SIZE);
+	km->table = __vmalloc(KEMU_TABLE_SIZE, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
 	if (!km->chunks[0] || !km->table)
 		goto out_unlock;
 	memcpy(km->chunks[0], okm->chunks[0], KEMU_STUBS_SIZE);
@@ -497,18 +542,21 @@ int kemu_dup_mm(struct mm_struct *oldmm, struct mm_struct *mm)
 	/* Copy the current thread's slot to the same index. */
 	os = xa_load(&okm->slots, kt->slot);
 	s = kemu_slot_alloc_pages();
-	if (!os || !s)
+	if (!os || !s) {
+		err = -ENOMEM;
 		goto out_free;
+	}
 	for (i = 0; i < KEMU_SLOT_USED_PAGES; i++)
 		copy_highpage(s->pages[i], os->pages[i]);
-	err = ida_alloc_range(&km->slot_ida, kt->slot, kt->slot, GFP_KERNEL);
+	err = ida_alloc_range(&km->slot_ida, kt->slot, kt->slot, GFP_KERNEL_ACCOUNT);
 	if (err < 0)
 		goto out_free_slot;
-	err = xa_err(xa_store(&km->slots, kt->slot, s, GFP_KERNEL));
+	err = xa_err(xa_store(&km->slots, kt->slot, s, GFP_KERNEL_ACCOUNT));
 	if (err)
 		goto out_free_slot;
 
 	mm->kemu = km;
+	mm->kemu_guest = true;
 	kemu_zap_region(mm, km);
 	return 0;
 
@@ -612,7 +660,22 @@ void kemu_unmapped(struct mm_struct *mm, unsigned long start, unsigned long end)
 
 	if (!km || start >= end)
 		return;
-	if (!xa_find(&km->blocks, &idx, (end - 1) >> 2, XA_PRESENT)) {
+	/*
+	 * Publish that a mapping changed *before* any early return: a concurrent
+	 * kemu_translate() may be fetching instructions from this range before
+	 * its block is registered in km->blocks/km->pages, so the xa_find()
+	 * checks below would miss it. The sequence bump lets that translation
+	 * notice and discard its (possibly stale) block (audit M-02).
+	 */
+	atomic64_inc(&km->unmap_seq);
+	/*
+	 * Wide blocks (reading more than KEMU_MAX_PAGES guest pages) are not
+	 * indexed in km->pages, so a range that touches only such a block's
+	 * tail page would be missed here. When any wide block exists, fall
+	 * through and let kemu_jit_invalidate() sort it out (audit M-02).
+	 */
+	if (!READ_ONCE(km->wide) &&
+	    !xa_find(&km->blocks, &idx, (end - 1) >> 2, XA_PRESENT)) {
 		idx = start >> PAGE_SHIFT;
 		if (!xa_find(&km->pages, &idx, (end - 1) >> PAGE_SHIFT, XA_PRESENT))
 			return;
@@ -640,6 +703,25 @@ bool kemu_vma_hidden(struct vm_area_struct *vma)
 }
 
 /*
+ * True for any of kemu's own mappings (the three hidden ones plus the visible
+ * [vdso] trampoline). Host page-protection fix-up (kemu_vma_page_prot) must
+ * leave these alone; every other VMA in a kemu mm is guest memory and never
+ * executed natively, so its host executability is stripped.
+ */
+bool kemu_vma_is_region(struct vm_area_struct *vma)
+{
+	/*
+	 * Identified purely by the special-mapping ops, so it works before
+	 * mm->kemu is set (during exec, while mm->kemu_guest already gates the
+	 * host-exec stripping).
+	 */
+	return vma_is_special_mapping(vma, &kemu_code_mapping) ||
+	       vma_is_special_mapping(vma, &kemu_table_mapping) ||
+	       vma_is_special_mapping(vma, &kemu_slots_mapping) ||
+	       vma_is_special_mapping(vma, &kemu_tramp_mapping);
+}
+
+/*
  * A user page fault of a kemu task: the host return stack overflowed into
  * its guard page (deep or unbalanced guest calls). The entries are only
  * prediction hints, so reset the stack and retry.
@@ -662,6 +744,12 @@ bool kemu_user_fault(struct pt_regs *regs, unsigned long address)
 unsigned long kemu_user_sp(struct task_struct *tsk)
 {
 	return tsk->kemu ? READ_ONCE(tsk->kemu->cpu->sp) : 0;
+}
+
+/* /proc/<pid>/stat kstkeip: the guest PC, not the host code-cache RIP. */
+unsigned long kemu_user_pc(struct task_struct *tsk)
+{
+	return tsk->kemu ? READ_ONCE(tsk->kemu->cpu->pc) : 0;
 }
 
 /* current_user_stack_pointer(): the guest SP for kemu tasks. */
@@ -701,16 +789,88 @@ unsigned int kemu_hwcap(void)
 
 unsigned int kemu_hwcap2(void)
 {
-	return kemu_rs_hwcap2();
+	unsigned int hw2 = kemu_rs_hwcap2();
+
+	/* Don't advertise RNG (RNDR/RNDRRS) if the host has no RDRAND. */
+	if (!boot_cpu_has(X86_FEATURE_RDRAND))
+		hw2 &= ~(unsigned int)HWCAP2_RNG;
+	return hw2;
 }
+
+/*
+ * Every host instruction the translator and glue emit without a runtime
+ * check. Missing any of these would fault (#UD) in kernel context, so kemu
+ * refuses to run guests rather than risk a kernel panic. AES-NI/PCLMULQDQ
+ * have JIT fallbacks but are required by DESIGN §2.2/§14 and keep the
+ * advertised AES/PMULL HWCAP honest, so they are required here too.
+ */
+static const unsigned int kemu_required_features[] = {
+	X86_FEATURE_XSAVE, X86_FEATURE_OSXSAVE,
+	X86_FEATURE_XMM, X86_FEATURE_XMM2,
+	X86_FEATURE_AVX, X86_FEATURE_AVX2, X86_FEATURE_FMA,
+	X86_FEATURE_BMI1, X86_FEATURE_BMI2, X86_FEATURE_ABM, X86_FEATURE_MOVBE,
+	X86_FEATURE_CX16, X86_FEATURE_FSGSBASE,
+	X86_FEATURE_AES, X86_FEATURE_PCLMULQDQ,
+};
+
+static bool __init kemu_host_supported(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(kemu_required_features); i++)
+		if (!boot_cpu_has(kemu_required_features[i])) {
+			pr_warn("kemu: disabled: host CPU lacks required feature (x86_feature %u); needs x86-64-v3 + CX16/FSGSBASE/AES-NI/PCLMULQDQ\n",
+				kemu_required_features[i]);
+			return false;
+		}
+	/* YMM state must actually be enabled in XCR0 for VEX-256 code. */
+	if (!cpu_feature_enabled(X86_FEATURE_AVX)) {
+		pr_warn("kemu: disabled: AVX (YMM) state not enabled\n");
+		return false;
+	}
+	return true;
+}
+
+static struct ctl_table kemu_sysctls[] = {
+	{
+		.procname	= "enabled",
+		.data		= &kemu_enabled,
+		.maxlen		= sizeof(bool),
+		.mode		= 0644,
+		.proc_handler	= proc_dobool,
+	},
+	{
+		.procname	= "restrict",
+		.data		= &kemu_restrict,
+		.maxlen		= sizeof(bool),
+		.mode		= 0644,
+		.proc_handler	= proc_dobool,
+	},
+};
 
 static int __init kemu_init(void)
 {
 	static const u32 tramp[] = { 0xd2801168, 0xd4000001 };
 
+	kemu_host_ok = kemu_host_supported();
+	if (!kemu_host_ok)
+		return 0;
+
+	/*
+	 * Hand the optional host features to the Rust core via the kernel's own
+	 * detection, so clearcpuid= is respected and an absent RDRAND disables
+	 * RNDR (audit H-01). AES/PCLMUL are required above, so always present.
+	 */
+	kemu_rs_set_host_features(cpu_feature_enabled(X86_FEATURE_AES),
+				  cpu_feature_enabled(X86_FEATURE_PCLMULQDQ),
+				  cpu_feature_enabled(X86_FEATURE_SHA_NI),
+				  cpu_feature_enabled(X86_FEATURE_RDRAND));
+
 	kemu_thread_cache = KMEM_CACHE(kemu_thread, SLAB_PANIC | SLAB_ACCOUNT);
 	if (kemu_xc_init())
 		pr_warn("kemu: no shared translation cache shrinker\n");
+	if (!register_sysctl("kernel/kemu", kemu_sysctls))
+		pr_warn("kemu: could not register sysctls\n");
 	pr_info("kemu: AArch64 user-mode emulation, %s\n",
 		kemu_jit_enabled ? "JIT" : "interpreter only");
 	kemu_tramp_pages[0] = alloc_page(GFP_KERNEL | __GFP_ZERO);
