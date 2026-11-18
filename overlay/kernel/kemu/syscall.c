@@ -79,7 +79,7 @@ void kemu_svc(struct pt_regs *regs)
 	long nr;
 
 	kemu_enter_op(kt);
-	next_pc = cpu->pc;
+	next_pc = READ_ONCE(cpu->pc);
 	kemu_load_syscall_view(regs, cpu);
 	kt->orig_x0 = kemu_reg(regs, di);
 	kt->flags = (kt->flags & ~KEMU_TF_ROLLBACK) | KEMU_TF_IN_SVC;
@@ -147,6 +147,8 @@ unsigned long kemu_interp(struct kemu_thread *kt, struct kemu_mm *km, u32 budget
 
 	switch (ex.kind) {
 	case KEMU_EXIT_SVC:
+		/* pc is already svc + 4; make sure nothing redirects past it. */
+		kemu_pend_svc(kt);
 		return kemu_stub(km, km->stubs.interp_svc);
 	case KEMU_EXIT_BRK:
 		force_sig_fault(SIGTRAP, TRAP_BRKPT, (void __user *)pc);

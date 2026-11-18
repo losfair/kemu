@@ -169,6 +169,7 @@ struct kemu_pgvec {
 #define KEMU_TF_STEP		BIT(3)	/* ptrace single-step */
 #define KEMU_TF_STEP_SVC	BIT(4)	/* trap after the stepped svc */
 #define KEMU_TF_ROLLBACK	BIT(5)	/* syscall_rollback() undid this svc */
+#define KEMU_TF_PENDING_SVC	BIT(6)	/* interpreter retired svc; enter interp_svc */
 
 struct kemu_thread {
 	struct task_struct *task;
@@ -216,6 +217,7 @@ extern bool kemu_restrict;	/* kernel.kemu.restrict sysctl */
 int kemu_setup_mm(struct linux_binprm *bprm);
 void kemu_start_thread(struct pt_regs *regs, unsigned long pc, unsigned long sp);
 void kemu_redirect(struct kemu_thread *kt);
+void kemu_pend_svc(struct kemu_thread *kt);
 unsigned int kemu_hwcap(void);
 unsigned int kemu_hwcap2(void);
 

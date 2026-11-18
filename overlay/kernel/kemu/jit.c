@@ -328,6 +328,14 @@ void kemu_jit_invalidate(struct kemu_mm *km, u64 lo, u64 hi)
 			kemu_blk_kill(km, v->off[i]);
 		kfree(v);
 	}
+	/* Forget TBI hints for guest PCs whose code is going away (M-04). */
+	if (!xa_empty(&km->tbi_pcs)) {
+		unsigned long p;
+		void *e;
+
+		xa_for_each_range(&km->tbi_pcs, p, e, lo >> 2, (hi - 1) >> 2)
+			xa_erase(&km->tbi_pcs, p);
+	}
 	if (km->wide) {
 		for (i = 0; i < km->wide->n; i++)
 			kemu_blk_kill(km, km->wide->off[i]);
@@ -429,6 +437,12 @@ void kemu_jit_flush(struct kemu_mm *km)
 	for (i = 0; i < KEMU_TABLE_ENTRIES; i++)
 		WRITE_ONCE(t[i], miss);
 	xa_destroy(&km->blocks);
+	/*
+	 * Drop the TBI hint set too: it would otherwise grow without bound over
+	 * a process's lifetime (audit M-04). Tagged blocks re-mark themselves
+	 * on the next non-canonical #GP after retranslation.
+	 */
+	xa_destroy(&km->tbi_pcs);
 	kemu_inval_free(km);
 	for (c = 1; c < KEMU_MAX_CHUNKS; c++)
 		if (km->chunks[c] && !km->chunk_retired[c])
@@ -612,7 +626,7 @@ static int kemu_translate(struct kemu_mm *km, u64 pc, unsigned long *main,
 		return err;
 	set_bit(km->chunk_used[c] / KEMU_BLOCK_ALIGN, km->blockmap[c]);
 	km->chunk_used[c] += ALIGN(res->size, KEMU_BLOCK_ALIGN);
-	err = xa_err(xa_store(&km->blocks, pc >> 2, xa_mk_value(off), GFP_KERNEL));
+	err = xa_err(xa_store(&km->blocks, pc >> 2, xa_mk_value(off), GFP_KERNEL_ACCOUNT));
 	if (err)
 		return err;
 	km->translations++;
@@ -742,8 +756,17 @@ void kemu_materialize(struct pt_regs *regs)
 	size_t len;
 	u32 mxcsr;
 
-	if (kt->flags & KEMU_TF_KSTATE)
+	if (kt->flags & KEMU_TF_KSTATE) {
+		/*
+		 * A retired-but-not-performed svc (kemu_pend_svc()): like an
+		 * interrupted svc stub (STUB_PAGE_STATE_SVC), restart it.
+		 */
+		if (kt->flags & KEMU_TF_PENDING_SVC) {
+			cpu->pc -= 4;
+			kt->flags &= ~(KEMU_TF_PENDING_SVC | KEMU_TF_STEP_SVC);
+		}
 		goto out;
+	}
 	mxcsr = kemu_host_regs(regs, &h);
 	kt->shadow = *cpu;
 	if (ip >= km->code_base && ip < km->code_base + KEMU_STUBS_SIZE) {
@@ -754,6 +777,9 @@ void kemu_materialize(struct pt_regs *regs)
 		 * describe the previous state. Use the page when authoritative. */
 		if (info == KEMU_STUB_PAGE_STATE || info == KEMU_STUB_PAGE_STATE_SVC)
 			mxcsr = cpu->scratch[KEMU_MXCSR_SLOT];
+		/* The svc restarts; a stepped one re-arms STEP_SVC when re-stepped. */
+		if (info == KEMU_STUB_PAGE_STATE_SVC)
+			kt->flags &= ~KEMU_TF_STEP_SVC;
 	} else if (ip >= km->code_base && ip < km->code_base + KEMU_CODE_SIZE) {
 		u64 retired;
 
@@ -851,7 +877,7 @@ bool kemu_user_gp(struct pt_regs *regs)
 		       (blk - (u8 *)km->chunks[off >> KEMU_CHUNK_SHIFT]);
 		bi = xa_load(&km->binfo, boff / KEMU_BLOCK_ALIGN);
 		if (bi && ++bi->tbi_faults >= KEMU_TBI_RETRANSLATE &&
-		    !xa_err(xa_store(&km->tbi_pcs, bi->pc >> 2, xa_mk_value(1), GFP_KERNEL)))
+		    !xa_err(xa_store(&km->tbi_pcs, bi->pc >> 2, xa_mk_value(1), GFP_KERNEL_ACCOUNT)))
 			kemu_blk_kill(km, boff);
 	}
 	mutex_unlock(&km->lock);
@@ -871,26 +897,82 @@ bool kemu_user_gp(struct pt_regs *regs)
 	}
 }
 
+/*
+ * #DE in translated code. The only divide instructions kemu emits are the
+ * lowering of guest UDIV/SDIV, which pre-check for a zero or INT_MIN/-1
+ * divisor; but the divisor can live in the guest's (cross-thread writable)
+ * state page, so another thread can change it between the check and the
+ * divide and raise a host #DE. AArch64 division never traps (UDIV by zero is
+ * 0, SDIV INT_MIN/-1 is INT_MIN), so recover the guest state and run the one
+ * instruction in the interpreter, which produces the architectural result
+ * instead of a host SIGFPE that would also leak a code-cache address
+ * (audit M-03).
+ */
+bool kemu_user_de(struct pt_regs *regs)
+{
+	struct kemu_thread *kt = current->kemu;
+	struct kemu_mm *km = current->mm->kemu;
+	unsigned long ip = kemu_reg(regs, ip);
+	struct kemu_rs_exit ex;
+
+	if (!kt || !km || ip < km->code_base + KEMU_CHUNK_SIZE ||
+	    ip >= km->code_base + KEMU_CODE_SIZE)
+		return false;
+	kemu_materialize(regs);
+	kt->shadow = *kt->cpu;
+	kemu_rs_interp(&kt->shadow, 1, &ex);
+	switch (ex.kind) {
+	case KEMU_EXIT_BUDGET:
+		*kt->cpu = kt->shadow;
+		return true;
+	case KEMU_EXIT_FAULT:
+		kemu_force_fault(ex.addr, ex.access, ex.aux);
+		return true;
+	default:
+		return false;
+	}
+}
+
 /* ---- kemu ops from stubs ---- */
 
 static unsigned long kemu_op_translate(struct kemu_thread *kt, struct kemu_mm *km,
 				       bool chain)
 {
 	struct kemu_trans res = {};
-	u64 pc = kt->cpu->pc;
+	u64 pc = READ_ONCE(kt->cpu->pc);
 	u64 t0 = ktime_get_ns();
+	u64 seq0;
 	unsigned long main;
 	int err;
 
 	mutex_lock(&km->lock);
+	seq0 = atomic64_read(&km->unmap_seq);
 	err = kemu_translate(km, pc, &main, &res);
+	/*
+	 * If a mapping was torn down while we were fetching and translating,
+	 * this block may have read instructions from a page that is now gone or
+	 * replaced. kemu_unmapped() bumps unmap_seq before its own early-return
+	 * checks, so sampling it before the fetch and re-reading after the block
+	 * is registered closes the window even when the targeted invalidation
+	 * already ran. Drop the block and fall back to the interpreter; a later
+	 * dispatch retranslates it correctly (audit M-02). The barrier orders
+	 * the block registration (xa_store above) before this re-read.
+	 */
+	smp_mb();
+	if (!err && atomic64_read(&km->unmap_seq) != seq0) {
+		void *v = xa_load(&km->blocks, pc >> 2);
+
+		if (v && xa_to_value(v) == res.blk_off)
+			kemu_blk_kill(km, res.blk_off);
+		err = -EAGAIN;
+	}
 	/*
 	 * The exit site was produced in the epoch this thread last entered
 	 * user mode in; after a flush its chunk may be freed or even reused
 	 * (kemu_reclaim() doesn't wait for threads that are in the kernel).
 	 */
 	if (!err && chain && kt->epoch_seen == km->epoch)
-		kemu_chain(km, kt->cpu->exit_info, pc, main, res.ic_entry, res.blk_off);
+		kemu_chain(km, READ_ONCE(kt->cpu->exit_info), pc, main, res.ic_entry, res.blk_off);
 	km->lookups++;
 	if (kemu_stress && km->lookups % kemu_stress == 0) {
 		struct kemu_thread *o;
@@ -936,6 +1018,10 @@ static void kemu_op_helper(struct kemu_thread *kt, struct kemu_mm *km)
 		if (kt->cpu->pc != pc + 4)
 			kemu_redirect(kt);
 		return;
+	case KEMU_EXIT_SVC:
+		/* The instruction was (concurrently rewritten to) an svc. */
+		kemu_pend_svc(kt);
+		return;
 	case KEMU_EXIT_ICINV:
 		mutex_lock(&km->lock);
 		kemu_jit_invalidate(km, ex.addr, ex.addr + 1);
@@ -969,7 +1055,7 @@ unsigned long kemu_op_step(struct kemu_thread *kt, struct kemu_mm *km)
 	switch (ex.kind) {
 	case KEMU_EXIT_SVC:
 		kt->flags |= KEMU_TF_STEP_SVC;
-		kt->flags &= ~KEMU_TF_REDIRECT;
+		kemu_pend_svc(kt);
 		return kemu_stub(km, km->stubs.interp_svc);
 	case KEMU_EXIT_BRK:
 		force_sig_fault(SIGTRAP, TRAP_BRKPT, (void __user *)kt->cpu->pc);
@@ -1049,7 +1135,7 @@ int kemu_jit_dup(struct kemu_mm *okm, struct kemu_mm *km)
 
 		if (!km->chunks[off >> KEMU_CHUNK_SHIFT])
 			continue;
-		if (xa_err(xa_store(&km->blocks, idx, v, GFP_KERNEL)))
+		if (xa_err(xa_store(&km->blocks, idx, v, GFP_KERNEL_ACCOUNT)))
 			return -ENOMEM;
 	}
 	if (kemu_inval_dup(okm, km))

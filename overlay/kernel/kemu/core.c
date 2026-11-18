@@ -320,6 +320,18 @@ void kemu_redirect(struct kemu_thread *kt)
 	kt->flags |= KEMU_TF_REDIRECT;
 }
 
+/*
+ * The interpreter retired a guest svc (page pc = svc + 4) that still has to
+ * be performed: resume at the interp_svc stub rather than at dispatch, even
+ * if something else (an epoch change, a signal) also asks for a redirect on
+ * the way out. kemu_materialize() turns this back into "restart the svc" when
+ * a signal frame has to be built first.
+ */
+void kemu_pend_svc(struct kemu_thread *kt)
+{
+	kt->flags |= KEMU_TF_PENDING_SVC | KEMU_TF_REDIRECT;
+}
+
 /* ---- exec ---- */
 
 /*
@@ -766,6 +778,7 @@ void kemu_exit_to_user(struct pt_regs *regs)
 {
 	struct kemu_thread *kt = current->kemu;
 	struct kemu_mm *km;
+	u32 stub;
 
 	if (!kt)
 		return;
@@ -774,9 +787,18 @@ void kemu_exit_to_user(struct pt_regs *regs)
 	if (!(kt->flags & KEMU_TF_REDIRECT))
 		return;
 	km = current->mm->kemu;
-	kt->flags &= ~KEMU_TF_REDIRECT;
-	kemu_reg(regs, ip) = kemu_stub(km, (kt->flags & KEMU_TF_STEP) ?
-				     km->stubs.step : km->stubs.dispatch);
+	/*
+	 * interp_svc lives in the never-retired stub chunk and continues at
+	 * dispatch, so it is safe after an epoch change too.
+	 */
+	if (kt->flags & KEMU_TF_PENDING_SVC)
+		stub = km->stubs.interp_svc;
+	else if (kt->flags & KEMU_TF_STEP)
+		stub = km->stubs.step;
+	else
+		stub = km->stubs.dispatch;
+	kt->flags &= ~(KEMU_TF_REDIRECT | KEMU_TF_PENDING_SVC);
+	kemu_reg(regs, ip) = kemu_stub(km, stub);
 	kemu_reg(regs, sp) = kt->rstack_top;
 	kemu_reg(regs, cx) = kemu_reg(regs, ip);
 	kemu_reg(regs, r11) = kemu_reg(regs, flags);
