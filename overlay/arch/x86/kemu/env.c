@@ -44,9 +44,10 @@ static int kemu_cmpxchg128(u64 addr, const u64 *exp, const u64 *new, u64 *old)
 	struct page *page;
 	u128 *p, o, e, n;
 	void *kaddr;
+	bool wrote;
 	int ret;
 
-	ret = get_user_pages_fast(addr & PAGE_MASK, 1, FOLL_WRITE, &page);
+	ret = pin_user_pages_fast(addr & PAGE_MASK, 1, FOLL_WRITE, &page);
 	if (ret != 1)
 		return -EFAULT;
 	kaddr = kmap_local_page(page);
@@ -54,10 +55,10 @@ static int kemu_cmpxchg128(u64 addr, const u64 *exp, const u64 *new, u64 *old)
 	e = ((u128)exp[1] << 64) | exp[0];
 	n = ((u128)new[1] << 64) | new[0];
 	o = e;
-	try_cmpxchg128(p, &o, n);
+	wrote = try_cmpxchg128(p, &o, n);
 	kunmap_local(kaddr);
-	set_page_dirty_lock(page);
-	put_page(page);
+	/* Only mark the page dirty if the exchange actually stored. */
+	unpin_user_pages_dirty_lock(&page, 1, wrote);
 	old[0] = (u64)o;
 	old[1] = (u64)(o >> 64);
 	return 0;

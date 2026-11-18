@@ -99,7 +99,7 @@ static int kemu_setup_rt_frame(struct ksignal *ksig, sigset_t *set)
 	}
 	kt->fault_esr = 0;
 
-	buf = kzalloc(KEMU_SIGFRAME_SIZE, GFP_KERNEL);
+	buf = kzalloc(KEMU_SIGFRAME_SIZE, GFP_KERNEL_ACCOUNT);
 	if (!buf)
 		return -ENOMEM;
 	copy_siginfo_to_external((siginfo_t *)buf, &ksig->info);
@@ -185,7 +185,7 @@ void kemu_do_signal(struct pt_regs *regs)
 
 	if (get_signal(&ksig)) {
 		if (kemu_debug)
-			pr_info("kemu: %s[%d] sig %d code %d addr %px at pc %llx (host ip %lx) x0=%llx sp=%llx lr=%llx\n",
+			pr_info("kemu: %s[%d] sig %d code %d addr %p at pc %llx (host ip %lx) x0=%llx sp=%llx lr=%llx\n",
 				current->comm, task_pid_nr(current), ksig.sig, ksig.info.si_code,
 				ksig.info.si_addr, cpu->pc, kemu_reg(regs, ip), cpu->x[0], cpu->sp, cpu->x[30]);
 		if (syscall && cpu->pc == restart &&
@@ -223,7 +223,7 @@ long kemu_sys_rt_sigreturn(struct pt_regs *regs)
 
 	if (frame & 15)
 		goto badframe;
-	buf = kmalloc(KEMU_SIGFRAME_SIZE, GFP_KERNEL);
+	buf = kmalloc(KEMU_SIGFRAME_SIZE, GFP_KERNEL_ACCOUNT);
 	if (!buf)
 		goto badframe;
 	if (copy_from_user(buf, (void __user *)frame, KEMU_SIGFRAME_SIZE)) {

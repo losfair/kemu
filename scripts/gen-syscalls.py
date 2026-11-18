@@ -13,6 +13,7 @@ overrides = {
     "rt_sigreturn", "clone", "uname", "newfstatat", "fstat",
     "epoll_ctl", "epoll_pwait", "epoll_pwait2", "openat", "openat2",
     "fcntl", "pipe2", "open_by_handle_at", "fanotify_init", "semctl",
+    "sigaltstack", "mmap", "prctl",
 }
 
 # Not offered to guests (ENOSYS; programs fall back):

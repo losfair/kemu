@@ -21,6 +21,10 @@
 #include <linux/audit.h>
 #include <linux/sem.h>
 #include <linux/ipc.h>
+#include <linux/signal.h>
+#include <linux/mman.h>
+#include <linux/prctl.h>
+#include <uapi/asm/mman.h>
 
 #include "kemu_internal.h"
 
@@ -385,4 +389,61 @@ long kemu_sys_semctl(struct pt_regs *regs)
 	default:
 		return __x64_sys_semctl(regs);
 	}
+}
+
+/* ---- sigaltstack: enforce the arm64 minimum alternate-stack size ----
+ *
+ * The x86_64 entry point validates ss_size against x86 MINSIGSTKSZ (2048),
+ * but an arm64 rt_sigframe needs KEMU_MINSIGSTKSZ. Accepting a smaller
+ * stack would let signal delivery write below ss_sp (audit M-01).
+ */
+asmlinkage long __x64_sys_sigaltstack(const struct pt_regs *regs);
+
+long kemu_sys_sigaltstack(struct pt_regs *regs)
+{
+	const stack_t __user *uss = (const stack_t __user *)kemu_reg(regs, di);
+	stack_t new;
+
+	if (uss) {
+		if (copy_from_user(&new, uss, sizeof(new)))
+			return -EFAULT;
+		if (!(new.ss_flags & SS_DISABLE) && new.ss_size < KEMU_MINSIGSTKSZ)
+			return -ENOMEM;
+	}
+	return __x64_sys_sigaltstack(regs);
+}
+
+/* ---- mmap: reject host-architecture-only flags (audit M-05) ---- */
+asmlinkage long __x64_sys_mmap(const struct pt_regs *regs);
+
+long kemu_sys_mmap(struct pt_regs *regs)
+{
+#ifdef MAP_32BIT
+	/* arm64 has no MAP_32BIT; it only has meaning on x86. */
+	if (kemu_reg(regs, r10) & MAP_32BIT)
+		return -EINVAL;
+#endif
+	return __x64_sys_mmap(regs);
+}
+
+/* ---- prctl: drop x86-specific or kemu-incompatible options (audit M-05) ---- */
+asmlinkage long __x64_sys_prctl(const struct pt_regs *regs);
+
+long kemu_sys_prctl(struct pt_regs *regs)
+{
+	switch ((int)kemu_reg(regs, di)) {
+	case PR_GET_TSC:
+	case PR_SET_TSC:
+		/* x86 TSC trap control; arm64 has no such option. */
+		return -EINVAL;
+	case PR_SET_SYSCALL_USER_DISPATCH:
+		/*
+		 * Syscall user dispatch intercepts host `syscall` instructions,
+		 * which kemu itself issues from its stubs; honouring it would
+		 * break the emulator and let the guest redirect them. kemu does
+		 * not implement guest-level SUD, so report it unsupported.
+		 */
+		return -EINVAL;
+	}
+	return __x64_sys_prctl(regs);
 }

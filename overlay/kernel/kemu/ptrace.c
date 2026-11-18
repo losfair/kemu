@@ -51,6 +51,14 @@ static void kemu_sync_syscall_view(struct task_struct *target)
 	kemu_reg(regs, r10) = kt->cpu->x[3];
 	kemu_reg(regs, r8) = kt->cpu->x[4];
 	kemu_reg(regs, r9) = kt->cpu->x[5];
+	/*
+	 * If the tracer skipped the syscall at entry (NT_ARM_SYSTEM_CALL = -1)
+	 * and set a return value via NT_PRSTATUS x0, carry it into the result
+	 * register so kemu_svc() doesn't overwrite it with -ENOSYS. When the
+	 * syscall is not skipped, kemu_dispatch() overwrites ax normally
+	 * (audit L-04).
+	 */
+	kemu_reg(regs, ax) = kt->cpu->x[0];
 }
 
 static int kemu_gpr_set(struct task_struct *target, const struct user_regset *regset,
@@ -77,6 +85,8 @@ static int kemu_gpr_set(struct task_struct *target, const struct user_regset *re
 	kt->cpu->sp = r[31];
 	kt->cpu->pc = r[32];
 	kt->cpu->nzcv = r[33] & KEMU_PSR_NZCV;
+	/* State page is now authoritative; exit_to_user rebuilds flags/MXCSR. */
+	kt->flags |= KEMU_TF_KSTATE;
 	kemu_sync_syscall_view(target);
 	kemu_redirect(kt);
 	return 0;
@@ -102,6 +112,7 @@ static int kemu_fpr_set(struct task_struct *target, const struct user_regset *re
 			unsigned int pos, unsigned int count, const void *kbuf,
 			const void __user *ubuf)
 {
+	struct kemu_thread *kt = target->kemu;
 	struct kemu_cpu *cpu;
 	struct {
 		u64 v[32][2];
@@ -109,9 +120,9 @@ static int kemu_fpr_set(struct task_struct *target, const struct user_regset *re
 	} f;
 	int err;
 
-	if (!target->kemu)
+	if (!kt)
 		return -EIO;
-	cpu = target->kemu->cpu;
+	cpu = kt->cpu;
 	memcpy(f.v, cpu->v, sizeof(f.v));
 	f.fpsr = cpu->fpsr;
 	f.fpcr = cpu->fpcr;
@@ -122,6 +133,14 @@ static int kemu_fpr_set(struct task_struct *target, const struct user_regset *re
 	memcpy(cpu->v, f.v, sizeof(f.v));
 	cpu->fpsr = f.fpsr;
 	cpu->fpcr = f.fpcr;
+	/*
+	 * Mark the state page authoritative and send the tracee back through the
+	 * dispatcher, so kemu_jit_exit_to_user() rebuilds the MXCSR image from
+	 * the written fpcr/fpsr and translated code reloads the vectors instead
+	 * of resuming with stale host XMM registers (audit L-04).
+	 */
+	kt->flags |= KEMU_TF_KSTATE;
+	kemu_redirect(kt);
 	return 0;
 }
 

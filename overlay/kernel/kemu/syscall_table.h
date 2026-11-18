@@ -140,7 +140,6 @@ asmlinkage long __x64_sys_mknodat(const struct pt_regs *regs);
 asmlinkage long __x64_sys_mlock(const struct pt_regs *regs);
 asmlinkage long __x64_sys_mlock2(const struct pt_regs *regs);
 asmlinkage long __x64_sys_mlockall(const struct pt_regs *regs);
-asmlinkage long __x64_sys_mmap(const struct pt_regs *regs);
 asmlinkage long __x64_sys_mount(const struct pt_regs *regs);
 asmlinkage long __x64_sys_mount_setattr(const struct pt_regs *regs);
 asmlinkage long __x64_sys_move_mount(const struct pt_regs *regs);
@@ -176,7 +175,6 @@ asmlinkage long __x64_sys_pkey_alloc(const struct pt_regs *regs);
 asmlinkage long __x64_sys_pkey_free(const struct pt_regs *regs);
 asmlinkage long __x64_sys_pkey_mprotect(const struct pt_regs *regs);
 asmlinkage long __x64_sys_ppoll(const struct pt_regs *regs);
-asmlinkage long __x64_sys_prctl(const struct pt_regs *regs);
 asmlinkage long __x64_sys_pread64(const struct pt_regs *regs);
 asmlinkage long __x64_sys_preadv(const struct pt_regs *regs);
 asmlinkage long __x64_sys_preadv2(const struct pt_regs *regs);
@@ -264,7 +262,6 @@ asmlinkage long __x64_sys_shmctl(const struct pt_regs *regs);
 asmlinkage long __x64_sys_shmdt(const struct pt_regs *regs);
 asmlinkage long __x64_sys_shmget(const struct pt_regs *regs);
 asmlinkage long __x64_sys_shutdown(const struct pt_regs *regs);
-asmlinkage long __x64_sys_sigaltstack(const struct pt_regs *regs);
 asmlinkage long __x64_sys_signalfd4(const struct pt_regs *regs);
 asmlinkage long __x64_sys_socket(const struct pt_regs *regs);
 asmlinkage long __x64_sys_socketpair(const struct pt_regs *regs);
@@ -319,6 +316,9 @@ long kemu_sys_openat2(struct pt_regs *regs);
 long kemu_sys_pipe2(struct pt_regs *regs);
 long kemu_sys_rt_sigreturn(struct pt_regs *regs);
 long kemu_sys_semctl(struct pt_regs *regs);
+long kemu_sys_sigaltstack(struct pt_regs *regs);
+long kemu_sys_mmap(struct pt_regs *regs);
+long kemu_sys_prctl(struct pt_regs *regs);
 long kemu_sys_uname(struct pt_regs *regs);
 
 #define KEMU_NR_SYSCALLS 470
@@ -456,7 +456,7 @@ static long kemu_syscall_table(struct pt_regs *regs, unsigned long nr)
 	case 129: return __x64_sys_kill(regs);	/* kill */
 	case 130: return __x64_sys_tkill(regs);	/* tkill */
 	case 131: return __x64_sys_tgkill(regs);	/* tgkill */
-	case 132: return __x64_sys_sigaltstack(regs);	/* sigaltstack */
+	case 132: return kemu_sys_sigaltstack(regs);	/* sigaltstack */
 	case 133: return __x64_sys_rt_sigsuspend(regs);	/* rt_sigsuspend */
 	case 134: return __x64_sys_rt_sigaction(regs);	/* rt_sigaction */
 	case 135: return __x64_sys_rt_sigprocmask(regs);	/* rt_sigprocmask */
@@ -491,7 +491,7 @@ static long kemu_syscall_table(struct pt_regs *regs, unsigned long nr)
 	case 164: return __x64_sys_setrlimit(regs);	/* setrlimit */
 	case 165: return __x64_sys_getrusage(regs);	/* getrusage */
 	case 166: return __x64_sys_umask(regs);	/* umask */
-	case 167: return __x64_sys_prctl(regs);	/* prctl */
+	case 167: return kemu_sys_prctl(regs);	/* prctl */
 	case 168: return __x64_sys_getcpu(regs);	/* getcpu */
 	case 169: return __x64_sys_gettimeofday(regs);	/* gettimeofday */
 	case 170: return __x64_sys_settimeofday(regs);	/* settimeofday */
@@ -546,7 +546,7 @@ static long kemu_syscall_table(struct pt_regs *regs, unsigned long nr)
 	case 219: return __x64_sys_keyctl(regs);	/* keyctl */
 	case 220: return kemu_sys_clone(regs);	/* clone */
 	case 221: return __x64_sys_execve(regs);	/* execve */
-	case 222: return __x64_sys_mmap(regs);	/* mmap */
+	case 222: return kemu_sys_mmap(regs);	/* mmap */
 	case 223: return __x64_sys_fadvise64_64(regs);	/* fadvise64 */
 	case 224: return __x64_sys_swapon(regs);	/* swapon */
 	case 225: return __x64_sys_swapoff(regs);	/* swapoff */
