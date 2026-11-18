@@ -345,18 +345,20 @@ pub struct KemuTrans {
 /// Cache optional host CPU features at the unsafe kernel boundary; the
 /// translator core itself remains entirely safe Rust.
 fn host_crypto() -> t1::HostCrypto {
-    use core::sync::atomic::{AtomicU8, Ordering};
-    static FEATURES: AtomicU8 = AtomicU8::new(0);
-    let mut bits = FEATURES.load(Ordering::Relaxed);
-    if bits == 0 {
-        // SAFETY: the JIT runs on x86-64, where CPUID is always available.
-        // This only reads integer registers and does not use kernel SIMD.
-        let ecx = unsafe { core::arch::x86_64::__cpuid(1) }.ecx;
-        let sha = unsafe { core::arch::x86_64::__cpuid_count(7, 0) }.ebx & (1 << 29) != 0;
-        bits = 0x80 | (((ecx >> 25) & 1) as u8) | ((ecx & 2) as u8) | ((sha as u8) << 2);
-        FEATURES.store(bits, Ordering::Relaxed);
+    // Features come from the kernel (kemu_rs_set_host_features via
+    // cpu_feature_enabled()) rather than a raw CPUID, so clearcpuid= is
+    // honoured (audit H-01).
+    t1::HostCrypto {
+        aes: sysregs::host_aes(),
+        pclmul: sysregs::host_pclmul(),
+        sha: sysregs::host_sha(),
     }
-    t1::HostCrypto { aes: bits & 1 != 0, pclmul: bits & 2 != 0, sha: bits & 4 != 0 }
+}
+
+/// Record the optional host CPU features. Called once from kemu_init().
+#[no_mangle]
+pub extern "C" fn kemu_rs_set_host_features(aes: bool, pclmul: bool, sha: bool, rndr: bool) {
+    sysregs::set_host_features(aes, pclmul, sha, rndr);
 }
 
 /// Translate the guest block at `pc` into `out` (user address `code_uaddr`).

@@ -21,15 +21,25 @@ mod integer;
 struct Slow {
     branches: [usize; 32],
     len: usize,
+    overflow: bool,
 }
 
 impl Slow {
-    fn new() -> Self { Self { branches: [0; 32], len: 0 } }
+    fn new() -> Self { Self { branches: [0; 32], len: 0, overflow: false } }
     fn push(&mut self, branch: usize) {
-        self.branches[self.len] = branch;
-        self.len += 1;
+        // Bounds-checked: a full set simply records the overflow instead of
+        // panicking (audit H-03). In practice at most a handful are pushed.
+        match self.branches.get_mut(self.len) {
+            Some(slot) => {
+                *slot = branch;
+                self.len += 1;
+            }
+            None => self.overflow = true,
+        }
     }
-    fn as_slice(&self) -> &[usize] { &self.branches[..self.len] }
+    fn as_slice(&self) -> &[usize] {
+        self.branches.get(..self.len).unwrap_or(&[])
+    }
 }
 
 const X13: u8 = 13;
@@ -847,9 +857,13 @@ impl<'s, 'b> Gen<'s, 'b> {
                     mask[i] = (((i >> size) * 2 + (op >> 2) as usize) << size
                         | (i & ((1 << size) - 1))) as u8;
                 }
-                self.mov_imm(RAX, u64::from_le_bytes(mask[..8].try_into().unwrap()));
+                let (lo, hi) = mask.split_at(8);
+                let mut w = [0u8; 8];
+                w.copy_from_slice(lo);
+                self.mov_imm(RAX, u64::from_le_bytes(w));
                 self.a.vmov_from_gpr(Sz::Q, X13, RAX);
-                self.mov_imm(RAX, u64::from_le_bytes(mask[8..].try_into().unwrap()));
+                w.copy_from_slice(hi);
+                self.mov_imm(RAX, u64::from_le_bytes(w));
                 self.a.vex_ib(3, PP_66, true, false, 0x22, X13, X13, Rm::R(RAX), 1); // vpinsrq
                 self.a.vex(2, PP_66, false, false, 0x00, X14, X14, Rm::R(X13));
                 self.a.vex(2, PP_66, false, false, 0x00, X15, X15, Rm::R(X13));

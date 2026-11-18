@@ -79,8 +79,10 @@ fn parse(bytes: &[u8]) -> Result<Image, String> {
     let phnum = rd_u16(bytes, 56);
     let mut phdrs = Vec::new();
     for i in 0..phnum as usize {
-        let o = phoff as usize + i * phentsize as usize;
-        if o + 56 > bytes.len() {
+        let o = (phoff as usize)
+            .checked_add(i.checked_mul(phentsize as usize).ok_or("phdr offset overflow")?)
+            .ok_or("phdr offset overflow")?;
+        if o.checked_add(56).ok_or("phdr offset overflow")? > bytes.len() {
             return Err("truncated phdr".into());
         }
         phdrs.push(Phdr {
@@ -139,7 +141,7 @@ fn map_segments(bytes: &[u8], img: &Image, load_bias: u64) -> Result<(u64, u64),
             lo as *mut libc::c_void,
             span,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
             -1,
             0,
         )
@@ -153,7 +155,7 @@ fn map_segments(bytes: &[u8], img: &Image, load_bias: u64) -> Result<(u64, u64),
         let foff = ph.p_offset as usize;
         let fsz = ph.p_filesz as usize;
         if fsz > 0 {
-            if foff + fsz > bytes.len() {
+            if foff.checked_add(fsz).ok_or("segment size overflow")? > bytes.len() {
                 return Err("segment past EOF".into());
             }
             unsafe {
@@ -191,7 +193,9 @@ pub fn load(path: &str, args: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Loaded, St
     if let Some(interp_ph) = img.phdrs.iter().find(|p| p.p_type == PT_INTERP) {
         let o = interp_ph.p_offset as usize;
         let sz = interp_ph.p_filesz as usize;
-        let interp_path = String::from_utf8_lossy(&bytes[o..o + sz])
+        let end = o.checked_add(sz).ok_or("interp offset overflow")?;
+        let slice = bytes.get(o..end).ok_or("interp path past EOF")?;
+        let interp_path = String::from_utf8_lossy(slice)
             .trim_end_matches('\0')
             .to_string();
         let resolved = resolve_interp(&interp_path);

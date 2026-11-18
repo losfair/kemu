@@ -110,3 +110,48 @@ pub const ID_AA64DFR0_EL1: u64 = {
 pub const ID_AA64DFR1_EL1: u64 = 0;
 pub const ID_AA64AFR0_EL1: u64 = 0;
 pub const ID_AA64AFR1_EL1: u64 = 0;
+
+// ---- Host feature flags, injected by the kernel glue (kemu_rs_set_host_features)
+// so emulation respects clearcpuid= and an absent RDRAND. When unset (the
+// standalone cargo build), every optional feature is treated as present, which
+// preserves the previous behaviour for the userspace tests.
+use core::sync::atomic::{AtomicU8, Ordering};
+
+const HF_VALID: u8 = 1 << 0;
+const HF_AES: u8 = 1 << 1;
+const HF_PCLMUL: u8 = 1 << 2;
+const HF_SHA: u8 = 1 << 3;
+const HF_RNDR: u8 = 1 << 4;
+
+static HOST_FEATURES: AtomicU8 = AtomicU8::new(0);
+
+/// Record the optional host CPU features (called once at init).
+pub fn set_host_features(aes: bool, pclmul: bool, sha: bool, rndr: bool) {
+    let bits = HF_VALID
+        | if aes { HF_AES } else { 0 }
+        | if pclmul { HF_PCLMUL } else { 0 }
+        | if sha { HF_SHA } else { 0 }
+        | if rndr { HF_RNDR } else { 0 };
+    HOST_FEATURES.store(bits, Ordering::Relaxed);
+}
+
+#[inline]
+fn host_feature(bit: u8) -> bool {
+    let f = HOST_FEATURES.load(Ordering::Relaxed);
+    f & HF_VALID == 0 || f & bit != 0
+}
+
+pub fn host_aes() -> bool { host_feature(HF_AES) }
+pub fn host_pclmul() -> bool { host_feature(HF_PCLMUL) }
+pub fn host_sha() -> bool { host_feature(HF_SHA) }
+pub fn host_rndr() -> bool { host_feature(HF_RNDR) }
+
+/// ID_AA64ISAR0_EL1 with the RNDR field cleared when the host lacks RDRAND,
+/// so it stays consistent with AT_HWCAP2 and the RNDR instruction.
+pub fn id_aa64isar0() -> u64 {
+    let mut v = ID_AA64ISAR0_EL1;
+    if !host_rndr() {
+        v &= !(0xfu64 << 60);
+    }
+    v
+}

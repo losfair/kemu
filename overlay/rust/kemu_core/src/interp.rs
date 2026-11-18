@@ -435,6 +435,12 @@ fn step<E: Env>(cpu: &mut CpuState, env: &mut E, insn: Insn, word: u32) -> Step 
         Insn::Mrs { rt, enc } => {
             // RNDR / RNDRRS also set NZCV (0b0000 success, 0b0100 failure).
             if enc == e(3, 3, 2, 4, 0) || enc == e(3, 3, 2, 4, 1) {
+                // Not advertised when the host lacks RDRAND: UNDEFINED, to
+                // stay consistent with the cleared ID_AA64ISAR0.RNDR and
+                // HWCAP2_RNG (audit H-01).
+                if !sysregs::host_rndr() {
+                    return Step::Exit(Exit::Undefined(word));
+                }
                 match env.random() {
                     Some(v) => {
                         cpu.set_xr(rt, v);
@@ -764,7 +770,7 @@ fn read_sysreg<E: Env>(cpu: &CpuState, env: &mut E, enc: u32) -> Option<u64> {
         _ if enc == e(3, 0, 0, 5, 1) => sysregs::ID_AA64DFR1_EL1,
         _ if enc == e(3, 0, 0, 5, 4) => sysregs::ID_AA64AFR0_EL1,
         _ if enc == e(3, 0, 0, 5, 5) => sysregs::ID_AA64AFR1_EL1,
-        _ if enc == e(3, 0, 0, 6, 0) => sysregs::ID_AA64ISAR0_EL1,
+        _ if enc == e(3, 0, 0, 6, 0) => sysregs::id_aa64isar0(),
         _ if enc == e(3, 0, 0, 6, 1) => sysregs::ID_AA64ISAR1_EL1,
         _ if enc == e(3, 0, 0, 6, 2) => sysregs::ID_AA64ISAR2_EL1,
         _ if enc == e(3, 0, 0, 7, 0) => sysregs::ID_AA64MMFR0_EL1,
@@ -775,7 +781,11 @@ fn read_sysreg<E: Env>(cpu: &CpuState, env: &mut E, enc: u32) -> Option<u64> {
         _ if enc >> 7 == (3 << 7) && (2..=7).contains(&((enc >> 3) & 15)) => 0,
         // RNDR / RNDRRS: op0=3,op1=3,crn=2,crm=4,op2=0/1
         _ if enc == e(3, 3, 2, 4, 0) || enc == e(3, 3, 2, 4, 1) => {
-            // handled specially by caller for NZCV; here return value or 0.
+            // Handled specially by the caller for NZCV; here return value or 0,
+            // or treat as unavailable when the host has no RDRAND (audit H-01).
+            if !sysregs::host_rndr() {
+                return None;
+            }
             return env.random().or(Some(0));
         }
         _ => return None,

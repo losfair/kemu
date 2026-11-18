@@ -1996,6 +1996,13 @@ impl<'s, 'b> Gen<'s, 'b> {
     fn dc_zva(&mut self, rt: u32) -> bool {
         self.clobber();
         self.get_into(rt, false, Sz::Q, RDX);
+        // DC ZVA takes a virtual address subject to TBI: in tagged mode the
+        // top byte must be stripped before the store, exactly like an
+        // ordinary data access (audit L-05). Without this a tagged Xt gives a
+        // non-canonical store address and a #GP in translated code.
+        if self.cfg.tbi {
+            self.untag(RDX);
+        }
         self.a.alu_ri(Alu::And, Sz::Q, Rm::R(RDX), -64);
         // vpxor ymm15, ymm15, ymm15 ; vmovdqu [rdx], ymm15 ; [rdx+32]
         self.a.vex(1, 1, false, true, 0xef, 15, 15, Rm::R(15));

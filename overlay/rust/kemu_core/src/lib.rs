@@ -9,6 +9,10 @@
 #![no_std]
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
+// A panic here would be a kernel BUG() (DESIGN §7.2), so forbid the common
+// panicking constructs outside the test build. Tests themselves use unwrap()
+// freely, so only gate non-test builds.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 #[cfg(feature = "std")]
 extern crate std;

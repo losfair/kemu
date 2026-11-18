@@ -162,3 +162,39 @@ fn saturating_vector_recovery_commits_qc_with_the_result() {
         }
     }
 }
+
+/// DC ZVA in tagged (TBI) mode must strip the top byte of the address
+/// before zeroing, exactly like an ordinary data store; otherwise a tagged
+/// Xt produces a non-canonical host store address and a #GP (audit L-05).
+/// The untag is `shl r,8; sar r,8`, emitted before the 64-byte alignment
+/// `and`; it must appear only in the TBI translation.
+#[test]
+fn dc_zva_tbi_untags_the_address() {
+    // DC ZVA, X2  (SYS #3, C7, C4, #1, X2) then RET to end the block.
+    let words = vec![0xd50b7422u32, 0xd65f03c0u32];
+
+    let translate = |tbi: bool| -> Vec<u8> {
+        let cfg = t1::Cfg {
+            stubs: stub_addrs(),
+            code_uaddr: 0x7e00_0010_0000,
+            reloc: false,
+            tbi,
+            vector_cache: false,
+            crypto: t1::HostCrypto::default(),
+        };
+        let mut env = Racy { words: words.clone(), flip_at: 0, first: 0, second: 0, seen: false };
+        let mut s = Box::new(t1::Scratch::new());
+        let mut out = vec![0u8; 1 << 16];
+        let r = t1::translate(&mut env, PC0, &mut out, &cfg, &mut s).unwrap();
+        out.truncate(r.size);
+        out
+    };
+
+    // `shl rdx,8` = 48 C1 E2 08 ; `sar rdx,8` = 48 C1 FA 08 (RDX holds the
+    // address in dc_zva()).
+    let untag: &[u8] = &[0x48, 0xC1, 0xE2, 0x08, 0x48, 0xC1, 0xFA, 0x08];
+    let has = |hay: &[u8]| hay.windows(untag.len()).any(|w| w == untag);
+
+    assert!(has(&translate(true)), "TBI dc_zva must untag the address");
+    assert!(!has(&translate(false)), "non-TBI dc_zva must not untag");
+}
