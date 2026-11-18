@@ -17,9 +17,21 @@ grep -q "TBI ALL PASSED" /tmp/tbi.log && echo "SMOKE ok tbi"
 echo "== vector-state"; ./vector-state && echo "SMOKE ok vector-state"
 echo "== syscall-state"; ./syscall-state && echo "SMOKE ok syscall-state"
 echo "== fp-status"; ./fp-status && echo "SMOKE ok fp-status"
+echo "== kemu-sec"; ./kemu-sec > /tmp/sec.log 2>&1; grep -E "^(PASS|FAIL)" /tmp/sec.log; tail -1 /tmp/sec.log
+grep -q "KEMU-SEC ALL PASSED" /tmp/sec.log && echo "SMOKE ok kemu-sec"
+echo "== divrace"; ./divrace > /tmp/div.log 2>&1; grep -E "^FAIL" /tmp/div.log; tail -1 /tmp/div.log
+grep -q "DIVRACE ALL PASSED" /tmp/div.log && echo "SMOKE ok divrace"
 echo "== intbench"; ../bench/intbench.arm64 && echo "SMOKE ok intbench"
+echo "== sysctl";
+if [ -f /proc/sys/kernel/kemu/enabled ]; then
+  echo 0 > /proc/sys/kernel/kemu/enabled
+  if ./hello-static >/dev/null 2>&1; then echo "sysctl-disable did not take effect";
+  else echo "SMOKE ok sysctl"; fi
+  echo 1 > /proc/sys/kernel/kemu/enabled
+  ./hello-static >/dev/null 2>&1 && echo "sysctl re-enabled ok"
+else echo "no kemu sysctl"; fi
 ' 2>&1 | grep -vE '^\[ |iPXE|SeaBIOS|Press|Booting|^.\[\?7l' | tee "$log"
-want="hello abi tbi vector-state syscall-state fp-status mtstress intbench"
+want="hello abi tbi vector-state syscall-state fp-status kemu-sec divrace mtstress intbench sysctl"
 rc=0
 for t in $want; do
 	grep -q "SMOKE ok $t" "$log" || { echo "FAILED: $t"; rc=1; }
